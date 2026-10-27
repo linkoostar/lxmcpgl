@@ -54,6 +54,23 @@ export function initDb(): void {
       sid     TEXT NOT NULL,
       PRIMARY KEY (user_id, sid)
     );
+    CREATE TABLE IF NOT EXISTS call_logs (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts          TEXT NOT NULL,
+      caller      TEXT NOT NULL,    -- 'admin' 或运营用户名
+      user_id     INTEGER,          -- 运营用户 id（admin 为 null）
+      tool_name   TEXT NOT NULL,    -- exposed_name
+      tool_id     TEXT,             -- 上游原始 tool_id
+      tool_type   TEXT,             -- read / write
+      shop_refs   TEXT,             -- JSON 数组 [sid,...]
+      success     INTEGER NOT NULL, -- 1=成功, 0=失败/被拒绝
+      is_error    INTEGER NOT NULL, -- 上游返回 isError
+      duration_ms INTEGER,
+      error       TEXT              -- 错误摘要（截断）
+    );
+    CREATE INDEX IF NOT EXISTS idx_call_logs_ts     ON call_logs(ts);
+    CREATE INDEX IF NOT EXISTS idx_call_logs_caller ON call_logs(caller);
+    CREATE INDEX IF NOT EXISTS idx_call_logs_tool   ON call_logs(tool_name);
   `);
   migrate();
   seed();
@@ -298,4 +315,124 @@ export function getToolCountByType(): { read: number; write: number; other: numb
     else result.other += r.c;
   }
   return result;
+}
+
+// ---------- call_logs ----------
+
+export interface CallLog {
+  id: number;
+  ts: string;
+  caller: string;
+  user_id: number | null;
+  tool_name: string;
+  tool_id: string | null;
+  tool_type: string | null;
+  shop_refs: string;
+  success: number;
+  is_error: number;
+  duration_ms: number | null;
+  error: string;
+}
+
+export function insertCallLog(l: {
+  caller: string;
+  user_id: number | null;
+  tool_name: string;
+  tool_id: string | null;
+  tool_type: string | null;
+  shop_refs: string[] | null;
+  success: boolean;
+  is_error: boolean;
+  duration_ms: number | null;
+  error: string | null;
+}): void {
+  const err = l.error ? String(l.error).slice(0, 500) : '';
+  const shops = l.shop_refs ? JSON.stringify(l.shop_refs.slice(0, 50)) : '';
+  db.prepare(
+    `INSERT INTO call_logs (ts, caller, user_id, tool_name, tool_id, tool_type, shop_refs, success, is_error, duration_ms, error)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    new Date().toISOString(),
+    l.caller,
+    l.user_id,
+    l.tool_name,
+    l.tool_id,
+    l.tool_type,
+    shops,
+    l.success ? 1 : 0,
+    l.is_error ? 1 : 0,
+    l.duration_ms,
+    err
+  );
+}
+
+export function listCallLogs(opts: {
+  q?: string;
+  caller?: string;
+  tool?: string;
+  success?: '1' | '0';
+  since?: string;
+  page: number;
+  pageSize: number;
+}): { total: number; items: CallLog[] } {
+  const conds: string[] = [];
+  const args: unknown[] = [];
+  if (opts.q) {
+    conds.push('(tool_name LIKE ? OR tool_id LIKE ? OR caller LIKE ? OR error LIKE ?)');
+    const like = `%${opts.q}%`;
+    args.push(like, like, like, like);
+  }
+  if (opts.caller) { conds.push('caller = ?'); args.push(opts.caller); }
+  if (opts.tool) { conds.push('tool_name = ?'); args.push(opts.tool); }
+  if (opts.success !== undefined) { conds.push('success = ?'); args.push(opts.success); }
+  if (opts.since) { conds.push('ts >= ?'); args.push(opts.since); }
+  const where = conds.length > 0 ? `WHERE ${conds.join(' AND ')}` : '';
+  const total = (db.prepare(`SELECT COUNT(*) AS c FROM call_logs ${where}`).all(...args) as { c: number }[])[0].c;
+  const rows = db
+    .prepare(
+      `SELECT * FROM call_logs ${where} ORDER BY id DESC LIMIT ? OFFSET ?`
+    )
+    .all(...args, opts.pageSize, (opts.page - 1) * opts.pageSize) as CallLog[];
+  return { total, items: rows };
+}
+
+export function getCallLogStats(since?: string): {
+  total: number;
+  success: number;
+  failed: number;
+  unique_callers: number;
+  unique_tools: number;
+  avg_ms: number | null;
+  top_tools: Array<{ tool_name: string; count: number }>;
+  top_callers: Array<{ caller: string; count: number }>;
+} {
+  const w = since ? 'WHERE ts >= ?' : '';
+  const a = since ? [since] : [];
+  const summary = db
+    .prepare(`SELECT COUNT(*) AS total, SUM(success) AS success, SUM(CASE WHEN success=0 THEN 1 ELSE 0 END) AS failed,
+                     AVG(duration_ms) AS avg_ms, COUNT(DISTINCT caller) AS unique_callers, COUNT(DISTINCT tool_name) AS unique_tools
+              FROM call_logs ${w}`)
+    .all(...a)[0] as any;
+  const topTools = db
+    .prepare(`SELECT tool_name, COUNT(*) AS count FROM call_logs ${w} GROUP BY tool_name ORDER BY count DESC LIMIT 8`)
+    .all(...a) as Array<{ tool_name: string; count: number }>;
+  const topCallers = db
+    .prepare(`SELECT caller, COUNT(*) AS count FROM call_logs ${w} GROUP BY caller ORDER BY count DESC LIMIT 6`)
+    .all(...a) as Array<{ caller: string; count: number }>;
+  return {
+    total: summary.total ?? 0,
+    success: summary.success ?? 0,
+    failed: summary.failed ?? 0,
+    unique_callers: summary.unique_callers ?? 0,
+    unique_tools: summary.unique_tools ?? 0,
+    avg_ms: summary.avg_ms != null ? Math.round(Number(summary.avg_ms)) : null,
+    top_tools: topTools,
+    top_callers: topCallers,
+  };
+}
+
+export function cleanupCallLogs(beforeDays: number): number {
+  const cutoff = new Date(Date.now() - beforeDays * 24 * 3600 * 1000).toISOString();
+  const info = db.prepare('DELETE FROM call_logs WHERE ts < ?').run(cutoff);
+  return info.changes;
 }

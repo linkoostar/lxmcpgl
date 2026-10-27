@@ -31,6 +31,7 @@
         <button class="nav-btn" data-page="tools">工具列表</button>
         <button class="nav-btn" data-page="users">运营用户</button>
         <button class="nav-btn" data-page="settings">系统设置</button>
+        <button class="nav-btn" data-page="logs">调用日志</button>
       </nav>
       <div class="spacer"></div>
       <span id="me-name" class="muted"></span>
@@ -185,6 +186,55 @@
         </div>
       </div>
     </main>
+
+    <!-- 调用日志 -->
+    <main id="page-logs" class="page hidden">
+      <div class="log-stats" id="log-stats"></div>
+
+      <div class="card">
+        <h2>调用记录</h2>
+        <div class="toolbar">
+          <input id="log-search" placeholder="搜索 工具名 / 调用者 / 错误信息…" />
+          <select id="log-caller-filter" style="width:130px;padding:7px 8px;border-radius:8px;border:1px solid var(--border)"><option value="">全部调用者</option></select>
+          <select id="log-success-filter" style="width:110px;padding:7px 8px;border-radius:8px;border:1px solid var(--border)">
+            <option value="">全部</option>
+            <option value="1">仅成功</option>
+            <option value="0">仅失败</option>
+          </select>
+          <select id="log-since-filter" style="width:120px;padding:7px 8px;border-radius:8px;border:1px solid var(--border)">
+            <option value="">全部时间</option>
+            <option value="24">最近 24h</option>
+            <option value="7">最近 7 天</option>
+            <option value="1">最近 1 天</option>
+          </select>
+          <button id="btn-log-search" class="btn">筛选</button>
+          <div class="spacer"></div>
+          <button id="btn-log-refresh" class="btn ghost small">刷新</button>
+          <button id="btn-log-clean" class="btn small danger">清理 30 天前</button>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th style="width:160px">时间</th>
+                <th style="width:110px">调用者</th>
+                <th style="width:200px">工具</th>
+                <th style="width:60px">类型</th>
+                <th style="width:60px">耗时</th>
+                <th style="width:70px">结果</th>
+                <th>错误 / 店铺</th>
+              </tr>
+            </thead>
+            <tbody id="logs-tbody"></tbody>
+          </table>
+        </div>
+        <div class="pager">
+          <button id="btn-log-prev" class="btn small">上一页</button>
+          <span id="log-page-info" class="muted"></span>
+          <button id="btn-log-next" class="btn small">下一页</button>
+        </div>
+      </div>
+    </main>
   </div>
 
   <!-- 用户权限弹窗 -->
@@ -221,7 +271,10 @@
           <div id="perm-shop-list" class="perm-list"></div>
         </div>
       </div>
-      <div class="row">
+      <div class="perm-summary-row">
+        <span id="perm-summary-tools" class="muted">—</span>
+        <span id="perm-summary-shops" class="muted">—</span>
+        <div class="spacer"></div>
         <button id="user-modal-save" class="btn primary">保存权限</button>
         <span id="user-modal-tip" class="muted"></span>
       </div>

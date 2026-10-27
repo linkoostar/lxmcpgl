@@ -22,6 +22,9 @@ import {
   setUserShops,
   getReadToolIds,
   getToolCountByType,
+  listCallLogs,
+  getCallLogStats,
+  cleanupCallLogs,
 } from './db.js';
 import { config, META_TOOLS } from './config.js';
 import { getUpstreamClient, resetUpstreamClient, UpstreamError } from './upstream.js';
@@ -573,6 +576,43 @@ apiRouter.post(
       const status = e instanceof UpstreamError ? e.status : 500;
       res.status(status === 500 ? 502 : 200).json({ ok: false, error: String(e?.message || e).slice(0, 500) });
     }
+  })
+);
+
+// ---------- 调用日志 ----------
+
+apiRouter.get(
+  '/call-logs',
+  requireAuth,
+  wrap(async (req, res) => {
+    const q = String(req.query.q ?? '').trim();
+    const caller = String(req.query.caller ?? '').trim();
+    const tool = String(req.query.tool ?? '').trim();
+    const success = req.query.success !== undefined ? String(req.query.success) as '1' | '0' : undefined;
+    const since = String(req.query.since ?? '').trim() || undefined;
+    const page = Math.max(1, parseInt(String(req.query.page ?? '1'), 10) || 1);
+    const pageSize = Math.min(200, Math.max(1, parseInt(String(req.query.page_size ?? '50'), 10) || 50));
+    const r = listCallLogs({ q, caller, tool, success, since, page, pageSize });
+    res.json(r);
+  })
+);
+
+apiRouter.get(
+  '/call-logs/stats',
+  requireAuth,
+  wrap(async (req, res) => {
+    const since = String(req.query.since ?? '').trim() || undefined;
+    res.json(getCallLogStats(since));
+  })
+);
+
+apiRouter.delete(
+  '/call-logs',
+  requireAuth,
+  wrap(async (req, res) => {
+    const days = Math.max(1, parseInt(String(req.query.days ?? '30'), 10) || 30);
+    const deleted = cleanupCallLogs(days);
+    res.json({ ok: true, deleted, before_days: days });
   })
 );
 

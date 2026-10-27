@@ -46,9 +46,11 @@ function switchPage(name) {
   $('#page-tools').classList.toggle('hidden', name !== 'tools');
   $('#page-users').classList.toggle('hidden', name !== 'users');
   $('#page-settings').classList.toggle('hidden', name !== 'settings');
+  $('#page-logs').classList.toggle('hidden', name !== 'logs');
   if (name === 'tools') loadTools();
   if (name === 'users') loadUsers();
   if (name === 'settings') loadSettings();
+  if (name === 'logs') loadLogs();
 }
 
 /* ---------- 登录 ---------- */
@@ -376,6 +378,23 @@ const permState = {
   allTools: true, toolIds: new Set(), allShops: true, shopIds: new Set(), shopsCache: null
 };
 
+function updatePermSummary() {
+  const toolsCount = (permState.toolsCache || []).length;
+  const shopsCount = (permState.shopsCache || []).length;
+  const tTxt = permState.allTools
+    ? `全部启用工具（${toolsCount ? `共 ${toolsCount} 个` : ''}）`
+    : `已选 ${permState.toolIds.size} 个工具`;
+  const sTxt = permState.allShops
+    ? `全部店铺${shopsCount ? `（${shopsCount} 店）` : ''}`
+    : `已选 ${permState.shopIds.size} 个店铺`;
+  const tEl = $('#perm-summary-tools');
+  const sEl = $('#perm-summary-shops');
+  if (tEl) tEl.textContent = tTxt;
+  if (sEl) sEl.textContent = sTxt;
+}
+// 暴露给 checkbox 回调（renderPermTools 内部 chk.change 会直接改 permState.toolIds/shopIds，渲染完需要刷新摘要）
+permState.updateSummary = updatePermSummary;
+
 async function openUserPerm(u) {
   const detail = await api('/users/' + u.id);
   permState.mode = 'user';
@@ -400,6 +419,7 @@ async function openUserPerm(u) {
   document.querySelector('input[name="perm-shops"][value="custom"]').checked = !detail.all_shops;
 
   $('#user-modal-save').textContent = '保存权限';
+  updatePermSummary();
   $('#user-mask').classList.remove('hidden');
 }
 
@@ -427,6 +447,7 @@ async function openTemplateEditor() {
   document.querySelector('input[name="perm-shops"][value="custom"]').checked = !permState.allShops;
 
   $('#user-modal-save').textContent = '保存模板';
+  updatePermSummary();
   $('#user-mask').classList.remove('hidden');
 }
 
@@ -452,6 +473,7 @@ function renderPermTools() {
     list.appendChild(label);
   }
   if (!tools.length) list.innerHTML = '<span class="muted">请先在工具列表页同步工具</span>';
+  updatePermSummary();
 }
 
 async function ensureToolsCache() {
@@ -490,13 +512,14 @@ function renderPermShops() {
     list.appendChild(label);
   }
   if (!shops.length) list.innerHTML = '<span class="muted">请先在「系统设置」同步店铺</span>';
+  updatePermSummary();
 }
 
 document.querySelectorAll('input[name="perm-tools"]').forEach((r) =>
-  r.addEventListener('change', () => { permState.allTools = r.value === 'all' ? r.checked : !r.checked; })
+  r.addEventListener('change', () => { permState.allTools = r.value === 'all' ? r.checked : !r.checked; updatePermSummary(); })
 );
 document.querySelectorAll('input[name="perm-shops"]').forEach((r) =>
-  r.addEventListener('change', () => { permState.allShops = r.value === 'all' ? r.checked : !r.checked; })
+  r.addEventListener('change', () => { permState.allShops = r.value === 'all' ? r.checked : !r.checked; updatePermSummary(); })
 );
 $('#perm-tool-search').addEventListener('input', renderPermTools);
 $('#perm-tool-all').addEventListener('click', () => {
@@ -707,6 +730,128 @@ function copyText(text, msg) {
 function escapeHtml(s) {
   return String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
+
+/* ---------- 调用日志 ---------- */
+
+const logState = { q: '', caller: '', success: '', since: '', page: 1, pageSize: 50, total: 0 };
+
+async function loadLogs() {
+  // 同时拉 stats 和 列表
+  const [stats, callers] = await Promise.all([
+    api('/call-logs/stats'),
+    api('/users'),
+  ]);
+  renderLogStats(stats);
+
+  // 填充调用者筛选下拉
+  const sel = $('#log-caller-filter');
+  sel.innerHTML = '<option value="">全部调用者</option>';
+  sel.append(new Option('admin', 'admin'));
+  for (const u of callers.items) sel.append(new Option(u.username, u.username));
+
+  // 如果是首次进入且没设置筛选，用最近 7 天
+  if (!logState.since && !logState.preset) {
+    // 首次使用默认查全部
+  }
+  await loadLogList();
+}
+
+function renderLogStats(stats) {
+  const root = $('#log-stats');
+  const topTools = (stats.top_tools || []).map((t) => `${t.tool_name} ×${t.count}`).join(' · ') || '—';
+  const topCallers = (stats.top_callers || []).map((t) => `${t.caller} ×${t.count}`).join(' · ') || '—';
+  root.innerHTML = `
+    <div class="log-stat-card"><div class="label">总调用</div><div class="value">${stats.total}</div></div>
+    <div class="log-stat-card success"><div class="label">成功</div><div class="value">${stats.success || 0}</div></div>
+    <div class="log-stat-card failed"><div class="label">失败 / 拒绝</div><div class="value">${stats.failed || 0}</div></div>
+    <div class="log-stat-card avg"><div class="label">平均耗时</div><div class="value">${stats.avg_ms != null ? stats.avg_ms + ' ms' : '—'}</div></div>
+    <div class="log-stat-card"><div class="label">独立调用者 / 工具</div>
+      <div class="value" style="font-size:15px">${stats.unique_callers || 0} · ${stats.unique_tools || 0}</div>
+      <div class="log-stats-inline"><div><b>热门工具</b>${topTools}</div><div><b>调用者</b>${topCallers}</div></div>
+    </div>
+  `;
+}
+
+async function loadLogList() {
+  const params = new URLSearchParams();
+  if (logState.q) params.set('q', logState.q);
+  if (logState.caller) params.set('caller', logState.caller);
+  if (logState.success) params.set('success', logState.success);
+  if (logState.since) params.set('since', logState.since);
+  params.set('page', logState.page);
+  params.set('page_size', logState.pageSize);
+
+  const { total, items } = await api('/call-logs?' + params.toString());
+  logState.total = total;
+  $('#log-page-info').textContent = `共 ${total} 条 · 第 ${logState.page} / ${Math.max(1, Math.ceil(total / logState.pageSize))} 页`;
+  const tbody = $('#logs-tbody');
+  tbody.innerHTML = '';
+  for (const l of items) {
+    const tr = document.createElement('tr');
+    const ts = new Date(l.ts);
+    const td0 = document.createElement('td');
+    td0.textContent = ts.toLocaleString();
+
+    const td1 = document.createElement('td');
+    td1.textContent = l.caller;
+    td1.style.fontWeight = l.caller === 'admin' ? '600' : '';
+
+    const td2 = document.createElement('td');
+    td2.innerHTML = `<code>${escapeHtml(l.tool_name)}</code>`;
+    if (l.tool_id) td2.innerHTML += `<div class="desc">${escapeHtml(l.tool_id)}</div>`;
+
+    const td3 = document.createElement('td');
+    if (l.tool_type === 'write') td3.innerHTML = '<span class="tag warn">write</span>';
+    else if (l.tool_type === 'read') td3.innerHTML = '<span class="tag ok">read</span>';
+    else td3.innerHTML = '<span class="muted">-</span>';
+
+    const td4 = document.createElement('td');
+    td4.textContent = l.duration_ms != null ? `${l.duration_ms}ms` : '-';
+
+    const td5 = document.createElement('td');
+    if (l.success) td5.innerHTML = '<span class="tag ok">成功</span>';
+    else td5.innerHTML = `<span class="tag no">${l.is_error ? '失败' : '拒绝'}</span>`;
+
+    const td6 = document.createElement('td');
+    const shops = (() => {
+      try { return l.shop_refs ? JSON.parse(l.shop_refs) : null; } catch { return null; }
+    })();
+    const parts = [];
+    if (l.error) parts.push(`<span class="desc" style="color:#dc2626">${escapeHtml(l.error)}</span>`);
+    if (shops && shops.length) parts.push(`<span class="muted">店铺: ${shops.join(', ')}</span>`);
+    td6.innerHTML = parts.join(' ') || '<span class="muted">—</span>';
+
+    tr.append(td0, td1, td2, td3, td4, td5, td6);
+    tbody.appendChild(tr);
+  }
+  if (!items.length) {
+    tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--muted);padding:30px">暂无调用记录，运营或管理员使用 MCP 网关后会自动记录</td></tr>';
+  }
+}
+
+$('#btn-log-search').addEventListener('click', async () => {
+  logState.q = $('#log-search').value.trim();
+  logState.caller = $('#log-caller-filter').value;
+  logState.success = $('#log-success-filter').value;
+  logState.since = $('#log-since-filter').value
+    ? new Date(Date.now() - Number($('#log-since-filter').value) * 3600 * 1000).toISOString()
+    : '';
+  logState.page = 1;
+  logState.preset = true;
+  try { await loadLogList(); } catch (e) { toast(e.message); }
+});
+$('#log-search').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('#btn-log-search').click(); });
+$('#btn-log-refresh').addEventListener('click', async () => { try { await loadLogs(); } catch (e) { toast(e.message); } });
+$('#btn-log-prev').addEventListener('click', () => { if (logState.page > 1) { logState.page--; loadLogList().catch((e) => toast(e.message)); } });
+$('#btn-log-next').addEventListener('click', () => { if (logState.page * logState.pageSize < logState.total) { logState.page++; loadLogList().catch((e) => toast(e.message)); } });
+$('#btn-log-clean').addEventListener('click', async () => {
+  if (!confirm('清理 30 天前的调用日志？此操作不可恢复。')) return;
+  try {
+    const r = await api('/call-logs?days=30', { method: 'DELETE' });
+    toast(`已清理 ${r.deleted} 条旧日志`);
+    loadLogs().catch(() => {});
+  } catch (e) { toast(e.message); }
+});
 
 /* ---------- 初始化 ---------- */
 

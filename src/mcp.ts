@@ -9,6 +9,7 @@ import {
   getUserToolIds,
   getUserShopIds,
   touchUser,
+  insertCallLog,
   type UserRow,
 } from './db.js';
 import { getUpstreamClient } from './upstream.js';
@@ -202,62 +203,104 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
     const name = String(request.params.name ?? '');
     const args = (request.params.arguments ?? {}) as Record<string, unknown>;
 
-    // 身份与限流
+    // 预先抽取店铺引用（后续可能要返回错误，提前提取好用于日志）
+    const shopRefs = collectShopRefs(args);
+
+    // 日志元信息（贯穿整个 handler）
+    const logCtx = {
+      caller: identity.kind === 'admin' ? 'admin' : identity.username,
+      userId: identity.kind === 'user' ? identity.id : null,
+      toolName: name,
+      toolId: null as string | null,
+      toolType: null as string | null,
+      shopRefs,
+      started: Date.now(),
+    };
+
+    function logOutcome(success: boolean, isError: boolean, error?: string): void {
+      insertCallLog({
+        caller: logCtx.caller,
+        user_id: logCtx.userId,
+        tool_name: logCtx.toolName,
+        tool_id: logCtx.toolId,
+        tool_type: logCtx.toolType,
+        shop_refs: logCtx.shopRefs.length > 0 ? logCtx.shopRefs : null,
+        success,
+        is_error: isError,
+        duration_ms: Date.now() - logCtx.started,
+        error: error ?? null,
+      });
+    }
+
+    // ---- 身份与限流 ----
     if (identity.kind === 'user') {
       const u = db.prepare('SELECT enabled FROM users WHERE id = ?').get(identity.id) as { enabled: number } | undefined;
-      if (!u || !u.enabled) return errorResult('账号已被停用');
+      if (!u || !u.enabled) { logOutcome(false, true, '账号已停用'); return errorResult('账号已被停用'); }
       if (!checkRateLimit(identity.id, identity.rate_limit)) {
+        logOutcome(false, true, `限流 ${identity.rate_limit}/分钟`);
         return errorResult(`调用过于频繁：当前限速 ${identity.rate_limit} 次/分钟`);
       }
       touchUser(identity.id);
     }
 
     const tool = getToolByExposedName(name);
-    if (!tool || !tool.enabled) return errorResult(`工具不存在或未启用: ${name}`);
+    if (!tool || !tool.enabled) { logOutcome(false, true, '工具不存在或未启用'); return errorResult(`工具不存在或未启用: ${name}`); }
+    logCtx.toolId = tool.tool_id;
+    logCtx.toolType = tool.tool_type;
 
     // 用户工具白名单
     if (identity.kind === 'user' && !identity.all_tools) {
       const allowed = getUserToolIds(identity.id);
-      if (!allowed.includes(tool.tool_id)) return errorResult(`无权使用该工具: ${name}`);
+      if (!allowed.includes(tool.tool_id)) {
+        logOutcome(false, true, '无权使用该工具');
+        return errorResult(`无权使用该工具: ${name}`);
+      }
     }
 
     // write 工具管控
     if (identity.kind === 'user' && tool.tool_type === 'write' && getSetting('block_write') === '1') {
+      logOutcome(false, true, 'block_write 禁止写操作');
       return errorResult(`该工具为写操作，已被网关禁用: ${name}`);
     }
 
-    if (!getSetting('upstream_key')) return errorResult('网关未配置上游密钥，请管理员在 Web 后台完成配置');
+    if (!getSetting('upstream_key')) {
+      logOutcome(false, true, '网关未配置上游密钥');
+      return errorResult('网关未配置上游密钥，请管理员在 Web 后台完成配置');
+    }
 
     // 店铺级校验（仅对运营用户生效）
-    if (identity.kind === 'user' && !identity.all_shops) {
-      const refs = collectShopRefs(args);
-      if (refs.length > 0) {
-        const allowedShops = new Set(getUserShopIds(identity.id));
-        const denied = refs.filter((r) => !allowedShops.has(r));
-        if (denied.length > 0) {
-          return errorResult(`无权访问以下店铺: ${denied.join(', ')}`);
-        }
+    if (identity.kind === 'user' && !identity.all_shops && shopRefs.length > 0) {
+      const allowedShops = new Set(getUserShopIds(identity.id));
+      const denied = shopRefs.filter((r) => !allowedShops.has(r));
+      if (denied.length > 0) {
+        logOutcome(false, true, `无权访问店铺: ${denied.join(',')}`);
+        return errorResult(`无权访问以下店铺: ${denied.join(', ')}`);
       }
     }
 
-    const started = Date.now();
-    const caller = identity.kind === 'admin' ? 'admin' : identity.username;
+    // ---- 调用上游 ----
+    const caller = logCtx.caller;
     try {
       const client = getUpstreamClient(getSetting('upstream_url'), getSetting('upstream_key'));
-      // 上游是元工具模式：业务工具统一经 action(toolId, params) 执行
       const resp = await callUpstreamTool(client, tool.tool_id, args);
-      const duration = Date.now() - started;
+      const duration = Date.now() - logCtx.started;
       if (resp?.error) {
-        console.error(`[mcp] ${caller} ${name} 上游错误 (${duration}ms): ${JSON.stringify(resp.error).slice(0, 200)}`);
-        return errorResult(`上游错误: ${JSON.stringify(resp.error).slice(0, 500)}`);
+        const msg = String(resp.error).slice(0, 500);
+        console.error(`[mcp] ${caller} ${name} 上游错误 (${duration}ms): ${msg.slice(0, 200)}`);
+        logOutcome(false, true, msg);
+        return errorResult(`上游错误: ${msg}`);
       }
       const content = resp?.result?.content;
       console.log(`[mcp] ${caller} ${name} ok ${duration}ms`);
+      logOutcome(true, false);
       if (Array.isArray(content)) return { content };
+      logOutcome(false, true, '上游返回为空');
       return errorResult('上游返回为空');
     } catch (e: any) {
-      console.error(`[mcp] ${caller} ${name} 调用失败: ${String(e?.message || e).slice(0, 300)}`);
-      return errorResult(`调用失败: ${String(e?.message || e).slice(0, 300)}`);
+      const msg = String(e?.message || e).slice(0, 500);
+      console.error(`[mcp] ${caller} ${name} 调用失败: ${msg.slice(0, 300)}`);
+      logOutcome(false, true, msg);
+      return errorResult(`调用失败: ${msg}`);
     }
   });
 

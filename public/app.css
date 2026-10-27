@@ -142,3 +142,30 @@ td .desc { color: var(--muted); font-size: 12px; display: block; max-width: 560p
   background: #1f2328; color: #fff; padding: 10px 18px; border-radius: 8px; font-size: 13px; z-index: 200;
 }
 .error { color: var(--danger); font-size: 13px; }
+
+/* 权限弹窗底部统计 */
+.perm-summary-row {
+  display: flex; gap: 16px; align-items: center; padding-top: 6px;
+  border-top: 1px solid var(--border); flex-wrap: wrap;
+}
+.perm-summary-row .tag { font-size: 11px; padding: 2px 10px; }
+
+/* 调用日志统计卡片 */
+.log-stats {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px; margin-bottom: 16px;
+}
+.log-stat-card {
+  background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 14px 16px;
+}
+.log-stat-card .label { font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+.log-stat-card .value { font-size: 22px; font-weight: 600; color: var(--text); }
+.log-stat-card.success .value { color: #059669; }
+.log-stat-card.failed .value { color: #dc2626; }
+.log-stat-card.avg .value { color: var(--primary); }
+.log-stats-inline {
+  display: flex; flex-direction: column; gap: 4px; margin-top: 8px; font-size: 12px;
+}
+.log-stats-inline div { display: flex; gap: 8px; align-items: center; }
+.log-stats-inline b { font-weight: 600; }
