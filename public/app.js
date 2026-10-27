@@ -513,7 +513,11 @@ openUserPerm = async function (u) {
 function renderPermShops() {
   const list = $('#perm-shop-list');
   list.innerHTML = '';
-  const shops = permState.shopsCache || [];
+  const q = ($('#perm-shop-search')?.value || '').toLowerCase();
+  const allShops = permState.shopsCache || [];
+  const shops = q
+    ? allShops.filter((s) => (s.sid + ' ' + s.name + ' ' + (s.country || '')).toLowerCase().includes(q))
+    : allShops;
   for (const s of shops) {
     const label = document.createElement('label');
     label.className = 'perm-item';
@@ -542,6 +546,7 @@ document.querySelectorAll('input[name="perm-shops"]').forEach((r) =>
   r.addEventListener('change', () => { permState.allShops = r.value === 'all' ? r.checked : !r.checked; updatePermSummary(); })
 );
 $('#perm-tool-search').addEventListener('input', renderPermTools);
+$('#perm-shop-search')?.addEventListener('input', renderPermShops);
 $('#perm-tool-all').addEventListener('click', () => {
   (permState.toolsCache || []).forEach((t) => permState.toolIds.add(t.tool_id));
   renderPermTools();
@@ -779,18 +784,32 @@ async function loadLogs() {
 function renderLogStats(stats) {
   const root = $('#log-stats');
   const rate = stats.total > 0 ? ((stats.success / stats.total) * 100).toFixed(1) + '%' : '—';
-  const topTools = (stats.top_tools || []).map((t) => `${t.tool_name} ×${t.count}`).join(' · ') || '—';
-  const topCallers = (stats.top_callers || []).map((t) => `${t.caller} ×${t.count}`).join(' · ') || '—';
+  const topTools = (stats.top_tools || []).slice(0, 8);
+  const topCallers = (stats.top_callers || []).slice(0, 5);
+  const toolChips = topTools.map((t) => `<span class="chip">${t.tool_id || t.tool_name} <b>×${t.count}</b></span>`).join('') || '<span class="muted">—</span>';
+  const callerChips = topCallers.map((t) => `<span class="chip caller">${t.caller} <b>×${t.count}</b></span>`).join('') || '<span class="muted">—</span>';
   root.innerHTML = `
     <div class="log-stat-card"><div class="label">总调用</div><div class="value">${stats.total}</div></div>
     <div class="log-stat-card success"><div class="label">成功</div><div class="value">${stats.success || 0}</div><div class="muted" style="font-size:12px;margin-top:4px">成功率 ${rate}</div></div>
     <div class="log-stat-card failed"><div class="label">失败 / 拒绝</div><div class="value">${stats.failed || 0}</div></div>
     <div class="log-stat-card avg"><div class="label">平均耗时</div><div class="value">${stats.avg_ms != null ? stats.avg_ms + ' ms' : '—'}</div></div>
-    <div class="log-stat-card"><div class="label">独立调用者 / 工具</div>
-      <div class="value" style="font-size:15px">${stats.unique_callers || 0} · ${stats.unique_tools || 0}</div>
-      <div class="log-stats-inline"><div><b>热门工具</b>${topTools}</div><div><b>调用者</b>${topCallers}</div></div>
+  `;
+  // 独立横列：热门工具 + 调用者（先清旧的再插新的）
+  const prev = document.querySelector('.log-stats-detail');
+  if (prev) prev.remove();
+  const detail = document.createElement('div');
+  detail.className = 'log-stats-detail';
+  detail.innerHTML = `
+    <div class="detail-col">
+      <div class="detail-head">🔥 热门工具 <span class="muted">（调用 ${stats.unique_tools || 0} 种）</span></div>
+      <div class="chip-row">${toolChips}</div>
+    </div>
+    <div class="detail-col">
+      <div class="detail-head">👤 调用者 <span class="muted">（${stats.unique_callers || 0} 人）</span></div>
+      <div class="chip-row">${callerChips}</div>
     </div>
   `;
+  root.after(detail);
 }
 
 async function loadLogList() {

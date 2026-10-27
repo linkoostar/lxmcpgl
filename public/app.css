@@ -174,8 +174,19 @@ td .desc { color: var(--muted); font-size: 12px; display: block;
 .log-stat-card.success .value { color: #059669; }
 .log-stat-card.failed .value { color: #dc2626; }
 .log-stat-card.avg .value { color: var(--primary); }
-.log-stats-inline {
-  display: flex; flex-direction: column; gap: 4px; margin-top: 8px; font-size: 12px;
+.log-stats-detail {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 12px;
+  background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 12px 16px; margin-bottom: 16px;
 }
-.log-stats-inline div { display: flex; gap: 8px; align-items: center; }
-.log-stats-inline b { font-weight: 600; }
+.log-stats-detail .detail-col { min-width: 0; }
+.log-stats-detail .detail-head { font-size: 13px; font-weight: 600; margin-bottom: 6px; color: var(--text); }
+.log-stats-detail .chip-row { display: flex; flex-wrap: wrap; gap: 4px 6px; }
+.log-stats-detail .chip {
+  display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 999px;
+  background: #f3f4f6; color: #374151; border: 1px solid #e5e7eb; max-width: 100%;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.log-stats-detail .chip b { font-weight: 600; color: var(--primary); margin-left: 4px; }
+.log-stats-detail .chip.caller { background: #eff6ff; color: #1e40af; border-color: #bfdbfe; }
+.log-stats-detail .chip.caller b { color: #1e40af; }
