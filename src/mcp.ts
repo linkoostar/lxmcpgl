@@ -1,6 +1,6 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import { InitializeRequestSchema, ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import type { Request, Response } from 'express';
 import {
   db,
@@ -10,6 +10,8 @@ import {
   getUserShopIds,
   touchUser,
   insertCallLog,
+  listUpstreams,
+  getUpstreamToolCounts,
   type UserRow,
 } from './db.js';
 import { getUpstreamClient } from './upstream.js';
@@ -250,38 +252,69 @@ async function callUpstreamTool(
 // ---------- 主处理 ----------
 
 export async function handleMcpRequest(req: Request, res: Response, identity: McpIdentity): Promise<void> {
+  // 构建动态 serverInfo — 让 Agent 启动时一眼知道网关聚合了哪些上游
+  const upstreams = listUpstreams().filter((u) => u.active);
+  const toolCounts = getUpstreamToolCounts();
+  const upstreamDesc = upstreams
+    .map((u) => `${u.name}（${u.notes || '无描述'}，${toolCounts[u.id] ?? 0} 工具）`)
+    .join('；');
+  const totalTools = upstreams.reduce((sum, u) => sum + (toolCounts[u.id] ?? 0), 0);
+  const serverDesc = `方中 MCP 网关，聚合 ${upstreams.length} 个上游 · ${totalTools} 工具：${upstreamDesc}`;
+
   const server = new Server(
-    { name: 'lxmcpgl-gateway', version: '1.0.0' },
+    { name: 'fangzhong-mcp-gateway', version: '1.0.0', description: serverDesc },
     { capabilities: { tools: { listChanged: false } } }
   );
 
+  // 覆盖 SDK 默认的 initialize handler — 返回动态 serverInfo
+  server.setRequestHandler(InitializeRequestSchema, async () => ({
+    protocolVersion: '2025-03-26',
+    capabilities: { tools: { listChanged: false } },
+    serverInfo: { name: '方中 MCP 网关', version: '1.0.0' },
+    _meta: undefined,
+  }));
+
   server.setRequestHandler(ListToolsRequestSchema, async () => {
-    let rows: Array<{ exposed_name: string; name: string; description: string; input_schema: string | null }>;
+    // 先查 active upstream 列表，用于给每个工具打 tag
+    const upMap = new Map(upstreams.map((u) => [u.id, { name: u.name, notes: u.notes }]));
+
+    let rows: Array<{ upstream: string; exposed_name: string; name: string; description: string; input_schema: string | null }>;
     if (identity.kind === 'admin') {
-      // admin 看所有 upstream 的工具（网关管理员全视角）
       rows = db
-        .prepare('SELECT exposed_name, name, description, input_schema FROM tools WHERE enabled = 1 ORDER BY upstream, tool_id')
+        .prepare('SELECT upstream, exposed_name, name, description, input_schema FROM tools WHERE enabled = 1 ORDER BY upstream, tool_id')
         .all() as any[];
     } else {
       const up = identity.upstream;
       if (!identity.all_tools) {
         const allowed = new Set(getUserToolIds(identity.id));
         const all = db
-          .prepare('SELECT tool_id, exposed_name, name, description, input_schema FROM tools WHERE enabled = 1 AND upstream = ? ORDER BY tool_id')
+          .prepare('SELECT upstream, tool_id, exposed_name, name, description, input_schema FROM tools WHERE enabled = 1 AND upstream = ? ORDER BY tool_id')
           .all(up) as any[];
         rows = all.filter((r) => allowed.has(r.tool_id));
       } else {
         rows = db
-          .prepare('SELECT exposed_name, name, description, input_schema FROM tools WHERE enabled = 1 AND upstream = ? ORDER BY tool_id')
+          .prepare('SELECT upstream, exposed_name, name, description, input_schema FROM tools WHERE enabled = 1 AND upstream = ? ORDER BY tool_id')
           .all(up) as any[];
       }
     }
     return {
-      tools: rows.map((r) => ({
-        name: r.exposed_name,
-        description: r.description || r.name || r.exposed_name,
-        inputSchema: safeParseSchema(r.input_schema),
-      })),
+      tools: rows.map((r) => {
+        const upInfo = upMap.get(r.upstream);
+        const upstreamName = upInfo?.name ?? r.upstream;
+        const upstreamDesc = upInfo?.notes ?? '';
+        // 在 description 开头注入「来源」，LLM 一眼就能按域分组
+        const descPrefix = upstreamDesc ? `[来自 ${upstreamName} · ${upstreamDesc}] ` : `[来自 ${upstreamName}] `;
+        const rawDesc = r.description || r.name || r.exposed_name;
+        return {
+          name: r.exposed_name,
+          description: descPrefix + rawDesc,
+          inputSchema: safeParseSchema(r.input_schema),
+          // 非标准扩展字段，Agent/客户端如果认 MCP tools 里的自定义字段可以直接用
+          _upstream: r.upstream,
+          _upstream_name: upstreamName,
+          _upstream_desc: upstreamDesc,
+        };
+      }),
     };
   });
 
