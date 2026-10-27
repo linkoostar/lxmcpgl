@@ -57,32 +57,104 @@ export function initDb(): void {
     CREATE TABLE IF NOT EXISTS call_logs (
       id          INTEGER PRIMARY KEY AUTOINCREMENT,
       ts          TEXT NOT NULL,
-      caller      TEXT NOT NULL,    -- 'admin' 或运营用户名
-      user_id     INTEGER,          -- 运营用户 id（admin 为 null）
-      tool_name   TEXT NOT NULL,    -- exposed_name
-      tool_id     TEXT,             -- 上游原始 tool_id
-      tool_type   TEXT,             -- read / write
-      shop_refs   TEXT,             -- JSON 数组 [sid,...]
-      success     INTEGER NOT NULL, -- 1=成功, 0=失败/被拒绝
-      is_error    INTEGER NOT NULL, -- 上游返回 isError
+      caller      TEXT NOT NULL,
+      user_id     INTEGER,
+      tool_name   TEXT NOT NULL,
+      tool_id     TEXT,
+      tool_type   TEXT,
+      shop_refs   TEXT,
+      success     INTEGER NOT NULL,
+      is_error    INTEGER NOT NULL,
       duration_ms INTEGER,
-      error       TEXT              -- 错误摘要（截断）
+      error       TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_call_logs_ts     ON call_logs(ts);
     CREATE INDEX IF NOT EXISTS idx_call_logs_caller ON call_logs(caller);
     CREATE INDEX IF NOT EXISTS idx_call_logs_tool   ON call_logs(tool_name);
+
+    -- ===== 多上游 M1 =====
+    CREATE TABLE IF NOT EXISTS upstreams (
+      id            TEXT PRIMARY KEY,            -- 'lingxing', 'xiyou-sif', 'sellermagic', 'nocodb'
+      name          TEXT NOT NULL,
+      url           TEXT NOT NULL,
+      api_key       TEXT,
+      adapter       TEXT NOT NULL,              -- 'lingxing-meta', 'flat-mcp', 'nocodb'
+      active        INTEGER DEFAULT 1,
+      sync_strategy TEXT DEFAULT 'pull',
+      shop_field    TEXT DEFAULT 'sid',
+      notes         TEXT DEFAULT '',
+      created_at    TEXT DEFAULT '',
+      updated_at    TEXT DEFAULT ''
+    );
+    CREATE TABLE IF NOT EXISTS cost_logs (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      upstream      TEXT NOT NULL,
+      user_id       INTEGER,
+      tool_name     TEXT NOT NULL,
+      tool_id       TEXT,
+      cost_credits  REAL DEFAULT 0,
+      duration_ms   INTEGER,
+      created_at    TEXT DEFAULT ''
+    );
+    CREATE INDEX IF NOT EXISTS idx_cost_logs_user     ON cost_logs(user_id);
+    CREATE INDEX IF NOT EXISTS idx_cost_logs_upstream ON cost_logs(upstream);
   `);
   migrate();
   seed();
 }
 
 function migrate(): void {
-  // 老库补充列（新增列不会由 CREATE TABLE IF NOT EXISTS 处理）
+  // ===== 原有迁移 =====
   const cols = (db.prepare(`PRAGMA table_info(tools)`).all() as Array<{ name: string }>).map((c) => c.name);
   if (!cols.includes('tool_type')) {
     db.exec(`ALTER TABLE tools ADD COLUMN tool_type TEXT DEFAULT ''`);
   }
-  // 工具分类兜底：给 tool_type 为空的老数据补算
+  // ===== M1：多上游 — 给现有表加 upstream 归属 =====
+  const tables: Array<{ name: string; defaultVal?: string; extraIdx?: string }> = [
+    { name: 'tools',      defaultVal: 'lingxing', extraIdx: 'idx_tools_upstream' },
+    { name: 'shops',      defaultVal: 'lingxing', extraIdx: 'idx_shops_upstream' },
+    { name: 'users',      defaultVal: 'lingxing' },
+    { name: 'user_tools', defaultVal: 'lingxing' },
+    { name: 'user_shops', defaultVal: 'lingxing' },
+    { name: 'call_logs',  defaultVal: 'lingxing', extraIdx: 'idx_call_logs_upstream' },
+  ];
+  for (const t of tables) {
+    const cs = (db.prepare(`PRAGMA table_info(${t.name})`).all() as Array<{ name: string }>).map((c) => c.name);
+    if (!cs.includes('upstream')) {
+      db.exec(`ALTER TABLE ${t.name} ADD COLUMN upstream TEXT DEFAULT '${t.defaultVal}'`);
+    }
+    if (t.extraIdx) {
+      db.exec(`CREATE INDEX IF NOT EXISTS ${t.extraIdx} ON ${t.name}(upstream)`);
+    }
+  }
+  // 数据兜底：任何 upstream 为 NULL/空的老记录补 'lingxing'
+  db.exec(`UPDATE tools      SET upstream = 'lingxing' WHERE upstream IS NULL OR upstream = ''`);
+  db.exec(`UPDATE shops      SET upstream = 'lingxing' WHERE upstream IS NULL OR upstream = ''`);
+  db.exec(`UPDATE users      SET upstream = 'lingxing' WHERE upstream IS NULL OR upstream = ''`);
+  db.exec(`UPDATE user_tools SET upstream = 'lingxing' WHERE upstream IS NULL OR upstream = ''`);
+  db.exec(`UPDATE user_shops SET upstream = 'lingxing' WHERE upstream IS NULL OR upstream = ''`);
+  db.exec(`UPDATE call_logs  SET upstream = 'lingxing' WHERE upstream IS NULL OR upstream = ''`);
+
+  // upstreams 表初始化领星记录（从现有 settings 取）
+  const hasLingxing = db.prepare("SELECT 1 FROM upstreams WHERE id = 'lingxing'").get();
+  if (!hasLingxing) {
+    const url = getSetting('upstream_url') || DEFAULT_UPSTREAM_URL;
+    const apiKey = getSetting('upstream_key'); // 可能为空，但先占位
+    db.prepare(
+      `INSERT INTO upstreams (id, name, url, api_key, adapter, active, sync_strategy, shop_field, notes, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, 1, 'poll', 'sid', '领星 ERP + 广告 + 财务 + 仓储 全平台数据源', ?, ?)`
+    ).run('lingxing', '领星', url, apiKey, 'lingxing-meta', new Date().toISOString(), new Date().toISOString());
+    console.log('[db] 已初始化 upstream: lingxing');
+  }
+  // upstreams 表补齐新列（ALTER 不会因为 CREATE TABLE IF NOT EXISTS 自动加）
+  const upCols = (db.prepare(`PRAGMA table_info(upstreams)`).all() as Array<{ name: string }>).map((c) => c.name);
+  if (!upCols.includes('shop_field')) db.exec(`ALTER TABLE upstreams ADD COLUMN shop_field TEXT DEFAULT 'sid'`);
+  if (!upCols.includes('sync_strategy')) db.exec(`ALTER TABLE upstreams ADD COLUMN sync_strategy TEXT DEFAULT 'poll'`);
+  if (!upCols.includes('notes')) db.exec(`ALTER TABLE upstreams ADD COLUMN notes TEXT DEFAULT ''`);
+  if (!upCols.includes('created_at')) db.exec(`ALTER TABLE upstreams ADD COLUMN created_at TEXT DEFAULT ''`);
+  if (!upCols.includes('updated_at')) db.exec(`ALTER TABLE upstreams ADD COLUMN updated_at TEXT DEFAULT ''`);
+
+  // 工具分类兜底
   backfillToolTypes();
 }
 
@@ -245,6 +317,7 @@ export interface UserRow {
   rate_limit: number;
   all_tools: number;
   all_shops: number;
+  upstream?: string;
   created_at: string;
   last_used_at: string;
 }

@@ -40,7 +40,7 @@ function mcpAuth(req: Request, res: Response, next: NextFunction): void {
     }
     identity = identityFromUser(user as UserRow);
   } else if (provided === getSetting('downstream_key')) {
-    identity = { kind: 'admin' }; // 管理员通用 Key：全部权限
+    identity = { kind: 'admin', upstream: 'lingxing' }; // 管理员通用 Key：全部权限
   } else {
     res.status(401).json({
       jsonrpc: '2.0',

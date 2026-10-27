@@ -22,11 +22,12 @@ import { refreshToolSchema } from './sync.js';
  */
 
 export type McpIdentity =
-  | { kind: 'admin' }
+  | { kind: 'admin'; upstream: string }
   | {
       kind: 'user';
       id: number;
       username: string;
+      upstream: string;
       rate_limit: number;
       all_tools: number;
       all_shops: number;
@@ -37,6 +38,7 @@ export function identityFromUser(u: UserRow): McpIdentity {
     kind: 'user',
     id: u.id,
     username: u.username,
+    upstream: u.upstream ?? 'lingxing',
     rate_limit: u.rate_limit,
     all_tools: u.all_tools,
     all_shops: u.all_shops,
@@ -254,22 +256,23 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
   );
 
   server.setRequestHandler(ListToolsRequestSchema, async () => {
+    const up = identity.upstream;
     let rows: Array<{ exposed_name: string; name: string; description: string; input_schema: string | null }>;
     if (identity.kind === 'admin') {
       rows = db
-        .prepare('SELECT exposed_name, name, description, input_schema FROM tools WHERE enabled = 1 ORDER BY tool_id')
-        .all() as any[];
+        .prepare('SELECT exposed_name, name, description, input_schema FROM tools WHERE enabled = 1 AND upstream = ? ORDER BY tool_id')
+        .all(up) as any[];
     } else {
       if (!identity.all_tools) {
         const allowed = new Set(getUserToolIds(identity.id));
         const all = db
-          .prepare('SELECT tool_id, exposed_name, name, description, input_schema FROM tools WHERE enabled = 1 ORDER BY tool_id')
-          .all() as any[];
+          .prepare('SELECT tool_id, exposed_name, name, description, input_schema FROM tools WHERE enabled = 1 AND upstream = ? ORDER BY tool_id')
+          .all(up) as any[];
         rows = all.filter((r) => allowed.has(r.tool_id));
       } else {
         rows = db
-          .prepare('SELECT exposed_name, name, description, input_schema FROM tools WHERE enabled = 1 ORDER BY tool_id')
-          .all() as any[];
+          .prepare('SELECT exposed_name, name, description, input_schema FROM tools WHERE enabled = 1 AND upstream = ? ORDER BY tool_id')
+          .all(up) as any[];
       }
     }
     return {
@@ -386,23 +389,43 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
       }
     }
 
-    // ---- 调用上游 ----
+    // ---- 调用上游（按 adapter 路由）----
     const caller = logCtx.caller;
+    const upConfig = db.prepare('SELECT * FROM upstreams WHERE id = ?').get(identity.upstream) as any;
+    if (!upConfig || !upConfig.active) {
+      logOutcome(false, true, `上游 ${identity.upstream} 未启用`);
+      return errorResult(`上游 ${identity.upstream} 未配置或已停用`);
+    }
+    if (!upConfig.api_key && !upConfig.url.includes('nocodb')) {
+      logOutcome(false, true, '上游未配置 API Key');
+      return errorResult(`上游 ${upConfig.name} 未配置 API Key，请联系管理员`);
+    }
     try {
-      const client = getUpstreamClient(getSetting('upstream_url'), getSetting('upstream_key'));
-      const resp = await callUpstreamTool(client, tool.tool_id, args);
+      // 延迟 import 避免循环依赖
+      const { getAdapter } = await import('./adapter.js');
+      const adapter = getAdapter(upConfig);
+      const callResult = await adapter.callTool(upConfig, tool.tool_id, args);
       const duration = Date.now() - logCtx.started;
-      if (resp?.error) {
-        const msg = String(resp.error).slice(0, 500);
+
+      // cost_logs 写入（上游付费分摊）
+      const cost = adapter.extractCost(callResult.content?.[0]?.text);
+      if (cost !== null) {
+        db.prepare(
+          'INSERT INTO cost_logs (upstream, user_id, tool_name, tool_id, cost_credits, duration_ms, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+        ).run(identity.upstream, identity.kind === 'user' ? identity.id : null, tool.exposed_name, tool.tool_id, cost, duration, new Date().toISOString());
+      }
+
+      if (callResult.isError) {
+        const msg = callResult.content?.[0]?.text?.slice(0, 500) ?? '上游返回错误';
         console.error(`[mcp] ${caller} ${name} 上游错误 (${duration}ms): ${msg.slice(0, 200)}`);
         logOutcome(false, true, msg);
-        return errorResult(`上游错误: ${msg}`);
+        return errorResult(`上游错误: ${msg.slice(0, 200)}`);
       }
-      const content = resp?.result?.content;
-      console.log(`[mcp] ${caller} ${name} ok ${duration}ms`);
+      const content = callResult.content;
+      console.log(`[mcp] ${caller} ${name} ok ${duration}ms upstream=${identity.upstream}`);
       logOutcome(true, false);
 
-      // 店铺结果过滤：运营用户 + 非全店铺权限时，把上游返回的店铺相关数组里不在白名单的条目砍掉
+      // 店铺结果过滤
       if (Array.isArray(content)) {
         let filteredContent: unknown = content;
         if (identity.kind === 'user' && !identity.all_shops) {
@@ -415,7 +438,7 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
       return errorResult('上游返回为空');
     } catch (e: any) {
       const msg = String(e?.message || e).slice(0, 500);
-      console.error(`[mcp] ${caller} ${name} 调用失败: ${msg.slice(0, 300)}`);
+      console.error(`[mcp] ${caller} ${name} 调用失败: ${msg.slice(0, 300)} upstream=${identity.upstream}`);
       logOutcome(false, true, msg);
       return errorResult(`调用失败: ${msg}`);
     }
