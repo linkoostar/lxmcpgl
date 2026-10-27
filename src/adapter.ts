@@ -248,13 +248,19 @@ class FlatMcpClient {
     });
     if (!resp.ok) throw new Error(`HTTP ${resp.status} ${resp.statusText}`);
     const txt = await resp.text();
-    // 支持 SSE（有些 flat MCP 用 streamable HTTP）
-    const firstLine = txt.split('\n')[0].trim();
-    if (firstLine.startsWith('data:')) {
-      const jsonStr = firstLine.slice(5).trim();
-      if (jsonStr === '[DONE]') throw new Error('SSE done without response');
-      return JSON.parse(jsonStr);
+    // 支持 SSE（NocoDB/西柚这类用 streamable HTTP 会返回 event: + data: 多行）
+    // 遍历所有行找最后一个 data: 开头的行（MCP SSE 可能多事件，我们要的是最后一个 JSON-RPC result）
+    const lines = txt.split(/\r?\n/);
+    let lastDataLine: string | null = null;
+    for (const ln of lines) {
+      const trimmed = ln.trim();
+      if (trimmed.startsWith('data:')) lastDataLine = trimmed.slice(5).trim();
     }
+    if (lastDataLine !== null) {
+      if (lastDataLine === '[DONE]') throw new Error('SSE done without response');
+      return JSON.parse(lastDataLine);
+    }
+    // 不是 SSE，直接 JSON.parse
     return JSON.parse(txt);
   }
 
