@@ -3,6 +3,7 @@ services:
     image: ghcr.io/linkoostar/lxmcpgl:latest
     container_name: lxmcpgl
     restart: unless-stopped
+    pull_policy: always            # 每次 up -d 自动拉最新镜像
     ports:
       - "8080:8080"
     environment:
@@ -12,4 +13,4 @@ services:
       - LINGXING_MCP_URL=https://openmcp.lingxing.com/mcp-servers/lingxing-mcp
       - LINGXING_MCP_KEY=你的领星X-Mcp-Key
     volumes:
-      - ./data:/app/data
+      - ./data:/app/data               # SQLite 数据，升级不丢配置
