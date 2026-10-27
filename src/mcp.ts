@@ -76,17 +76,24 @@ function checkRateLimit(userId: number, limitPerMin: number): boolean {
 }
 
 // ---------- 店铺参数校验 ----------
+// 注意：profile_id / profile_ids 是 Amazon 广告体系的 profile ID，和领星 shop sid 完全不同！
+// 不能和 shop sid 混在一个白名单比对里 —— profile_id 暂不参与 shop 级校验（shops 表无映射）。
 
-const SHOP_PARAM_KEYS = new Set([
+const SHOP_SID_KEYS = new Set([
   'sid',
   'sids',
   'store_id',
   'store_ids',
   'shop_id',
   'shop_ids',
-  'profile_id',
-  'profile_ids',
 ]);
+
+const SELLER_ID_KEYS = new Set([
+  'seller_id',
+  'seller_ids',
+]);
+
+const SHOP_PARAM_KEYS = new Set([...SHOP_SID_KEYS, ...SELLER_ID_KEYS]);
 
 function extractShopValues(value: unknown, out: string[], depth = 0): void {
   if (depth > 3 || value === null || value === undefined) return;
@@ -139,8 +146,7 @@ const SCHEMA_STALE_RE = /工具参数定义已更新|"code"\s*:\s*102/;
 
 const SHOP_ID_KEYS = new Set([
   'sid', 'shop_id', 'shop_ids', 'store_id', 'store_ids',
-  'profile_id', 'profile_ids', 'seller_id', 'seller_ids',
-  'shop_sids', 'seller_ids',
+  'shop_sids',
 ]);
 
 /** 从一个对象里抽取所有店铺标识 */
@@ -345,9 +351,35 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
     }
 
     // 店铺级校验（仅对运营用户生效）
+    // shop sid 白名单（sid / store_id / shop_id）—— 直接比对
+    // seller_id 校验 —— 查 shops 表：这个 seller_id 关联的 shop sid 是否在白名单里
     if (identity.kind === 'user' && !identity.all_shops && shopRefs.length > 0) {
-      const allowedShops = new Set(getUserShopIds(identity.id));
-      const denied = shopRefs.filter((r) => !allowedShops.has(r));
+      const allowedShopIds = new Set(getUserShopIds(identity.id));
+      // 上游所有 seller_id → shop sid 映射（缓存到 handler 内）
+      const sellerToSids = new Map<string, Set<string>>();
+      const sellerRows = db.prepare('SELECT seller_id, sid FROM shops').all() as Array<{ seller_id: string; sid: string }>;
+      for (const row of sellerRows) {
+        if (!row.seller_id) continue; // 过滤空值
+        let set = sellerToSids.get(row.seller_id);
+        if (!set) { set = new Set(); sellerToSids.set(row.seller_id, set); }
+        set.add(row.sid);
+      }
+
+      const denied: string[] = [];
+      for (const ref of shopRefs) {
+        // 如果 ref 是 seller_id 格式（Amazon seller_id 通常 14-22 字符大写字母+数字）
+        const isSellerId = sellerToSids.has(ref) || /^[A-Z0-9]{10,30}$/.test(ref);
+        if (isSellerId) {
+          // seller_id：映射到 shop sid 再比对
+          const mapped = sellerToSids.get(ref);
+          if (!mapped || ![...mapped].some((s) => allowedShopIds.has(s))) {
+            denied.push(ref);
+          }
+        } else {
+          // 默认当作 shop sid 直接比对
+          if (!allowedShopIds.has(ref)) denied.push(ref);
+        }
+      }
       if (denied.length > 0) {
         logOutcome(false, true, `无权访问店铺: ${denied.join(',')}`);
         return errorResult(`无权访问以下店铺: ${denied.join(', ')}`);
