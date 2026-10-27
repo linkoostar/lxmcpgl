@@ -25,10 +25,17 @@ import {
   listCallLogs,
   getCallLogStats,
   cleanupCallLogs,
+  listUpstreams,
+  getUpstream,
+  upsertUpstream,
+  deleteUpstream,
+  getUpstreamToolCounts,
+  maskUpstreamKey,
 } from './db.js';
 import { config, META_TOOLS } from './config.js';
 import { getUpstreamClient, resetUpstreamClient, UpstreamError } from './upstream.js';
-import { syncTools, isSyncing, listTools, batchSetEnabled } from './sync.js';
+import { syncTools, syncUpstreamById, isSyncing, listTools, batchSetEnabled, syncAllUpstreams } from './sync.js';
+import { getAdapter } from './adapter.js';
 
 const COOKIE_NAME = 'lx_session';
 const SESSION_TTL_MS = 12 * 3600 * 1000;
@@ -249,17 +256,194 @@ apiRouter.post(
 apiRouter.post(
   '/tools/sync',
   requireAuth,
-  wrap(async (_req, res) => {
+  wrap(async (req, res) => {
     if (isSyncing()) {
       res.status(409).json({ error: '已有同步任务在进行中' });
       return;
     }
-    if (!getSetting('upstream_key')) {
-      res.status(400).json({ error: '请先配置上游密钥' });
-      return;
+    const upstreamId = String(req.body?.upstream_id ?? '').trim();
+    if (upstreamId) {
+      const r = await syncUpstreamById(upstreamId);
+      res.json({ [upstreamId]: r, totalSynced: r.synced });
+    } else {
+      const r = await syncAllUpstreams();
+      res.json(r);
     }
-    const result = await syncTools();
-    res.json(result);
+  })
+);
+
+// ---------- Upstreams CRUD（多上游管理）----------
+
+const KNOWN_ADAPTERS = ['lingxing-meta', 'flat-mcp'];
+
+function validateUpstreamId(id: string): string | null {
+  if (!id) return 'id 不能为空';
+  if (!/^[a-z0-9][a-z0-9_-]{1,31}$/.test(id)) return 'id 需为 2-32 位小写字母/数字/-/_ 且以字母/数字开头';
+  return null;
+}
+
+apiRouter.get(
+  '/upstreams',
+  requireAuth,
+  wrap(async (_req, res) => {
+    const counts = getUpstreamToolCounts();
+    const items = listUpstreams().map((u) => ({
+      id: u.id,
+      name: u.name,
+      url: u.url,
+      adapter: u.adapter,
+      adapter_label: u.adapter === 'lingxing-meta' ? '领星元工具模式' : u.adapter === 'flat-mcp' ? '标准扁平 MCP' : u.adapter,
+      active: !!u.active,
+      sync_strategy: u.sync_strategy,
+      shop_field: u.shop_field,
+      notes: u.notes,
+      api_key_set: !!u.api_key,
+      api_key_masked: maskUpstreamKey(u.api_key),
+      tool_count: counts[u.id] ?? 0,
+      created_at: u.created_at,
+      updated_at: u.updated_at,
+    }));
+    res.json({ items, known_adapters: KNOWN_ADAPTERS });
+  })
+);
+
+apiRouter.post(
+  '/upstreams',
+  requireAuth,
+  wrap(async (req, res) => {
+    const { id, name, url, api_key, adapter, active, notes } = req.body ?? {};
+    const sid = String(id ?? '').trim();
+    const err = validateUpstreamId(sid);
+    if (err) { res.status(400).json({ error: err }); return; }
+    if (getUpstream(sid)) { res.status(400).json({ error: `upstream ${sid} 已存在` }); return; }
+    const sname = String(name ?? '').trim();
+    if (!sname) { res.status(400).json({ error: 'name 不能为空' }); return; }
+    const surl = String(url ?? '').trim();
+    if (!/^https?:\/\//.test(surl)) { res.status(400).json({ error: 'url 必须以 http(s):// 开头' }); return; }
+    const sadapter = String(adapter ?? 'flat-mcp').trim();
+    if (!KNOWN_ADAPTERS.includes(sadapter)) { res.status(400).json({ error: `adapter 需为 ${KNOWN_ADAPTERS.join(' / ')}` }); return; }
+    const row = upsertUpstream({
+      id: sid,
+      name: sname,
+      url: surl,
+      api_key: api_key ? String(api_key).trim() : undefined,
+      adapter: sadapter,
+      active: active !== undefined ? (active ? 1 : 0) : 1,
+      notes: notes ? String(notes) : '',
+    });
+    res.json({ ok: true, upstream: row.id });
+  })
+);
+
+apiRouter.put(
+  '/upstreams/:id',
+  requireAuth,
+  wrap(async (req, res) => {
+    const sid = String(req.params.id);
+    const existing = getUpstream(sid);
+    if (!existing) { res.status(404).json({ error: 'upstream 不存在' }); return; }
+    const b = req.body ?? {};
+    const patch: Parameters<typeof upsertUpstream>[0] = {
+      id: sid,
+      name: existing.name,
+      url: existing.url,
+      api_key: undefined, // 不覆盖
+      adapter: existing.adapter,
+      active: existing.active,
+      sync_strategy: existing.sync_strategy,
+      shop_field: existing.shop_field,
+      notes: existing.notes,
+    };
+    if (b.name !== undefined) patch.name = String(b.name).trim();
+    if (b.url !== undefined) {
+      const u = String(b.url).trim();
+      if (!/^https?:\/\//.test(u)) { res.status(400).json({ error: 'url 必须以 http(s):// 开头' }); return; }
+      patch.url = u;
+    }
+    if (b.adapter !== undefined) {
+      const a = String(b.adapter).trim();
+      if (!KNOWN_ADAPTERS.includes(a)) { res.status(400).json({ error: `adapter 需为 ${KNOWN_ADAPTERS.join(' / ')}` }); return; }
+      patch.adapter = a;
+    }
+    if (b.api_key !== undefined) {
+      const k = String(b.api_key).trim();
+      if (k) patch.api_key = k; // 只有非空才更新（留空表示不改）
+    }
+    if (b.active !== undefined) patch.active = b.active ? 1 : 0;
+    if (b.notes !== undefined) patch.notes = String(b.notes);
+    upsertUpstream(patch);
+    // 如果改的是领星上游（lingxing），同步更新老 settings 兼容
+    if (sid === 'lingxing') {
+      if (b.url !== undefined) setSetting('upstream_url', patch.url);
+      if (b.api_key && String(b.api_key).trim() !== '') setSetting('upstream_key', String(b.api_key).trim());
+      resetUpstreamClient();
+    }
+    res.json({ ok: true });
+  })
+);
+
+apiRouter.delete(
+  '/upstreams/:id',
+  requireAuth,
+  wrap(async (req, res) => {
+    const sid = String(req.params.id);
+    if (sid === 'lingxing') { res.status(400).json({ error: '领星 upstream 不能删除，请停用' }); return; }
+    const existing = getUpstream(sid);
+    if (!existing) { res.status(404).json({ error: 'upstream 不存在' }); return; }
+    const changed = deleteUpstream(sid);
+    res.json({ ok: true, deleted: changed });
+  })
+);
+
+apiRouter.post(
+  '/upstreams/:id/test',
+  requireAuth,
+  wrap(async (req, res) => {
+    const sid = String(req.params.id);
+    // 允许测试一个还没保存的 draft（前端可能传 url/api_key/adapter）
+    const b = req.body ?? {};
+    const useDraft = !!b.url;
+    const up = useDraft
+      ? {
+          id: sid,
+          name: String(b.name ?? sid),
+          url: String(b.url).trim(),
+          api_key: b.api_key ? String(b.api_key).trim() : '',
+          adapter: String(b.adapter ?? 'flat-mcp').trim(),
+          active: 1, sync_strategy: 'pull', shop_field: 'sid', notes: '',
+          created_at: '', updated_at: '',
+        }
+      : getUpstream(sid);
+    if (!up) { res.status(404).json({ error: 'upstream 不存在' }); return; }
+    if (!up.url || !up.adapter) { res.json({ ok: false, error: '缺少 url 或 adapter' }); return; }
+    try {
+      const adapter = getAdapter(up);
+      const tools = await adapter.listTools(up as any);
+      res.json({ ok: true, tool_count: tools.length, adapter: up.adapter });
+    } catch (e: any) {
+      res.json({ ok: false, error: String(e?.message || e).slice(0, 300) });
+    }
+  })
+);
+
+apiRouter.post(
+  '/upstreams/:id/sync',
+  requireAuth,
+  wrap(async (req, res) => {
+    if (isSyncing()) { res.status(409).json({ error: '已有同步任务在进行中' }); return; }
+    const sid = String(req.params.id);
+    const r = await syncUpstreamById(sid);
+    res.json({ upstream_id: sid, ...r });
+  })
+);
+
+apiRouter.post(
+  '/upstreams/sync-all',
+  requireAuth,
+  wrap(async (_req, res) => {
+    if (isSyncing()) { res.status(409).json({ error: '已有同步任务在进行中' }); return; }
+    const r = await syncAllUpstreams();
+    res.json(r);
   })
 );
 

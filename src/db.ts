@@ -515,3 +515,101 @@ export function cleanupCallLogs(beforeDays: number): number {
   const info = db.prepare('DELETE FROM call_logs WHERE ts < ?').run(cutoff);
   return info.changes;
 }
+
+// ===== M1.7：upstreams CRUD helper =====
+
+export interface UpstreamRow {
+  id: string;
+  name: string;
+  url: string;
+  api_key: string;
+  adapter: string;
+  active: number;
+  sync_strategy: string;
+  shop_field: string;
+  notes: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export function listUpstreams(): UpstreamRow[] {
+  return db.prepare('SELECT * FROM upstreams ORDER BY id').all() as UpstreamRow[];
+}
+
+export function getUpstream(id: string): UpstreamRow | undefined {
+  return db.prepare('SELECT * FROM upstreams WHERE id = ?').get(id) as UpstreamRow | undefined;
+}
+
+export function getUpstreamActive(id: string): UpstreamRow | undefined {
+  return db.prepare('SELECT * FROM upstreams WHERE id = ? AND active = 1').get(id) as UpstreamRow | undefined;
+}
+
+export function listActiveUpstreams(): UpstreamRow[] {
+  return db.prepare('SELECT * FROM upstreams WHERE active = 1 ORDER BY id').all() as UpstreamRow[];
+}
+
+export function upsertUpstream(row: {
+  id: string;
+  name: string;
+  url: string;
+  api_key?: string;
+  adapter: string;
+  active?: number;
+  sync_strategy?: string;
+  shop_field?: string;
+  notes?: string;
+}): UpstreamRow {
+  const now = new Date().toISOString();
+  const existing = getUpstream(row.id);
+  // 新 key 为空则保留旧 key
+  const finalKey = (row.api_key && row.api_key.trim() !== '') ? row.api_key.trim() : (existing?.api_key ?? '');
+  db.prepare(
+    `INSERT INTO upstreams (id, name, url, api_key, adapter, active, sync_strategy, shop_field, notes, created_at, updated_at)
+     VALUES (@id, @name, @url, @api_key, @adapter, @active, @sync_strategy, @shop_field, @notes, @created_at, @updated_at)
+     ON CONFLICT(id) DO UPDATE SET
+       name = excluded.name,
+       url = excluded.url,
+       api_key = excluded.api_key,
+       adapter = excluded.adapter,
+       active = excluded.active,
+       sync_strategy = excluded.sync_strategy,
+       shop_field = excluded.shop_field,
+       notes = excluded.notes,
+       updated_at = excluded.updated_at`
+  ).run({
+    id: row.id,
+    name: row.name,
+    url: row.url,
+    api_key: finalKey,
+    adapter: row.adapter,
+    active: row.active ?? 1,
+    sync_strategy: row.sync_strategy ?? 'pull',
+    shop_field: row.shop_field ?? 'sid',
+    notes: row.notes ?? '',
+    created_at: existing?.created_at ?? now,
+    updated_at: now,
+  });
+  return getUpstream(row.id)!;
+}
+
+export function deleteUpstream(id: string): number {
+  // 级联：停用该 upstream 的所有 tools（但不删除，保留历史记录）
+  db.prepare('UPDATE tools SET enabled = 0 WHERE upstream = ?').run(id);
+  const info = db.prepare('DELETE FROM upstreams WHERE id = ?').run(id);
+  return info.changes;
+}
+
+/** 获取每个 upstream 的工具数量（给前端展示用） */
+export function getUpstreamToolCounts(): Record<string, number> {
+  const rows = db.prepare('SELECT upstream, COUNT(*) AS c FROM tools GROUP BY upstream').all() as Array<{ upstream: string; c: number }>;
+  const r: Record<string, number> = {};
+  for (const row of rows) r[row.upstream] = row.c;
+  return r;
+}
+
+/** 给 API 用的脱敏版本（不返回 api_key 原文） */
+export function maskUpstreamKey(key: string): string {
+  if (!key) return '';
+  if (key.length <= 8) return '****';
+  return `${key.slice(0, 4)}****${key.slice(-4)}`;
+}

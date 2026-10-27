@@ -1,4 +1,4 @@
-import { db, getSetting, setSetting, setSettingJSON, getReadToolIds, upsertTool, type ToolRow } from './db.js';
+import { db, getSetting, setSetting, setSettingJSON, getReadToolIds, upsertTool, getUpstream, type ToolRow } from './db.js';
 import { META_TOOLS } from './config.js';
 import { getUpstreamClient, type UpstreamClient } from './upstream.js';
 
@@ -267,8 +267,8 @@ export function listTools(q: string, page: number, pageSize: number, toolType?: 
   const total = (db.prepare(`SELECT COUNT(*) AS c FROM tools ${where}`).all(...params) as { c: number }[])[0].c;
   const rows = db
     .prepare(
-      `SELECT tool_id, exposed_name, name, description, input_schema, tool_type, enabled, updated_at
-       FROM tools ${where} ORDER BY tool_id LIMIT ? OFFSET ?`
+      `SELECT tool_id, exposed_name, name, description, input_schema, tool_type, upstream, enabled, updated_at
+       FROM tools ${where} ORDER BY upstream, tool_id LIMIT ? OFFSET ?`
     )
     .all(...params, pageSize, (page - 1) * pageSize) as Array<ToolRow & { input_schema: string | null }>;
   return {
@@ -279,6 +279,7 @@ export function listTools(q: string, page: number, pageSize: number, toolType?: 
       name: r.name,
       description: r.description,
       tool_type: r.tool_type || '',
+      upstream: r.upstream || 'lingxing',
       has_schema: !!r.input_schema,
       enabled: !!r.enabled,
       updated_at: r.updated_at,
@@ -467,4 +468,12 @@ async function syncLingxingMeta(up: { id: string; name: string; url: string; api
     errors: errors.slice(0, 20),
     duration_ms: Date.now() - started,
   };
+}
+
+/** 同步单个 upstream（web API 用） */
+export async function syncUpstreamById(id: string): Promise<SyncResult> {
+  const up = getUpstream(id);
+  if (!up) throw new Error(`upstream ${id} 不存在`);
+  if (!up.active) throw new Error(`upstream ${id} 已停用`);
+  return syncOneUpstream(up);
 }

@@ -355,7 +355,7 @@ function showNewKey(key, username) {
   $('#new-key-tip').querySelector('b').textContent = `${username} 的 Key（只显示一次，请立即复制发给运营）：`;
   const cfg = {
     mcpServers: {
-      'lingxing-gateway': {
+      'fangzhong-mcp': {
         type: 'streamableHttp',
         url: `${location.origin}/mcp`,
         headers: { Authorization: `Bearer ${key}` },
@@ -612,8 +612,6 @@ $('#user-modal-save').addEventListener('click', async () => {
 
 async function loadSettings() {
   const s = await api('/settings');
-  $('#set-url').value = s.upstream_url || '';
-  $('#key-masked').textContent = s.upstream_key_set ? `（已设置 ${s.upstream_key_masked}）` : '（未设置）';
   $('#down-key').value = s.downstream_key || '';
   $('#sync-status').textContent = s.last_sync_at ? `上次同步：${new Date(s.last_sync_at).toLocaleString()} · 已缓存 ${s.tool_count} 个工具` : `尚未同步 · 已缓存 ${s.tool_count} 个工具`;
   $('#shop-count').textContent = s.shop_count > 0 ? `已同步 ${s.shop_count} 店` : '未同步';
@@ -628,7 +626,190 @@ async function loadSettings() {
   if (s.default_shops_all) shopsTxt = `全部店铺（${s.shop_count || 0} 店）`;
   else shopsTxt = `指定 ${s.default_shops?.length || 0} 店`;
   $('#tpl-summary').textContent = `模板：${toolsTxt} · ${shopsTxt}`;
+
+  // 加载 upstream 列表
+  loadUpstreams().catch(() => {});
 }
+
+/* ---------- Upstreams 多上游管理 ---------- */
+let editingUpstreamId = null;
+
+async function loadUpstreams() {
+  const { items } = await api('/upstreams');
+  renderUpstreams(items);
+}
+
+function renderUpstreams(items) {
+  const host = $('#upstreams-list');
+  if (!items.length) { host.innerHTML = '<p class="muted">暂无上游，请点击下方「添加上游」接入</p>'; return; }
+  host.innerHTML = items.map((u) => upstreamCardHTML(u)).join('');
+  // 绑定每个卡片的按钮
+  items.forEach((u) => bindUpstreamCard(u.id));
+}
+
+function upstreamCardHTML(u) {
+  const isEditing = editingUpstreamId === u.id;
+  if (!isEditing) {
+    // 展示模式
+    return `
+      <div class="upstream-card" data-id="${u.id}" style="border:1px solid var(--border);border-radius:10px;padding:12px 16px;margin-bottom:10px;background:var(--bg-soft)">
+        <div class="row" style="align-items:center">
+          <b>${u.name}</b>
+          <span class="muted" style="font-size:12px;margin-left:6px">(${u.id})</span>
+          <span style="margin-left:8px;padding:2px 8px;border-radius:10px;font-size:11px;${u.active ? 'background:#dcfce7;color:#166534' : 'background:#fee2e2;color:#991b1b'}">${u.active ? '启用' : '停用'}</span>
+          <span class="muted" style="margin-left:6px;font-size:12px">${u.adapter_label} · ${u.tool_count} 工具</span>
+          <div class="spacer"></div>
+          <button class="btn small" data-act="test" data-id="${u.id}">测试</button>
+          <button class="btn small primary" data-act="sync" data-id="${u.id}">同步</button>
+          <button class="btn small" data-act="edit" data-id="${u.id}">编辑</button>
+          ${u.id === 'lingxing' ? '' : `<button class="btn small danger" data-act="delete" data-id="${u.id}">删除</button>`}
+        </div>
+        <div class="muted" style="margin-top:4px;font-size:12px">${u.url} · API Key: ${u.api_key_set ? u.api_key_masked : '<span style="color:#b91c1c">未设置</span>'}</div>
+        ${u.notes ? `<div class="muted" style="margin-top:2px;font-size:12px">${u.notes}</div>` : ''}
+      </div>`;
+  }
+  // 编辑模式
+  return `
+    <div class="upstream-card editing" data-id="${u.id}" style="border:2px solid var(--primary);border-radius:10px;padding:12px 16px;margin-bottom:10px;background:#f0f9ff">
+      <div class="row wrap" style="gap:10px">
+        <label style="flex-direction:column;flex:1;min-width:100px">显示名<input class="ed-name" value="${escapeHTML(u.name)}" /></label>
+        <label style="flex-direction:column;flex:1;min-width:100px">地址<input class="ed-url" value="${escapeHTML(u.url)}" /></label>
+      </div>
+      <div class="row wrap" style="gap:10px;margin-top:6px">
+        <label style="flex-direction:column;flex:1;min-width:100px">适配器
+          <select class="ed-adapter" style="padding:7px 8px;border-radius:8px;border:1px solid var(--border)">
+            <option value="flat-mcp" ${u.adapter==='flat-mcp'?'selected':''}>标准扁平 MCP</option>
+            <option value="lingxing-meta" ${u.adapter==='lingxing-meta'?'selected':''}>领星元工具模式</option>
+          </select>
+        </label>
+        <label style="flex-direction:column;flex:1;min-width:140px">API Key（留空不改）<input class="ed-key" type="password" placeholder="当前: ${u.api_key_set ? u.api_key_masked : '未设置'}" /></label>
+        <label style="flex-direction:row;align-items:center;gap:6px;margin:0">
+          <input type="checkbox" class="ed-active" ${u.active ? 'checked' : ''} style="width:auto" /> 启用
+        </label>
+      </div>
+      <label style="flex-direction:column;margin-top:6px">备注<input class="ed-notes" value="${escapeHTML(u.notes || '')}" /></label>
+      <div class="row" style="margin-top:10px">
+        <button class="btn primary small" data-act="save-edit" data-id="${u.id}">保存</button>
+        <button class="btn small" data-act="cancel-edit" data-id="${u.id}">取消</button>
+        <span class="muted ed-msg" style="margin-left:8px"></span>
+      </div>
+    </div>`;
+}
+
+function escapeHTML(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+
+function bindUpstreamCard(id) {
+  const host = $('#upstreams-list');
+  const card = host.querySelector(`.upstream-card[data-id="${CSS.escape(id)}"]`);
+  if (!card) return;
+  card.querySelectorAll('[data-act]').forEach((btn) => {
+    btn.addEventListener('click', () => handleUpstreamAction(btn.dataset.act, id, card));
+  });
+}
+
+async function handleUpstreamAction(act, id, card) {
+  if (act === 'test') {
+    card.querySelector('[data-act="test"]')?.textContent = '测试中…';
+    try {
+      const r = await api(`/upstreams/${id}/test`, { method: 'POST' });
+      toast(r.ok ? `✅ 连通：${r.tool_count} 个工具` : `❌ ${r.error}`);
+    } catch (e) { toast('失败：' + e.message); }
+    await loadUpstreams();
+  } else if (act === 'sync') {
+    card.querySelector('[data-act="sync"]').textContent = '同步中…';
+    try {
+      const r = await api(`/upstreams/${id}/sync`, { method: 'POST' });
+      toast(`✅ ${r.synced}/${r.total_listed} 工具 · ${r.duration_ms}ms`);
+      loadSettings().catch(() => {});
+    } catch (e) { toast('失败：' + e.message); }
+    await loadUpstreams();
+  } else if (act === 'edit') {
+    editingUpstreamId = id;
+    await loadUpstreams();
+  } else if (act === 'delete') {
+    if (!confirm(`确认删除 upstream ${id}？其工具将被停用但不删除。`)) return;
+    try {
+      await api(`/upstreams/${id}`, { method: 'DELETE' });
+      toast('已删除');
+      await loadUpstreams();
+    } catch (e) { toast(e.message); }
+  } else if (act === 'save-edit') {
+    const patch = {
+      name: card.querySelector('.ed-name').value.trim(),
+      url: card.querySelector('.ed-url').value.trim(),
+      adapter: card.querySelector('.ed-adapter').value,
+      active: card.querySelector('.ed-active').checked,
+      notes: card.querySelector('.ed-notes').value.trim(),
+    };
+    const key = card.querySelector('.ed-key').value.trim();
+    if (key) patch.api_key = key;
+    try {
+      await api(`/upstreams/${id}`, { method: 'PUT', body: patch });
+      toast('已保存');
+      editingUpstreamId = null;
+      await loadUpstreams();
+    } catch (e) { card.querySelector('.ed-msg').textContent = e.message; }
+  } else if (act === 'cancel-edit') {
+    editingUpstreamId = null;
+    await loadUpstreams();
+  }
+}
+
+/* 新增 upstream 表单 */
+$('#nu-test').addEventListener('click', async () => {
+  const el = $('#nu-test-result');
+  el.textContent = '测试中…';
+  try {
+    const body = {
+      url: $('#nu-url').value.trim(),
+      api_key: $('#nu-key').value.trim(),
+      adapter: $('#nu-adapter').value,
+    };
+    const r = await api(`/upstreams/${$('#nu-id').value.trim() || 'new'}/test`, { method: 'POST', body });
+    el.textContent = r.ok ? `✅ 连通：${r.tool_count} 个工具` : `❌ ${r.error}`;
+  } catch (e) { el.textContent = '失败：' + e.message; }
+});
+
+$('#nu-save').addEventListener('click', async () => {
+  const id = $('#nu-id').value.trim();
+  const body = {
+    id,
+    name: $('#nu-name').value.trim(),
+    url: $('#nu-url').value.trim(),
+    api_key: $('#nu-key').value.trim(),
+    adapter: $('#nu-adapter').value,
+    active: $('#nu-active').checked,
+    notes: $('#nu-notes').value.trim(),
+  };
+  try {
+    await api('/upstreams', { method: 'POST', body });
+    toast('已保存 upstream');
+    // 清表单
+    $('#nu-id').value = ''; $('#nu-name').value = ''; $('#nu-url').value = '';
+    $('#nu-key').value = ''; $('#nu-notes').value = ''; $('#nu-test-result').textContent = '';
+    $('#upstream-new-form').open = false;
+    await loadUpstreams();
+    // 如果勾了启用，顺便同步
+    if (body.active) {
+      try {
+        const r = await api(`/upstreams/${id}/sync`, { method: 'POST' });
+        toast(`✅ 同步完成：${r.synced}/${r.total_listed}`);
+        loadSettings().catch(() => {});
+      } catch (e) { toast('自动同步失败：' + e.message); }
+    }
+  } catch (e) { toast(e.message); }
+});
+
+$('#btn-sync-all-up').addEventListener('click', async () => {
+  const el = $('#sync-all-result');
+  el.textContent = '同步中…';
+  try {
+    const r = await api('/upstreams/sync-all', { method: 'POST' });
+    const parts = Object.entries(r.results).map(([k, v]) => `${k}: ${v.synced}/${v.total_listed}`);
+    el.textContent = `✅ 共 ${r.totalSynced} 工具（${parts.join(' · ')}）`;
+    loadSettings().catch(() => {});
+  } catch (e) { el.textContent = '❌ ' + e.message; }
+});
 
 $('#btn-tpl-edit').addEventListener('click', async () => {
   await ensureToolsCache();
@@ -656,7 +837,7 @@ $('#btn-tpl-readonly').addEventListener('click', async () => {
 function renderSnippet(key) {
   const cfg = {
     mcpServers: {
-      'lingxing-gateway': {
+      'fangzhong-mcp': {
         type: 'streamableHttp',
         url: `${location.origin}/mcp`,
         headers: { Authorization: `Bearer ${key}` },
@@ -665,30 +846,6 @@ function renderSnippet(key) {
   };
   $('#mcp-snippet').textContent = JSON.stringify(cfg, null, 2);
 }
-
-$('#btn-save-settings').addEventListener('click', async () => {
-  try {
-    const body = { upstream_url: $('#set-url').value.trim() };
-    const key = $('#set-key').value.trim();
-    if (key) body.upstream_key = key;
-    await api('/settings', { method: 'PUT', body });
-    $('#set-key').value = '';
-    toast('已保存');
-    loadSettings().catch(() => {});
-  } catch (e) { toast(e.message); }
-});
-
-$('#btn-test').addEventListener('click', async () => {
-  const el = $('#test-result');
-  el.textContent = '测试中…';
-  try {
-    const body = { upstream_url: $('#set-url').value.trim() };
-    const key = $('#set-key').value.trim();
-    if (key) body.upstream_key = key;
-    const r = await api('/settings/test', { method: 'POST', body });
-    el.textContent = r.ok ? `连接成功：${r.serverInfo?.name || '未知服务'} ${r.serverInfo?.version || ''}` : `失败：${r.error}`;
-  } catch (e) { el.textContent = '失败：' + e.message; }
-});
 
 $('#btn-sync-shops').addEventListener('click', async (e) => {
   const btn = e.target;
