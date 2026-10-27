@@ -16,14 +16,16 @@ export function initDb(): void {
       value TEXT NOT NULL DEFAULT ''
     );
     CREATE TABLE IF NOT EXISTS tools (
-      tool_id      TEXT PRIMARY KEY,
+      tool_id      TEXT NOT NULL,
+      upstream     TEXT NOT NULL DEFAULT 'lingxing',
       exposed_name TEXT,
       name         TEXT DEFAULT '',
       description  TEXT DEFAULT '',
       input_schema TEXT,
       raw          TEXT,
       enabled      INTEGER NOT NULL DEFAULT 1,
-      updated_at   TEXT DEFAULT ''
+      updated_at   TEXT DEFAULT '',
+      PRIMARY KEY (upstream, tool_id)
     );
     CREATE TABLE IF NOT EXISTS users (
       id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -127,12 +129,19 @@ function migrate(): void {
       db.exec(`CREATE INDEX IF NOT EXISTS ${t.extraIdx} ON ${t.name}(upstream)`);
     }
   }
-  // 数据兜底：任何 upstream 为 NULL/空的老记录补 'lingxing'
+  // 数据兜底：任何 upstream 为 NULL 的老记录补 'lingxing'
+  // （call_logs 不处理空串：拒绝类调用的 upstream 可能确实为空，不能篡改成 lingxing）
   db.exec(`UPDATE tools      SET upstream = 'lingxing' WHERE upstream IS NULL OR upstream = ''`);
   db.exec(`UPDATE shops      SET upstream = 'lingxing' WHERE upstream IS NULL OR upstream = ''`);
   db.exec(`UPDATE user_tools SET upstream = 'lingxing' WHERE upstream IS NULL OR upstream = ''`);
   db.exec(`UPDATE user_shops SET upstream = 'lingxing' WHERE upstream IS NULL OR upstream = ''`);
-  db.exec(`UPDATE call_logs  SET upstream = 'lingxing' WHERE upstream IS NULL OR upstream = ''`);
+  db.exec(`UPDATE call_logs  SET upstream = 'lingxing' WHERE upstream IS NULL`);
+
+  // ===== P0-2：tools 主键从 (tool_id) 迁移为 (upstream, tool_id) =====
+  // 旧库 tool_id 是全局主键，多上游同名工具会互相覆盖（导致错上游、错 credits、错权限）。
+  migrateToolsCompositePk();
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_tools_upstream ON tools(upstream)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_tools_exposed ON tools(exposed_name)`);
 
   // upstreams 表初始化领星记录（从现有 settings 取）
   const hasLingxing = db.prepare("SELECT 1 FROM upstreams WHERE id = 'lingxing'").get();
@@ -158,6 +167,49 @@ function migrate(): void {
   backfillToolTypes();
 }
 
+/**
+ * 把旧版 tools(tool_id PRIMARY KEY) 重建为 (upstream, tool_id) 复合主键。
+ * 幂等：已经是复合主键则直接返回。
+ */
+function migrateToolsCompositePk(): void {
+  const info = db.prepare('PRAGMA table_info(tools)').all() as Array<{ name: string; pk: number }>;
+  const pkCols = info.filter((c) => c.pk > 0).sort((a, b) => a.pk - b.pk).map((c) => c.name);
+  if (pkCols.length === 2 && pkCols[0] === 'upstream' && pkCols[1] === 'tool_id') return;
+
+  console.log('[db] 迁移 tools 表主键 -> (upstream, tool_id)');
+  const tx = db.transaction(() => {
+    db.exec(`DROP TABLE IF EXISTS tools_legacy_p0`);
+    db.exec(`ALTER TABLE tools RENAME TO tools_legacy_p0`);
+    db.exec(`
+      CREATE TABLE tools (
+        tool_id      TEXT NOT NULL,
+        upstream     TEXT NOT NULL DEFAULT 'lingxing',
+        exposed_name TEXT,
+        name         TEXT DEFAULT '',
+        description  TEXT DEFAULT '',
+        input_schema TEXT,
+        raw          TEXT,
+        tool_type    TEXT DEFAULT '',
+        enabled      INTEGER NOT NULL DEFAULT 1,
+        updated_at   TEXT DEFAULT '',
+        PRIMARY KEY (upstream, tool_id)
+      )
+    `);
+    // 历史数据同一 tool_id 只会有一条，upstream 已在上面的兜底 UPDATE 中补齐
+    db.exec(`
+      INSERT OR IGNORE INTO tools
+        (tool_id, upstream, exposed_name, name, description, input_schema, raw, tool_type, enabled, updated_at)
+      SELECT tool_id,
+             COALESCE(NULLIF(upstream, ''), 'lingxing'),
+             exposed_name, name, description, input_schema, raw,
+             COALESCE(tool_type, ''), enabled, updated_at
+      FROM tools_legacy_p0
+    `);
+    db.exec(`DROP TABLE tools_legacy_p0`);
+  });
+  tx();
+}
+
 /** 老数据兜底：按工具名中的动词分词判断读写类型 */
 const WRITE_TOKENS = new Set([
   'put', 'add', 'create', 'update', 'delete', 'del', 'set', 'modify', 'cancel',
@@ -170,11 +222,11 @@ function classifyByName(name: string): string {
   return tokens.some((t) => WRITE_TOKENS.has(t)) ? 'write' : 'read';
 }
 function backfillToolTypes(): void {
-  const rows = (db.prepare("SELECT tool_id FROM tools WHERE tool_type IS NULL OR tool_type = ''").all() as Array<{ tool_id: string }>);
+  const rows = (db.prepare("SELECT upstream, tool_id FROM tools WHERE tool_type IS NULL OR tool_type = ''").all() as Array<{ upstream: string; tool_id: string }>);
   if (rows.length === 0) return;
-  const stmt = db.prepare('UPDATE tools SET tool_type = ? WHERE tool_id = ?');
+  const stmt = db.prepare('UPDATE tools SET tool_type = ? WHERE upstream = ? AND tool_id = ?');
   const tx = db.transaction(() => {
-    for (const r of rows) stmt.run(classifyByName(r.tool_id), r.tool_id);
+    for (const r of rows) stmt.run(classifyByName(r.tool_id), r.upstream, r.tool_id);
   });
   tx();
   console.log(`[db] 已为 ${rows.length} 个工具补算 tool_type 分类`);
@@ -271,26 +323,48 @@ export function upsertTool(t: {
   upstream?: string;
 }): void {
   db.prepare(
-    `INSERT INTO tools (tool_id, exposed_name, name, description, input_schema, raw, tool_type, upstream, enabled, updated_at)
+    `INSERT INTO tools (tool_id, upstream, exposed_name, name, description, input_schema, raw, tool_type, enabled, updated_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
-     ON CONFLICT(tool_id) DO UPDATE SET
+     ON CONFLICT(upstream, tool_id) DO UPDATE SET
        exposed_name = excluded.exposed_name,
        name = excluded.name,
        description = excluded.description,
        input_schema = excluded.input_schema,
        raw = excluded.raw,
        tool_type = excluded.tool_type,
-       upstream = COALESCE(excluded.upstream, tools.upstream),
        updated_at = excluded.updated_at`
-  ).run(t.tool_id, t.exposed_name, t.name, t.description, t.input_schema, t.raw ?? null, t.tool_type, t.upstream ?? 'lingxing', new Date().toISOString());
+  ).run(t.tool_id, t.upstream ?? 'lingxing', t.exposed_name, t.name, t.description, t.input_schema, t.raw ?? null, t.tool_type, new Date().toISOString());
 }
 
-export function getToolByExposedName(name: string): ToolRow | undefined {
-  return db.prepare('SELECT * FROM tools WHERE exposed_name = ?').get(name) as ToolRow | undefined;
+/**
+ * 按下游暴露名解析工具，且只在 allowedUpstreams 范围内查找（fail-closed）。
+ * 多上游存在同名工具时，tools/list 会暴露 `upstream__name` 限定名，这里两种都支持。
+ */
+export function getToolByExposedName(name: string, allowedUpstreams: string[]): ToolRow | undefined {
+  if (!allowedUpstreams.length) return undefined;
+  const ph = allowedUpstreams.map(() => '?').join(',');
+  const exact = db
+    .prepare(`SELECT * FROM tools WHERE exposed_name = ? AND enabled = 1 AND upstream IN (${ph})`)
+    .all(name, ...allowedUpstreams) as ToolRow[];
+  if (exact.length === 1) return exact[0];
+  if (exact.length > 1) return undefined; // 同名跨上游，必须用限定名
+  for (const up of allowedUpstreams) {
+    const prefix = `${up}__`;
+    if (!name.startsWith(prefix)) continue;
+    const row = db
+      .prepare('SELECT * FROM tools WHERE upstream = ? AND exposed_name = ? AND enabled = 1')
+      .get(up, name.slice(prefix.length)) as ToolRow | undefined;
+    if (row) return row;
+  }
+  return undefined;
 }
 
-export function getToolById(toolId: string): ToolRow | undefined {
-  return db.prepare('SELECT * FROM tools WHERE tool_id = ?').get(toolId) as ToolRow | undefined;
+/** 按 (upstream, tool_id) 精确查询；upstream 缺省时返回任意一条（仅兼容旧调用） */
+export function getToolById(toolId: string, upstream?: string): ToolRow | undefined {
+  const row = upstream
+    ? db.prepare('SELECT * FROM tools WHERE upstream = ? AND tool_id = ?').get(upstream, toolId)
+    : db.prepare('SELECT * FROM tools WHERE tool_id = ? ORDER BY upstream LIMIT 1').get(toolId);
+  return row as ToolRow | undefined;
 }
 
 // ---------- shops ----------
@@ -376,7 +450,7 @@ export function touchUser(userId: number): void {
 // ---------- 工具查询辅助 ----------
 
 export function getReadToolIds(): string[] {
-  return (db.prepare('SELECT tool_id FROM tools WHERE tool_type = ?').all('read') as Array<{ tool_id: string }>).map(
+  return (db.prepare('SELECT DISTINCT tool_id FROM tools WHERE tool_type = ?').all('read') as Array<{ tool_id: string }>).map(
     (r) => r.tool_id
   );
 }
@@ -499,46 +573,74 @@ export function getCallLogStats(opts: CallLogStatsOpts = {}): {
   top_tools: Array<{ tool_name: string; count: number }>;
   top_callers: Array<{ caller: string; count: number }>;
 } {
-  // 构造统一 where 条件 — 所有子查询复用
-  const conds: string[] = [];
-  const args: unknown[] = [];
-  if (opts.since) { conds.push('ts >= ?'); args.push(opts.since); }
-  if (opts.until) { conds.push('ts <= ?'); args.push(opts.until); }
-  if (opts.upstream) { conds.push('upstream = ?'); args.push(opts.upstream); }
-  if (opts.caller) { conds.push('caller = ?'); args.push(opts.caller); }
-  const where = conds.length > 0 ? `WHERE ${conds.join(' AND ')}` : '';
+  // call_logs where（ts 字段）
+  const clConds: string[] = [];
+  const clArgs: unknown[] = [];
+  if (opts.since) { clConds.push('ts >= ?'); clArgs.push(opts.since); }
+  if (opts.until) { clConds.push('ts <= ?'); clArgs.push(opts.until); }
+  if (opts.upstream) { clConds.push('upstream = ?'); clArgs.push(opts.upstream); }
+  if (opts.caller) { clConds.push('caller = ?'); clArgs.push(opts.caller); }
+  const clWhere = clConds.length > 0 ? `WHERE ${clConds.join(' AND ')}` : '';
+
+  // cost_logs where（created_at），时间条件复用 opts.since/opts.until，其他用 upstream/caller 映射
+  const coConds: string[] = [];
+  const coArgs: unknown[] = [];
+  if (opts.since) { coConds.push('created_at >= ?'); coArgs.push(opts.since); }
+  if (opts.until) { coConds.push('created_at <= ?'); coArgs.push(opts.until); }
+  if (opts.upstream) { coConds.push('upstream = ?'); coArgs.push(opts.upstream); }
+  if (opts.caller) {
+    // caller 在 cost_logs 里对应 user_id（cost_logs.user_id 是运营用户 id，admin 调用为 NULL）
+    const uidRows = db.prepare("SELECT id FROM users WHERE username = ?").all(opts.caller) as Array<{ id: number }>;
+    if (uidRows.length > 0) {
+      const ph = uidRows.map(() => '?').join(',');
+      coConds.push(`(user_id IN (${ph}) OR user_id IS NULL)`);
+      coArgs.push(...uidRows.map((r) => r.id));
+    } else {
+      // call_logs 里这个 caller 可能是 admin（cost_logs.user_id = NULL），也可能没人
+      coConds.push('user_id IS NULL');
+    }
+  }
+  const coWhere = coConds.length > 0 ? `WHERE ${coConds.join(' AND ')}` : '';
 
   const summary = db
     .prepare(`SELECT COUNT(*) AS total, SUM(success) AS success, SUM(CASE WHEN success=0 THEN 1 ELSE 0 END) AS failed,
                      AVG(duration_ms) AS avg_ms, COUNT(DISTINCT caller) AS unique_callers, COUNT(DISTINCT tool_name) AS unique_tools
-              FROM call_logs ${where}`)
-    .all(...args)[0] as any;
+              FROM call_logs ${clWhere}`)
+    .all(...clArgs)[0] as any;
 
-  // upstream 维度汇总 — 按 upstream 聚调用次数 + 总 credits + 平均耗时
-  // credits 从 cost_logs JOIN 过来（同一时间范围内）
-  const upstreamStats = db
-    .prepare(`SELECT c.upstream, COUNT(*) AS count, AVG(c.duration_ms) AS avg_ms,
-                    COALESCE(SUM(co.cost_credits), 0) AS credits
-             FROM call_logs c
-             LEFT JOIN cost_logs co ON co.upstream = c.upstream AND co.tool_name = c.tool_name
-               ${where.replace(/ts/g, 'c.ts').replace(/upstream/g, 'c.upstream').replace(/caller/g, 'c.caller')}
-             GROUP BY c.upstream
-             ORDER BY count DESC`)
-    .all(...args) as Array<{ upstream: string; count: number; avg_ms: number; credits: number }>;
+  // upstream 维度汇总 —— call_logs 单独算 count/avg，cost_logs 单独算 credits，最后 JOIN 回来
+  // 避免 COUNT(*) 在多对多 JOIN 时被放大
+  const upstreamCount = db
+    .prepare(`SELECT upstream, COUNT(*) AS count, AVG(duration_ms) AS avg_ms
+              FROM call_logs ${clWhere} GROUP BY upstream`)
+    .all(...clArgs) as Array<{ upstream: string; count: number; avg_ms: number | null }>;
 
-  // 全局总 credits
+  const upstreamCredits = db
+    .prepare(`SELECT upstream, COALESCE(SUM(cost_credits), 0) AS credits
+              FROM cost_logs ${coWhere} GROUP BY upstream`)
+    .all(...coArgs) as Array<{ upstream: string; credits: number }>;
+
+  const creditsMap = new Map(upstreamCredits.map((r) => [r.upstream, Number(r.credits)]));
+  const upstreamStats = upstreamCount
+    .map((u) => ({
+      upstream: u.upstream,
+      count: u.count,
+      credits: creditsMap.get(u.upstream) ?? 0,
+      avg_ms: u.avg_ms != null ? Math.round(Number(u.avg_ms)) : 0,
+    }))
+    .sort((a, b) => b.count - a.count);
+
+  // 全局总 credits（独立 SUM，不跟 call_logs JOIN）
   const totalCreditsRow = db
-    .prepare(`SELECT COALESCE(SUM(cost_credits), 0) AS total FROM cost_logs cl
-              LEFT JOIN call_logs ca ON ca.upstream = cl.upstream AND ca.tool_name = cl.tool_name
-              ${where.replace(/ts/g, 'ca.ts').replace(/upstream/g, 'ca.upstream').replace(/caller/g, 'ca.caller')}`)
-    .all(...args)[0] as { total: number };
+    .prepare(`SELECT COALESCE(SUM(cost_credits), 0) AS total FROM cost_logs ${coWhere}`)
+    .all(...coArgs)[0] as { total: number };
 
   const topTools = db
-    .prepare(`SELECT tool_name, COUNT(*) AS count FROM call_logs ${where} GROUP BY tool_name ORDER BY count DESC LIMIT 8`)
-    .all(...args) as Array<{ tool_name: string; count: number }>;
+    .prepare(`SELECT tool_name, COUNT(*) AS count FROM call_logs ${clWhere} GROUP BY tool_name ORDER BY count DESC LIMIT 8`)
+    .all(...clArgs) as Array<{ tool_name: string; count: number }>;
   const topCallers = db
-    .prepare(`SELECT caller, COUNT(*) AS count FROM call_logs ${where} GROUP BY caller ORDER BY count DESC LIMIT 6`)
-    .all(...args) as Array<{ caller: string; count: number }>;
+    .prepare(`SELECT caller, COUNT(*) AS count FROM call_logs ${clWhere} GROUP BY caller ORDER BY count DESC LIMIT 6`)
+    .all(...clArgs) as Array<{ caller: string; count: number }>;
 
   return {
     total: summary.total ?? 0,
@@ -548,12 +650,7 @@ export function getCallLogStats(opts: CallLogStatsOpts = {}): {
     unique_tools: summary.unique_tools ?? 0,
     avg_ms: summary.avg_ms != null ? Math.round(Number(summary.avg_ms)) : null,
     total_credits: Number(totalCreditsRow?.total ?? 0),
-    upstream_stats: upstreamStats.map((u) => ({
-      upstream: u.upstream,
-      count: u.count,
-      credits: Number(u.credits ?? 0),
-      avg_ms: u.avg_ms != null ? Math.round(Number(u.avg_ms)) : 0,
-    })),
+    upstream_stats: upstreamStats,
     top_tools: topTools,
     top_callers: topCallers,
   };

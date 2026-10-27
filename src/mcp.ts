@@ -36,26 +36,34 @@ export type McpIdentity =
       all_shops: number;
     };
 
-/** 把 users.upstream 解析成用户可访问的 upstream id 数组
- *  - '' / NULL / '*' → 空数组表示「全部 active upstream」
- *  - 'lingxing,xiyou' → ['lingxing', 'xiyou']
- *  - 'lingxing' → ['lingxing']（旧行为兼容）
+/** 用户可访问的 upstream 范围（fail-closed 语义） */
+export interface UpstreamScope {
+  /** true = 显式全部（'' / NULL / '*'），ids 为当前 active upstream 全集 */
+  all: boolean;
+  /** 实际可访问的 upstream id 集合；空数组 = 无任何权限 */
+  ids: string[];
+}
+
+/**
+ * 把 users.upstream 解析成用户可访问的 upstream 范围
+ *  - '' / NULL / '*' → 全部 active upstream
+ *  - 'lingxing,xiyou' → ['lingxing', 'xiyou']（只保留 active）
+ *  - 解析结果为空 / 全部无效 → ids = []（无权限，不再 fail-open）
  */
-export function resolveUserUpstreams(raw: string | undefined | null, activeIds: string[]): string[] {
+export function resolveUserUpstreams(raw: string | undefined | null, activeIds: string[]): UpstreamScope {
   const val = (raw ?? '').trim();
-  if (!val || val === '*') return activeIds;
+  if (!val || val === '*') return { all: true, ids: [...activeIds] };
   const list = val
     .split(/[,\s]+/)
     .map((s) => s.trim())
     .filter(Boolean);
   // 过滤掉已经不存在或停用的 upstream
-  return list.filter((id) => activeIds.includes(id));
+  return { all: false, ids: list.filter((id) => activeIds.includes(id)) };
 }
 
-/** 判断 tool.upstream 是否在用户可访问范围里（空范围 = 全部） */
-export function canUseUpstream(userScope: string[], toolUpstream: string): boolean {
-  if (!userScope.length) return true; // 空范围 = 全部
-  return userScope.includes(toolUpstream);
+/** 判断 tool.upstream 是否在用户可访问范围里（空范围 = 无权限） */
+export function canUseUpstream(scope: UpstreamScope, toolUpstream: string): boolean {
+  return scope.ids.includes(toolUpstream);
 }
 
 export function identityFromUser(u: UserRow): McpIdentity {
@@ -194,31 +202,34 @@ function extractShopIdsFromObj(obj: Record<string, unknown>): string[] {
   return out;
 }
 
-function filterShopListInNode(node: unknown, allowedShops: Set<string>): unknown {
+/**
+ * 店铺白名单过滤（fail-closed）。
+ * - 数组元素若能提取到店铺标识（sid / shop_id / seller_id / country_code+name），命中白名单才放行
+ * - 元素没有任何店铺标识 → 过滤掉（不确定归属，宁可漏也不越权）
+ * - 整个数组所有元素都没有店铺标识 → 返回空数组（上游可能返回了非店铺维度/汇总数据）
+ */
+function filterShopListInNode(node: unknown, allowedShops: Set<string>, depth = 0): unknown {
   if (Array.isArray(node)) {
-    // 先尝试把这个数组当作候选店铺列表 —— 如果首元素有店铺标识字段，就用 allowedShops 过滤
-    if (node.length > 0 && node[0] && typeof node[0] === 'object') {
-      const first = node[0] as Record<string, unknown>;
-      if (SHOP_ID_KEYS.has(
-        Object.keys(first).some((k) => SHOP_ID_KEYS.has(k.toLowerCase()))
-          ? Object.keys(first).find((k) => SHOP_ID_KEYS.has(k.toLowerCase()))!.toLowerCase()
-          : ''
-      ) || ('country_code' in first && 'name' in first)) {
-        return node.filter((item) => {
-          const ids = extractShopIdsFromObj(item as Record<string, unknown>);
-          // 任何一个标识命中白名单就通过（兼容一条数据含多个店铺 id 的情况）
-          if (ids.length === 0) return true; // 无店铺标识则不过滤（保险）
-          return ids.some((id) => allowedShops.has(id));
-        });
-      }
+    // 只对浅数组（depth<=2）应用店铺识别，深层数组如 seller 历史列表等交给上层判断
+    if (depth <= 2 && node.length > 0 && node[0] && typeof node[0] === 'object' && !Array.isArray(node[0])) {
+      let anyHasShops = false;
+      const filtered = node.filter((item) => {
+        const ids = extractShopIdsFromObj(item as Record<string, unknown>);
+        if (ids.length === 0) return false; // fail-closed：无店铺标识则丢弃
+        anyHasShops = true;
+        return ids.some((id) => allowedShops.has(id));
+      });
+      // 如果整条数组没有任何元素含店铺标识，说明这可能是非店铺维度的汇总数据
+      // 也可能是工具本身不返回店铺字段（如 ABA 搜索词），两种情况都按空处理以避免越权
+      return anyHasShops ? filtered : [];
     }
-    // 否则递归各元素
-    return node.map((x) => filterShopListInNode(x, allowedShops));
+    // 深层数组或原始值数组（如字符串），递归各元素
+    return node.map((x) => filterShopListInNode(x, allowedShops, depth + 1));
   }
   if (node && typeof node === 'object') {
     const out: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
-      out[k] = filterShopListInNode(v, allowedShops);
+      out[k] = filterShopListInNode(v, allowedShops, depth + 1);
     }
     return out;
   }
@@ -302,22 +313,28 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
     const activeUpIds = upstreams.map((u) => u.id);
     const upMap = new Map(upstreams.map((u) => [u.id, { name: u.name, notes: u.notes }]));
 
-    let rows: Array<{ upstream: string; exposed_name: string; name: string; description: string; input_schema: string | null }>;
+    let rows: Array<{ upstream: string; tool_id: string; exposed_name: string; name: string; description: string; input_schema: string | null }>;
     if (identity.kind === 'admin') {
+      // admin 也只看「启用中且归属 active upstream」的工具，停用上游的历史工具不该被下游看到
       rows = db
-        .prepare('SELECT upstream, exposed_name, name, description, input_schema FROM tools WHERE enabled = 1 ORDER BY upstream, tool_id')
+        .prepare(`SELECT t.upstream, t.tool_id, t.exposed_name, t.name, t.description, t.input_schema
+                  FROM tools t
+                  JOIN upstreams u ON u.id = t.upstream
+                  WHERE t.enabled = 1 AND u.active = 1
+                  ORDER BY t.upstream, t.tool_id`)
         .all() as any[];
     } else {
       // 用户 upstream 范围：空/NULL/'*' = 全部 active，逗号分隔 = 指定子集
-      const userScope = resolveUserUpstreams(identity.upstream, activeUpIds);
-      // 用 IN 查询跨 upstream 拉取
-      const placeholders = userScope.length ? userScope.map(() => '?').join(',') : null;
-      const sqlBase =
-        'SELECT upstream, tool_id, exposed_name, name, description, input_schema FROM tools WHERE enabled = 1';
-      const sql = placeholders ? `${sqlBase} AND upstream IN (${placeholders}) ORDER BY upstream, tool_id`
-                               : `${sqlBase} ORDER BY upstream, tool_id`;
-      const args = placeholders ? userScope : [];
-      const all = db.prepare(sql).all(...args) as any[];
+      // fail-closed：解析结果为空表示「无任何权限」，必须直接返回空清单
+      const scope = resolveUserUpstreams(identity.upstream, activeUpIds);
+      if (scope.ids.length === 0) return { tools: [] };
+      const placeholders = scope.ids.map(() => '?').join(',');
+      const all = db
+        .prepare(
+          `SELECT upstream, tool_id, exposed_name, name, description, input_schema FROM tools
+           WHERE enabled = 1 AND upstream IN (${placeholders}) ORDER BY upstream, tool_id`
+        )
+        .all(...scope.ids) as any[];
 
       if (!identity.all_tools) {
         const allowed = new Set(getUserToolIds(identity.id));
@@ -326,6 +343,13 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
         rows = all;
       }
     }
+
+    // 同一 exposed_name 命中多个 upstream 时，加 `upstream__` 前缀避免 Agent 调错上游
+    const nameCount = new Map<string, number>();
+    for (const r of rows) nameCount.set(r.exposed_name, (nameCount.get(r.exposed_name) ?? 0) + 1);
+    const exposedNameOf = (r: { upstream: string; exposed_name: string }): string =>
+      (nameCount.get(r.exposed_name) ?? 0) > 1 ? `${r.upstream}__${r.exposed_name}` : r.exposed_name;
+
     return {
       tools: rows.map((r) => {
         const upInfo = upMap.get(r.upstream);
@@ -335,7 +359,7 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
         const descPrefix = upstreamDesc ? `[来自 ${upstreamName} · ${upstreamDesc}] ` : `[来自 ${upstreamName}] `;
         const rawDesc = r.description || r.name || r.exposed_name;
         return {
-          name: r.exposed_name,
+          name: exposedNameOf(r),
           description: descPrefix + rawDesc,
           inputSchema: safeParseSchema(r.input_schema),
           // 非标准扩展字段，Agent/客户端如果认 MCP tools 里的自定义字段可以直接用
@@ -382,6 +406,13 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
       });
     }
 
+    // 调用者可见的 upstream 范围（admin = 全部 active；用户 = users.upstream，fail-closed）
+    const activeUpIds = upstreams.map((u) => u.id);
+    const scope: UpstreamScope =
+      identity.kind === 'admin'
+        ? { all: true, ids: [...activeUpIds] }
+        : resolveUserUpstreams(identity.upstream, activeUpIds);
+
     // ---- 身份与限流 ----
     if (identity.kind === 'user') {
       const u = db.prepare('SELECT enabled FROM users WHERE id = ?').get(identity.id) as { enabled: number } | undefined;
@@ -393,10 +424,12 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
       touchUser(identity.id);
     }
 
-    const tool = getToolByExposedName(name);
+    // 只在调用者可见的 upstream 范围内按暴露名解析工具（防止跨上游越权）
+    const tool = getToolByExposedName(name, scope.ids);
     if (!tool || !tool.enabled) { logOutcome(false, true, '工具不存在或未启用'); return errorResult(`工具不存在或未启用: ${name}`); }
     logCtx.toolId = tool.tool_id;
     logCtx.toolType = tool.tool_type;
+    logCtx.upstream = tool.upstream ?? ''; // 后续所有 logOutcome 都写正确的 upstream
 
     // 用户工具白名单
     if (identity.kind === 'user' && !identity.all_tools) {
@@ -411,11 +444,6 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
     if (identity.kind === 'user' && tool.tool_type === 'write' && getSetting('block_write') === '1') {
       logOutcome(false, true, 'block_write 禁止写操作');
       return errorResult(`该工具为写操作，已被网关禁用: ${name}`);
-    }
-
-    if (!getSetting('upstream_key')) {
-      logOutcome(false, true, '网关未配置上游密钥');
-      return errorResult('网关未配置上游密钥，请管理员在 Web 后台完成配置');
     }
 
     // 店铺级校验（仅对运营用户生效）
@@ -457,16 +485,15 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
     // ---- 调用上游（按 adapter 路由）----
     const caller = logCtx.caller;
     // 不管 admin 还是运营用户，都按 tool.upstream 路由（list 里已经过滤过权限了）
-    const upId = tool.upstream ?? identity.upstream;
-    logCtx.upstream = upId;  // 让后续所有 logOutcome 都写正确的 upstream
+    const upId = tool.upstream ?? '';
+    if (!upId) {
+      logOutcome(false, true, '工具缺少 upstream 归属');
+      return errorResult(`工具缺少 upstream 归属: ${name}`);
+    }
     // 额外校验：运营用户必须有这个 upstream 权限（防止 tools/call 被绕过）
-    if (identity.kind === 'user') {
-      const activeUpIds = upstreams.map((u) => u.id);
-      const userScope = resolveUserUpstreams(identity.upstream, activeUpIds);
-      if (!canUseUpstream(userScope, upId)) {
-        logOutcome(false, true, `上游 ${upId} 不在用户权限范围`);
-        return errorResult(`无权访问上游 ${upId}`);
-      }
+    if (identity.kind === 'user' && !canUseUpstream(scope, upId)) {
+      logOutcome(false, true, `上游 ${upId} 不在用户权限范围`);
+      return errorResult(`无权访问上游 ${upId}`);
     }
     const upConfig = db.prepare('SELECT * FROM upstreams WHERE id = ?').get(upId) as any;
     if (!upConfig || !upConfig.active) {

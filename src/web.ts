@@ -509,7 +509,8 @@ apiRouter.get(
   '/tools/:toolId',
   requireAuth,
   wrap(async (req, res) => {
-    const tool = getToolById(String(req.params.toolId));
+    const upstream = String(req.query.upstream ?? '').trim() || undefined;
+    const tool = getToolById(String(req.params.toolId), upstream);
     if (!tool) {
       res.status(404).json({ error: '工具不存在' });
       return;
@@ -530,8 +531,15 @@ apiRouter.put(
   '/tools/:toolId/enabled',
   requireAuth,
   wrap(async (req, res) => {
+    const upstream = String(req.body?.upstream ?? req.query.upstream ?? '').trim();
+    if (!upstream) {
+      res.status(400).json({ error: '缺少 upstream 参数' });
+      return;
+    }
     const enabled = req.body?.enabled ? 1 : 0;
-    const info = db.prepare('UPDATE tools SET enabled = ? WHERE tool_id = ?').run(enabled, String(req.params.toolId));
+    const info = db
+      .prepare('UPDATE tools SET enabled = ? WHERE upstream = ? AND tool_id = ?')
+      .run(enabled, upstream, String(req.params.toolId));
     if (info.changes === 0) {
       res.status(404).json({ error: '工具不存在' });
       return;
@@ -556,14 +564,22 @@ apiRouter.post(
   '/tools/batch-enabled',
   requireAuth,
   wrap(async (req, res) => {
-    const { tool_ids, all, q } = req.body ?? {};
+    const { items, tool_ids, all, q, upstream } = req.body ?? {};
     const enabled = !!req.body?.enabled;
-    if (!Array.isArray(tool_ids) && all !== true) {
-      res.status(400).json({ error: '请提供 tool_ids 或 all=true' });
+    if (!Array.isArray(items) && !Array.isArray(tool_ids) && all !== true) {
+      res.status(400).json({ error: '请提供 items / tool_ids 或 all=true' });
       return;
     }
     const changed = batchSetEnabled(
-      { tool_ids: Array.isArray(tool_ids) ? tool_ids.map(String) : undefined, all: all === true, q: String(q ?? '') },
+      {
+        items: Array.isArray(items)
+          ? items.map((i: any) => ({ upstream: String(i?.upstream ?? ''), tool_id: String(i?.tool_id ?? '') }))
+          : undefined,
+        tool_ids: Array.isArray(tool_ids) ? tool_ids.map(String) : undefined,
+        all: all === true,
+        q: String(q ?? ''),
+        upstream: String(upstream ?? '').trim() || undefined,
+      },
       enabled
     );
     res.json({ ok: true, changed });
@@ -761,7 +777,17 @@ apiRouter.put(
       setUserShops(u.id, b.shop_ids.map(String));
     }
     if (b.upstream !== undefined) {
-      db.prepare('UPDATE users SET upstream = ? WHERE id = ?').run(String(b.upstream ?? '').trim(), u.id);
+      const raw = String(b.upstream ?? '').trim();
+      if (raw && raw !== '*') {
+        const validIds = new Set((db.prepare('SELECT id FROM upstreams').all() as Array<{ id: string }>).map((r) => r.id));
+        const parts = raw.split(/[,\s]+/).map((s) => s.trim()).filter(Boolean);
+        const invalid = parts.filter((id) => !validIds.has(id));
+        if (invalid.length > 0) {
+          res.status(400).json({ error: `无效的 upstream id: ${invalid.join(', ')}（可选: ${[...validIds].join(', ') || '暂无'}）` });
+          return;
+        }
+      }
+      db.prepare('UPDATE users SET upstream = ? WHERE id = ?').run(raw, u.id);
     }
     res.json({ ok: true });
   })

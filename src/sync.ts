@@ -288,42 +288,74 @@ export function listTools(q: string, page: number, pageSize: number, toolType?: 
   };
 }
 
-/** 批量启停：按 id 列表或按搜索条件（all=true 时 q 为空表示全部） */
-export function batchSetEnabled(opts: { tool_ids?: string[]; all?: boolean; q?: string }, enabled: boolean): number {
+/** 批量启停：按 (upstream, tool_id) 精确列表，或按搜索条件（all=true）批量 */
+export function batchSetEnabled(
+  opts: {
+    items?: Array<{ upstream: string; tool_id: string }>;
+    tool_ids?: string[];
+    all?: boolean;
+    q?: string;
+    upstream?: string;
+  },
+  enabled: boolean
+): number {
   const flag = enabled ? 1 : 0;
-  if (opts.tool_ids && opts.tool_ids.length > 0) {
-    const stmt = db.prepare('UPDATE tools SET enabled = ? WHERE tool_id = ?');
+  if (opts.items && opts.items.length > 0) {
+    const stmt = db.prepare('UPDATE tools SET enabled = ? WHERE upstream = ? AND tool_id = ?');
+    let changed = 0;
     const tx = db.transaction(() => {
-      for (const id of opts.tool_ids!) stmt.run(flag, id);
+      for (const it of opts.items!) changed += stmt.run(flag, it.upstream, it.tool_id).changes;
     });
     tx();
-    return opts.tool_ids.length;
+    return changed;
+  }
+  if (opts.tool_ids && opts.tool_ids.length > 0) {
+    // 兼容旧调用：只有 tool_id 时按 tool_id 更新（可能命中所属多个 upstream）
+    const stmt = db.prepare('UPDATE tools SET enabled = ? WHERE tool_id = ?');
+    let changed = 0;
+    const tx = db.transaction(() => {
+      for (const id of opts.tool_ids!) changed += stmt.run(flag, id).changes;
+    });
+    tx();
+    return changed;
   }
   if (opts.all) {
+    const conds: string[] = [];
+    const params: unknown[] = [flag];
     const q = String(opts.q ?? '').trim();
-    const info = q
-      ? db
-          .prepare('UPDATE tools SET enabled = ? WHERE tool_id LIKE ? OR name LIKE ? OR description LIKE ?')
-          .run(flag, `%${q}%`, `%${q}%`, `%${q}%`)
-      : db.prepare('UPDATE tools SET enabled = ?').run(flag);
-    return info.changes;
+    if (q) {
+      conds.push('(tool_id LIKE ? OR name LIKE ? OR description LIKE ?)');
+      params.push(`%${q}%`, `%${q}%`, `%${q}%`);
+    }
+    if (opts.upstream) { conds.push('upstream = ?'); params.push(opts.upstream); }
+    const where = conds.length > 0 ? `WHERE ${conds.join(' AND ')}` : '';
+    return db.prepare(`UPDATE tools SET enabled = ? ${where}`).run(...params).changes;
   }
   return 0;
 }
 
 /** 上游提示"工具参数定义已更新"时，重新拉取该工具 Schema 并入库 */
-export async function refreshToolSchema(client: UpstreamClient, toolId: string): Promise<void> {
+export async function refreshToolSchema(client: UpstreamClient, toolId: string, upstream?: string): Promise<void> {
   try {
     const resp = await client.callTool('search', { toolId });
     if (resp?.error) return;
     const schema = extractSchema(unwrapCallResult(resp));
     if (schema) {
-      db.prepare('UPDATE tools SET input_schema = ?, updated_at = ? WHERE tool_id = ?').run(
-        JSON.stringify(schema),
-        new Date().toISOString(),
-        toolId
-      );
-      console.log(`[sync] 已刷新工具 Schema: ${toolId}`);
+      if (upstream) {
+        db.prepare('UPDATE tools SET input_schema = ?, updated_at = ? WHERE upstream = ? AND tool_id = ?').run(
+          JSON.stringify(schema),
+          new Date().toISOString(),
+          upstream,
+          toolId
+        );
+      } else {
+        db.prepare('UPDATE tools SET input_schema = ?, updated_at = ? WHERE tool_id = ?').run(
+          JSON.stringify(schema),
+          new Date().toISOString(),
+          toolId
+        );
+      }
+      console.log(`[sync] 已刷新工具 Schema: ${upstream ? upstream + '/' : ''}${toolId}`);
     }
   } catch (e: any) {
     console.warn(`[sync] 刷新 Schema 失败 ${toolId}: ${String(e?.message || e).slice(0, 150)}`);

@@ -95,6 +95,8 @@ async function populateUpstreamFilter() {
   } catch (e) { /* ignore */ }
 }
 
+function toolKey(upstream, toolId) { return `${upstream}::${toolId}`; }
+
 function updateBatchBar() {
   const n = toolState.selected.size;
   const bar = $('#batch-bar');
@@ -106,7 +108,7 @@ function updateBatchBar() {
   let txt = `已选 ${n} 个`;
   if (toolState.selectFiltered) txt += `（含全部搜索结果：${toolState.total} 个）`;
   $('#batch-info').textContent = txt;
-  const pageIds = $$('#tools-tbody input.row-chk').map((c) => c.dataset.id);
+  const pageIds = $$('#tools-tbody input.row-chk').map((c) => toolKey(c.dataset.upstream, c.dataset.id));
   $('#chk-all-page').checked = pageIds.length > 0 && pageIds.every((id) => toolState.selected.has(id));
 }
 
@@ -127,11 +129,13 @@ async function loadTools() {
     chk.type = 'checkbox';
     chk.className = 'row-chk';
     chk.dataset.id = t.tool_id;
-    chk.checked = toolState.selected.has(t.tool_id);
+    chk.dataset.upstream = t.upstream;
+    const key = toolKey(t.upstream, t.tool_id);
+    chk.checked = toolState.selected.has(key);
     chk.addEventListener('change', () => {
-      if (chk.checked) toolState.selected.add(t.tool_id);
+      if (chk.checked) toolState.selected.add(key);
       else {
-        toolState.selected.delete(t.tool_id);
+        toolState.selected.delete(key);
         toolState.selectFiltered = false;
       }
       updateBatchBar();
@@ -174,7 +178,10 @@ async function loadTools() {
     toggle.textContent = t.enabled ? '停用' : '启用';
     toggle.onclick = async () => {
       try {
-        await api(`/tools/${encodeURIComponent(t.tool_id)}/enabled`, { method: 'PUT', body: { enabled: !t.enabled } });
+        await api(`/tools/${encodeURIComponent(t.tool_id)}/enabled`, {
+          method: 'PUT',
+          body: { enabled: !t.enabled, upstream: t.upstream },
+        });
         loadTools();
       } catch (e) { toast(e.message); }
     };
@@ -182,7 +189,7 @@ async function loadTools() {
     detail.className = 'btn small ghost';
     detail.textContent = '详情';
     detail.style.marginLeft = '6px';
-    detail.onclick = () => showToolDetail(t.tool_id);
+    detail.onclick = () => showToolDetail(t.upstream, t.tool_id);
     td5.append(toggle, detail);
 
     tr.append(td0, td1, td2, td3, td4, td5);
@@ -216,23 +223,25 @@ $('#chk-all-page').addEventListener('change', (e) => {
   const checked = e.target.checked;
   $$('#tools-tbody input.row-chk').forEach((c) => {
     c.checked = checked;
-    if (checked) toolState.selected.add(c.dataset.id);
-    else toolState.selected.delete(c.dataset.id);
+    const key = toolKey(c.dataset.upstream, c.dataset.id);
+    if (checked) toolState.selected.add(key);
+    else toolState.selected.delete(key);
   });
   if (!checked) toolState.selectFiltered = false;
   updateBatchBar();
 });
 
 $('#btn-select-filtered').addEventListener('click', async () => {
-  // 把所有页的 id 拉全（最多 2000）
-  const ids = [];
+  // 把所有页的 (upstream, tool_id) 拉全（最多 2000）
   for (let page = 1; page <= 40; page++) {
-    const d = await api('/tools?' + new URLSearchParams({ q: toolState.q, page, page_size: 50 }));
-    for (const it of d.items) ids.push(it.tool_id);
+    const params = new URLSearchParams({ q: toolState.q, page, page_size: 50 });
+    if (toolState.toolType) params.set('tool_type', toolState.toolType);
+    if (toolState.upstream) params.set('upstream', toolState.upstream);
+    const d = await api('/tools?' + params);
+    for (const it of d.items) toolState.selected.add(toolKey(it.upstream, it.tool_id));
     if (page * 50 >= d.total) break;
   }
   toolState.selectFiltered = true;
-  ids.forEach((id) => toolState.selected.add(id));
   $$('#tools-tbody input.row-chk').forEach((c) => (c.checked = true));
   $('#chk-all-page').checked = true;
   updateBatchBar();
@@ -249,8 +258,14 @@ $('#btn-clear-select').addEventListener('click', () => {
 async function batchApply(enabled) {
   try {
     const body = toolState.selectFiltered
-      ? { all: true, q: toolState.q, enabled }
-      : { tool_ids: [...toolState.selected], enabled };
+      ? { all: true, q: toolState.q, upstream: toolState.upstream, enabled }
+      : {
+          items: [...toolState.selected].map((k) => {
+            const i = k.indexOf('::');
+            return { upstream: k.slice(0, i), tool_id: k.slice(i + 2) };
+          }),
+          enabled,
+        };
     const r = await api('/tools/batch-enabled', { method: 'POST', body });
     toast(`已${enabled ? '启用' : '停用'} ${r.changed} 个工具`);
     toolState.selected.clear();
@@ -280,10 +295,11 @@ $('#btn-sync').addEventListener('click', async () => {
   }
 });
 
-async function showToolDetail(toolId) {
+async function showToolDetail(upstream, toolId) {
   try {
-    const t = await api('/tools/' + encodeURIComponent(toolId));
-    $('#modal-title').textContent = `${t.tool_id}（暴露名: ${t.exposed_name}）`;
+    const qs = upstream ? `?upstream=${encodeURIComponent(upstream)}` : '';
+    const t = await api('/tools/' + encodeURIComponent(toolId) + qs);
+    $('#modal-title').textContent = `${t.upstream}/${t.tool_id}（暴露名: ${t.exposed_name}）`;
     $('#modal-body').textContent = JSON.stringify(t.input_schema ?? { note: '无 Schema，参数以 {type: object} 兜底' }, null, 2);
     $('#modal-mask').classList.remove('hidden');
   } catch (e) { toast(e.message); }
