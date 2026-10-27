@@ -239,13 +239,18 @@ export async function syncTools(): Promise<SyncResult> {
   }
 }
 
-export function listTools(q: string, page: number, pageSize: number): { total: number; items: Array<Record<string, unknown>> } {
-  const like = `%${q}%`;
-  const where = q
-    ? 'WHERE tool_id LIKE ? OR name LIKE ? OR description LIKE ?'
-    : '';
-  const params = q ? [like, like, like] : [];
-  const total = (db.prepare(`SELECT COUNT(*) AS c FROM tools ${where}`).get(...params) as { c: number }).c;
+export function listTools(q: string, page: number, pageSize: number, toolType?: string, enabled?: number): { total: number; items: Array<Record<string, unknown>> } {
+  const conds: string[] = [];
+  const params: unknown[] = [];
+  if (q) {
+    conds.push('(tool_id LIKE ? OR exposed_name LIKE ? OR name LIKE ? OR description LIKE ?)');
+    const like = `%${q}%`;
+    params.push(like, like, like, like);
+  }
+  if (toolType) { conds.push('tool_type = ?'); params.push(toolType); }
+  if (enabled !== undefined && enabled !== null) { conds.push('enabled = ?'); params.push(enabled); }
+  const where = conds.length > 0 ? `WHERE ${conds.join(' AND ')}` : '';
+  const total = (db.prepare(`SELECT COUNT(*) AS c FROM tools ${where}`).all(...params) as { c: number }[])[0].c;
   const rows = db
     .prepare(
       `SELECT tool_id, exposed_name, name, description, input_schema, tool_type, enabled, updated_at

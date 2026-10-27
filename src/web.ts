@@ -269,7 +269,10 @@ apiRouter.get(
     const q = String(req.query.q ?? '').trim();
     const page = Math.max(1, parseInt(String(req.query.page ?? '1'), 10) || 1);
     const pageSize = Math.min(500, Math.max(1, parseInt(String(req.query.page_size ?? '50'), 10) || 50));
-    res.json(listTools(q, page, pageSize));
+    const toolType = String(req.query.tool_type ?? '').trim() || undefined;
+    let enabled: number | undefined = undefined;
+    if (req.query.enabled !== undefined && req.query.enabled !== '') enabled = String(req.query.enabled) === '1' ? 1 : 0;
+    res.json(listTools(q, page, pageSize, toolType, enabled));
   })
 );
 
@@ -503,11 +506,21 @@ apiRouter.put(
       );
     }
     if (b.all_tools !== undefined) {
-      db.prepare('UPDATE users SET all_tools = ? WHERE id = ?').run(b.all_tools ? 1 : 0, u.id);
+      const newVal = b.all_tools ? 1 : 0;
+      db.prepare('UPDATE users SET all_tools = ? WHERE id = ?').run(newVal, u.id);
+      if (newVal === 1) {
+        // 切回全量：清空白名单，避免后续再切回 0 时带出脏数据
+        db.prepare('DELETE FROM user_tools WHERE user_id = ?').run(u.id);
+      }
     }
     if (b.all_shops !== undefined) {
-      db.prepare('UPDATE users SET all_shops = ? WHERE id = ?').run(b.all_shops ? 1 : 0, u.id);
+      const newVal = b.all_shops ? 1 : 0;
+      db.prepare('UPDATE users SET all_shops = ? WHERE id = ?').run(newVal, u.id);
+      if (newVal === 1) {
+        db.prepare('DELETE FROM user_shops WHERE user_id = ?').run(u.id);
+      }
     }
+    // tool_ids / shop_ids 显式传了就同步：即使 all_tools=1，允许前端顺带清空也行
     if (Array.isArray(b.tool_ids)) {
       setUserTools(u.id, b.tool_ids.map(String));
     }

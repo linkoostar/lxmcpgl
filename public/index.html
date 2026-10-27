@@ -42,6 +42,11 @@
     <main id="page-tools" class="page hidden">
       <div class="toolbar">
         <input id="tool-search" placeholder="搜索工具名 / 描述…" />
+        <select id="tool-type-filter" style="padding:7px 8px;border-radius:8px;border:1px solid var(--border)">
+          <option value="">全部类型</option>
+          <option value="read">read（只读）</option>
+          <option value="write">write（写操作）</option>
+        </select>
         <button id="btn-search" class="btn">搜索</button>
         <div class="spacer"></div>
         <span id="sync-status" class="muted"></span>

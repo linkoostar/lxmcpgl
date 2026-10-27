@@ -77,7 +77,7 @@ document.querySelectorAll('.nav-btn').forEach((b) => b.addEventListener('click',
 
 /* ---------- 工具列表（含批量选择） ---------- */
 
-const toolState = { q: '', page: 1, pageSize: 50, total: 0, selected: new Set(), selectFiltered: false };
+const toolState = { q: '', page: 1, pageSize: 50, toolType: '', total: 0, selected: new Set(), selectFiltered: false };
 
 function updateBatchBar() {
   const n = toolState.selected.size;
@@ -96,6 +96,7 @@ function updateBatchBar() {
 
 async function loadTools() {
   const params = new URLSearchParams({ q: toolState.q, page: toolState.page, page_size: toolState.pageSize });
+  if (toolState.toolType) params.set('tool_type', toolState.toolType);
   const data = await api('/tools?' + params);
   toolState.total = data.total;
   $('#page-info').textContent = `共 ${data.total} 个工具 · 第 ${toolState.page} / ${Math.max(1, Math.ceil(data.total / toolState.pageSize))} 页`;
@@ -173,10 +174,13 @@ async function loadTools() {
 
 $('#btn-search').addEventListener('click', () => {
   toolState.q = $('#tool-search').value.trim();
+  toolState.toolType = $('#tool-type-filter').value;
   toolState.page = 1;
+  toolState.selected.clear(); toolState.selectFiltered = false; updateBatchBar();
   loadTools().catch((e) => toast(e.message));
 });
 $('#tool-search').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('#btn-search').click(); });
+$('#tool-type-filter').addEventListener('change', () => $('#btn-search').click());
 $('#btn-prev').addEventListener('click', () => {
   if (toolState.page > 1) { toolState.page--; loadTools().catch((e) => toast(e.message)); }
 });
@@ -758,11 +762,12 @@ async function loadLogs() {
 
 function renderLogStats(stats) {
   const root = $('#log-stats');
+  const rate = stats.total > 0 ? ((stats.success / stats.total) * 100).toFixed(1) + '%' : '—';
   const topTools = (stats.top_tools || []).map((t) => `${t.tool_name} ×${t.count}`).join(' · ') || '—';
   const topCallers = (stats.top_callers || []).map((t) => `${t.caller} ×${t.count}`).join(' · ') || '—';
   root.innerHTML = `
     <div class="log-stat-card"><div class="label">总调用</div><div class="value">${stats.total}</div></div>
-    <div class="log-stat-card success"><div class="label">成功</div><div class="value">${stats.success || 0}</div></div>
+    <div class="log-stat-card success"><div class="label">成功</div><div class="value">${stats.success || 0}</div><div class="muted" style="font-size:12px;margin-top:4px">成功率 ${rate}</div></div>
     <div class="log-stat-card failed"><div class="label">失败 / 拒绝</div><div class="value">${stats.failed || 0}</div></div>
     <div class="log-stat-card avg"><div class="label">平均耗时</div><div class="value">${stats.avg_ms != null ? stats.avg_ms + ' ms' : '—'}</div></div>
     <div class="log-stat-card"><div class="label">独立调用者 / 工具</div>
