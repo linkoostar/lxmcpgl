@@ -38,6 +38,11 @@ function showApp(username) {
   $('#view-login').classList.add('hidden');
   $('#view-app').classList.remove('hidden');
   $('#me-name').textContent = username || '';
+  // 加载版本号（从 settings API）
+  api('/settings').then((s) => {
+    const el = $('#app-version');
+    if (el && s.version) el.textContent = `v${s.version}`;
+  }).catch(() => {});
   switchPage('tools');
 }
 
@@ -489,7 +494,7 @@ async function ensureToolsCache() {
   if (permState.toolsCache) return;
   const items = [];
   for (let page = 1; page <= 40; page++) {
-    const d = await api('/tools?' + new URLSearchParams({ page, page_size: 50 }));
+    const d = await api('/tools?' + new URLSearchParams({ page, page_size: 50, enabled: '1' }));
     items.push(...d.items);
     if (page * 50 >= d.total) break;
   }

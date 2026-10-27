@@ -169,6 +169,7 @@ apiRouter.get(
     const toolCount = (db.prepare('SELECT COUNT(*) AS c FROM tools').get() as { c: number }).c;
     const typeCount = getToolCountByType();
     res.json({
+      version: config.version,
       upstream_url: getSetting('upstream_url'),
       upstream_key_set: !!upstreamKey,
       upstream_key_masked: maskKey(upstreamKey),
