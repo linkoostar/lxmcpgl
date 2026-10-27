@@ -132,6 +132,17 @@ function extractSchema(payload: any): Record<string, unknown> | null {
   return found && (found as any).type === 'object' ? found : null;
 }
 
+/**
+ * schema 是否真的带了参数定义。
+ * 上游偶发返回 {type:'object', properties:{}} 空壳，直接入库会把已有的参数定义清空，
+ * 导致工具变成「无参可传」。这类空壳一律视为缺失，由 upsertTool 的 COALESCE 保留旧 schema。
+ */
+function schemaHasFields(schema: Record<string, unknown>): boolean {
+  const props = schema.properties;
+  if (props && typeof props === 'object' && !Array.isArray(props) && Object.keys(props as object).length > 0) return true;
+  return Array.isArray(schema.required) && schema.required.length > 0;
+}
+
 function sanitizeToolName(name: string): string {
   let n = name.replace(/[^a-zA-Z0-9_-]/g, '_');
   if (!/^[a-zA-Z0-9_-]+$/.test(n) || !n) n = `tool_${n.replace(/[^a-zA-Z0-9_-]/g, '')}`;
@@ -208,13 +219,14 @@ export async function syncTools(): Promise<SyncResult> {
           return;
         }
         const schema = extractSchema(unwrapCallResult(resp));
-        if (!schema) schemaMissing++;
+        const usableSchema = schema && schemaHasFields(schema) ? schema : null;
+        if (!usableSchema) schemaMissing++;
         upsertTool({
           tool_id: t.tool_id,
           exposed_name: sanitizeToolName(t.tool_id),
           name: t.name,
           description: t.description,
-          input_schema: schema ? JSON.stringify(schema) : null,
+          input_schema: usableSchema ? JSON.stringify(usableSchema) : null,
           raw: t.raw,
           tool_type: t.tool_type,
         });
@@ -340,23 +352,25 @@ export async function refreshToolSchema(client: UpstreamClient, toolId: string, 
     const resp = await client.callTool('search', { toolId });
     if (resp?.error) return;
     const schema = extractSchema(unwrapCallResult(resp));
-    if (schema) {
-      if (upstream) {
-        db.prepare('UPDATE tools SET input_schema = ?, updated_at = ? WHERE upstream = ? AND tool_id = ?').run(
-          JSON.stringify(schema),
-          new Date().toISOString(),
-          upstream,
-          toolId
-        );
-      } else {
-        db.prepare('UPDATE tools SET input_schema = ?, updated_at = ? WHERE tool_id = ?').run(
-          JSON.stringify(schema),
-          new Date().toISOString(),
-          toolId
-        );
-      }
-      console.log(`[sync] 已刷新工具 Schema: ${upstream ? upstream + '/' : ''}${toolId}`);
+    if (!schema || !schemaHasFields(schema)) {
+      console.warn(`[sync] 刷新 Schema 跳过（上游未返回有效参数定义）: ${upstream ? upstream + '/' : ''}${toolId}`);
+      return;
     }
+    if (upstream) {
+      db.prepare('UPDATE tools SET input_schema = ?, updated_at = ? WHERE upstream = ? AND tool_id = ?').run(
+        JSON.stringify(schema),
+        new Date().toISOString(),
+        upstream,
+        toolId
+      );
+    } else {
+      db.prepare('UPDATE tools SET input_schema = ?, updated_at = ? WHERE tool_id = ?').run(
+        JSON.stringify(schema),
+        new Date().toISOString(),
+        toolId
+      );
+    }
+    console.log(`[sync] 已刷新工具 Schema: ${upstream ? upstream + '/' : ''}${toolId}`);
   } catch (e: any) {
     console.warn(`[sync] 刷新 Schema 失败 ${toolId}: ${String(e?.message || e).slice(0, 150)}`);
   }
@@ -491,13 +505,14 @@ async function syncLingxingMeta(up: { id: string; name: string; url: string; api
         return;
       }
       const schema = extractSchema(unwrapCallResult(resp));
-      if (!schema) schemaMissing++;
+      const usableSchema = schema && schemaHasFields(schema) ? schema : null;
+      if (!usableSchema) schemaMissing++;
       upsertTool({
         tool_id: t.tool_id,
         exposed_name: sanitizeToolName(t.tool_id),
         name: t.name,
         description: t.description,
-        input_schema: schema ? JSON.stringify(schema) : null,
+        input_schema: usableSchema ? JSON.stringify(usableSchema) : null,
         tool_type: t.tool_type,
         upstream: up.id,
       });

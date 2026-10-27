@@ -329,7 +329,7 @@ export function upsertTool(t: {
        exposed_name = excluded.exposed_name,
        name = excluded.name,
        description = excluded.description,
-       input_schema = excluded.input_schema,
+       input_schema = COALESCE(excluded.input_schema, input_schema),
        raw = excluded.raw,
        tool_type = excluded.tool_type,
        updated_at = excluded.updated_at`

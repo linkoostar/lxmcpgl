@@ -11,7 +11,6 @@ import {
   touchUser,
   insertCallLog,
   listUpstreams,
-  getUpstreamToolCounts,
   parseUpstreamHeaders,
   type UserRow,
 } from './db.js';
@@ -410,12 +409,63 @@ async function callUpstreamTool(
   return resp;
 }
 
+// ---------- 上游响应清理（内网地址） ----------
+// NocoDB 等上游的分页字段（next/prev）会返回带内网地址、baseId、tableId 的绝对 URL，
+// 这些地址下游既访问不到、也不该暴露，统一移除值为内网 URL 的字段。
+
+const INTERNAL_URL_RE =
+  /^https?:\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})(?::\d+)?(?:\/|$)/i;
+
+function stripInternalUrlsInNode(node: unknown, stat: { removed: number }): unknown {
+  if (Array.isArray(node)) return node.map((x) => stripInternalUrlsInNode(x, stat));
+  if (node && typeof node === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
+      if (typeof v === 'string' && INTERNAL_URL_RE.test(v.trim())) {
+        stat.removed += 1;
+        continue; // 内网 URL 字段整条丢弃
+      }
+      out[k] = stripInternalUrlsInNode(v, stat);
+    }
+    return out;
+  }
+  return node;
+}
+
+/** 清理 MCP content 里 JSON 文本中的内网 URL 字段 */
+function stripInternalUrlsInContent(content: unknown, stat: { removed: number }): unknown {
+  if (!Array.isArray(content)) return content;
+  return content.map((part: any) => {
+    if (!part || typeof part !== 'object' || typeof part.text !== 'string') return part;
+    try {
+      const parsed = JSON.parse(part.text);
+      return { ...part, text: JSON.stringify(stripInternalUrlsInNode(parsed, stat)) };
+    } catch {
+      return part;
+    }
+  });
+}
+
+/** 上游已知问题标注：让 Agent 在 tools/list 阶段就知道这些工具当前不可靠 */
+const TOOL_CAVEATS: Record<string, string> = {
+  'lingxing:platform_store_report_list': '⚠️ 上游已知问题：该接口常返回空/不可用数据，不要据此判断店铺业绩。',
+  'lingxing:platform_walmart_bill_statement_list': '⚠️ 前置条件：需先在领星完成沃尔玛店铺授权与账期同步，否则返回空列表。',
+};
+
 // ---------- 主处理 ----------
 
 export async function handleMcpRequest(req: Request, res: Response, identity: McpIdentity): Promise<void> {
   // 构建动态 serverInfo — 让 Agent 启动时一眼知道网关聚合了哪些上游
   const upstreams = listUpstreams().filter((u) => u.active);
-  const toolCounts = getUpstreamToolCounts();
+  // 只统计「已启用 + 上游 active」的工具，必须和 tools/list 实际暴露的数量一致
+  const toolCounts: Record<string, number> = {};
+  if (upstreams.length > 0) {
+    const ph = upstreams.map(() => '?').join(',');
+    const rows = db
+      .prepare(`SELECT upstream, COUNT(*) AS c FROM tools WHERE enabled = 1 AND upstream IN (${ph}) GROUP BY upstream`)
+      .all(...upstreams.map((u) => u.id)) as Array<{ upstream: string; c: number }>;
+    for (const r of rows) toolCounts[r.upstream] = r.c;
+  }
   const upstreamDesc = upstreams
     .map((u) => `${u.name}（${u.notes || '无描述'}，${toolCounts[u.id] ?? 0} 工具）`)
     .join('；');
@@ -487,9 +537,10 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
         // 在 description 开头注入「来源」，LLM 一眼就能按域分组
         const descPrefix = upstreamDesc ? `[来自 ${upstreamName} · ${upstreamDesc}] ` : `[来自 ${upstreamName}] `;
         const rawDesc = r.description || r.name || r.exposed_name;
+        const caveat = TOOL_CAVEATS[`${r.upstream}:${r.tool_id}`];
         return {
           name: exposedNameOf(r),
-          description: descPrefix + rawDesc,
+          description: descPrefix + (caveat ? `${caveat} ` : '') + rawDesc,
           inputSchema: safeParseSchema(r.input_schema),
           // 非标准扩展字段，Agent/客户端如果认 MCP tools 里的自定义字段可以直接用
           _upstream: r.upstream,
@@ -743,6 +794,12 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
               },
             ];
           }
+        }
+        // 清理响应里的内网地址（如 NocoDB 的 next 分页 URL 会带 192.168.x.x:port / baseId / tableId）
+        const scrubStat = { removed: 0 };
+        filteredContent = stripInternalUrlsInContent(filteredContent, scrubStat) as any[];
+        if (scrubStat.removed > 0) {
+          console.log(`[mcp] ${caller} ${name} 已移除 ${scrubStat.removed} 个内网 URL 字段`);
         }
         return { content: filteredContent };
       }

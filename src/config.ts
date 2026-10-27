@@ -9,7 +9,7 @@ export const config = {
   adminPassword: process.env.ADMIN_PASSWORD || 'admin123',
   upstreamUrlEnv: process.env.LINGXING_MCP_URL || '',
   upstreamKeyEnv: process.env.LINGXING_MCP_KEY || '',
-  version: '1.1.0',
+  version: '1.1.1',
   // 构建信息：由 CI/Docker build-arg 注入，用于确认「更新是否真正生效」
   commit: process.env.GIT_SHA || '',
   buildTime: process.env.BUILD_TIME || '',
