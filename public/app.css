@@ -92,6 +92,7 @@ td .desc { color: var(--muted); font-size: 12px; display: block; max-width: 560p
 }
 .tag.ok { background: #ecfdf5; color: #059669; }
 .tag.no { background: #fff1f2; color: #e11d48; }
+.tag.warn { background: #fffbeb; color: #d97706; }
 .pager { display: flex; align-items: center; gap: 12px; justify-content: center; margin-top: 12px; }
 
 /* 代码块 */

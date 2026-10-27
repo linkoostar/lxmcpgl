@@ -1,10 +1,27 @@
 import express from 'express';
 import type { Request, Response, NextFunction, RequestHandler } from 'express';
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
-import { db, getSetting, setSetting, hashPassword, verifyPassword, getToolById } from './db.js';
+import {
+  db,
+  getSetting,
+  setSetting,
+  hashPassword,
+  verifyPassword,
+  sha256,
+  getToolById,
+  upsertShop,
+  listShops,
+  listUsers,
+  getUserById,
+  getUserByKeyHash,
+  getUserToolIds,
+  getUserShopIds,
+  setUserTools,
+  setUserShops,
+} from './db.js';
 import { config, META_TOOLS } from './config.js';
 import { getUpstreamClient, resetUpstreamClient, UpstreamError } from './upstream.js';
-import { syncTools, isSyncing, listTools } from './sync.js';
+import { syncTools, isSyncing, listTools, batchSetEnabled } from './sync.js';
 
 const COOKIE_NAME = 'lx_session';
 const SESSION_TTL_MS = 12 * 3600 * 1000;
@@ -151,6 +168,8 @@ apiRouter.get(
       last_sync_at: getSetting('last_sync_at'),
       tool_count: toolCount,
       syncing: isSyncing(),
+      block_write: getSetting('block_write') === '1',
+      shop_count: listShops().length,
     });
   })
 );
@@ -170,6 +189,9 @@ apiRouter.put(
     }
     if (upstream_key !== undefined && String(upstream_key).trim() !== '') {
       setSetting('upstream_key', String(upstream_key).trim());
+    }
+    if (req.body?.block_write !== undefined) {
+      setSetting('block_write', req.body.block_write ? '1' : '0');
     }
     resetUpstreamClient();
     res.json({ ok: true });
@@ -219,7 +241,7 @@ apiRouter.get(
   wrap(async (req, res) => {
     const q = String(req.query.q ?? '').trim();
     const page = Math.max(1, parseInt(String(req.query.page ?? '1'), 10) || 1);
-    const pageSize = Math.min(200, Math.max(1, parseInt(String(req.query.page_size ?? '50'), 10) || 50));
+    const pageSize = Math.min(500, Math.max(1, parseInt(String(req.query.page_size ?? '50'), 10) || 50));
     res.json(listTools(q, page, pageSize));
   })
 );
@@ -266,6 +288,217 @@ apiRouter.post(
     const key = randomBytes(24).toString('hex');
     setSetting('downstream_key', key);
     res.json({ ok: true, downstream_key: key });
+  })
+);
+
+// ---------- 批量启停 ----------
+
+apiRouter.post(
+  '/tools/batch-enabled',
+  requireAuth,
+  wrap(async (req, res) => {
+    const { tool_ids, all, q } = req.body ?? {};
+    const enabled = !!req.body?.enabled;
+    if (!Array.isArray(tool_ids) && all !== true) {
+      res.status(400).json({ error: '请提供 tool_ids 或 all=true' });
+      return;
+    }
+    const changed = batchSetEnabled(
+      { tool_ids: Array.isArray(tool_ids) ? tool_ids.map(String) : undefined, all: all === true, q: String(q ?? '') },
+      enabled
+    );
+    res.json({ ok: true, changed });
+  })
+);
+
+// ---------- 店铺 ----------
+
+apiRouter.get(
+  '/shops',
+  requireAuth,
+  wrap(async (_req, res) => {
+    res.json({ items: listShops() });
+  })
+);
+
+apiRouter.post(
+  '/shops/sync',
+  requireAuth,
+  wrap(async (_req, res) => {
+    if (!getSetting('upstream_key')) {
+      res.status(400).json({ error: '请先配置上游密钥' });
+      return;
+    }
+    try {
+      const client = getUpstreamClient(getSetting('upstream_url'), getSetting('upstream_key'));
+      const resp = await client.callTool('action', { toolId: 'get_my_sids', params: {} });
+      if (resp?.error) throw new Error(JSON.stringify(resp.error).slice(0, 300));
+      const text = resp?.result?.content?.find((c: any) => c?.type === 'text')?.text ?? '';
+      const payload = JSON.parse(text);
+      const list = payload?.data?.list ?? payload?.data ?? [];
+      if (!Array.isArray(list)) throw new Error('get_my_sids 返回结构异常');
+      for (const s of list) {
+        const sid = s?.id ?? s?.sid;
+        if (sid === undefined || sid === null) continue;
+        upsertShop({
+          sid: String(sid),
+          name: String(s?.name ?? ''),
+          country: String(s?.country ?? s?.country_code ?? ''),
+          seller_id: String(s?.seller_id ?? ''),
+        });
+      }
+      res.json({ ok: true, count: listShops().length });
+    } catch (e: any) {
+      res.status(502).json({ error: String(e?.message || e).slice(0, 300) });
+    }
+  })
+);
+
+// ---------- 运营用户 ----------
+
+function userKey(): string {
+  return randomBytes(24).toString('hex');
+}
+
+apiRouter.get(
+  '/users',
+  requireAuth,
+  wrap(async (_req, res) => {
+    res.json({
+      items: listUsers().map((u) => ({
+        id: u.id,
+        username: u.username,
+        key_prefix: u.key_prefix,
+        enabled: !!u.enabled,
+        rate_limit: u.rate_limit,
+        all_tools: !!u.all_tools,
+        tool_count: u.all_tools ? null : getUserToolIds(u.id).length,
+        all_shops: !!u.all_shops,
+        shop_count: u.all_shops ? null : getUserShopIds(u.id).length,
+        created_at: u.created_at,
+        last_used_at: u.last_used_at,
+      })),
+    });
+  })
+);
+
+apiRouter.post(
+  '/users',
+  requireAuth,
+  wrap(async (req, res) => {
+    const username = String(req.body?.username ?? '').trim();
+    const rateLimit = Math.max(0, parseInt(String(req.body?.rate_limit ?? '0'), 10) || 0);
+    if (!/^[\w.-]{2,32}$/.test(username)) {
+      res.status(400).json({ error: '用户名需为 2-32 位字母/数字/._-' });
+      return;
+    }
+    if (getUserByUsername(username)) {
+      res.status(400).json({ error: '用户名已存在' });
+      return;
+    }
+    const key = userKey();
+    const info = db
+      .prepare(
+        'INSERT INTO users (username, key_hash, key_prefix, enabled, rate_limit, all_tools, all_shops, created_at, last_used_at) VALUES (?, ?, ?, 1, ?, 1, 1, ?, ?)'
+      )
+      .run(username, sha256(key), key.slice(0, 8), rateLimit, new Date().toISOString(), '');
+    res.json({ ok: true, id: info.lastInsertRowid, downstream_key: key });
+  })
+);
+
+function getUserByUsername(username: string) {
+  return db.prepare('SELECT * FROM users WHERE username = ?').get(username) as any;
+}
+
+apiRouter.get(
+  '/users/:id',
+  requireAuth,
+  wrap(async (req, res) => {
+    const u = getUserById(parseInt(String(req.params.id), 10));
+    if (!u) {
+      res.status(404).json({ error: '用户不存在' });
+      return;
+    }
+    res.json({
+      id: u.id,
+      username: u.username,
+      enabled: !!u.enabled,
+      rate_limit: u.rate_limit,
+      all_tools: !!u.all_tools,
+      tool_ids: getUserToolIds(u.id),
+      all_shops: !!u.all_shops,
+      shop_ids: getUserShopIds(u.id),
+    });
+  })
+);
+
+apiRouter.put(
+  '/users/:id',
+  requireAuth,
+  wrap(async (req, res) => {
+    const u = getUserById(parseInt(String(req.params.id), 10));
+    if (!u) {
+      res.status(404).json({ error: '用户不存在' });
+      return;
+    }
+    const b = req.body ?? {};
+    if (b.enabled !== undefined) {
+      db.prepare('UPDATE users SET enabled = ? WHERE id = ?').run(b.enabled ? 1 : 0, u.id);
+    }
+    if (b.rate_limit !== undefined) {
+      db.prepare('UPDATE users SET rate_limit = ? WHERE id = ?').run(
+        Math.max(0, parseInt(String(b.rate_limit), 10) || 0),
+        u.id
+      );
+    }
+    if (b.all_tools !== undefined) {
+      db.prepare('UPDATE users SET all_tools = ? WHERE id = ?').run(b.all_tools ? 1 : 0, u.id);
+    }
+    if (b.all_shops !== undefined) {
+      db.prepare('UPDATE users SET all_shops = ? WHERE id = ?').run(b.all_shops ? 1 : 0, u.id);
+    }
+    if (Array.isArray(b.tool_ids)) {
+      setUserTools(u.id, b.tool_ids.map(String));
+    }
+    if (Array.isArray(b.shop_ids)) {
+      setUserShops(u.id, b.shop_ids.map(String));
+    }
+    res.json({ ok: true });
+  })
+);
+
+apiRouter.post(
+  '/users/:id/reset-key',
+  requireAuth,
+  wrap(async (req, res) => {
+    const u = getUserById(parseInt(String(req.params.id), 10));
+    if (!u) {
+      res.status(404).json({ error: '用户不存在' });
+      return;
+    }
+    const key = userKey();
+    db.prepare('UPDATE users SET key_hash = ?, key_prefix = ? WHERE id = ?').run(sha256(key), key.slice(0, 8), u.id);
+    res.json({ ok: true, downstream_key: key });
+  })
+);
+
+apiRouter.delete(
+  '/users/:id',
+  requireAuth,
+  wrap(async (req, res) => {
+    const id = parseInt(String(req.params.id), 10);
+    const u = getUserById(id);
+    if (!u) {
+      res.status(404).json({ error: '用户不存在' });
+      return;
+    }
+    const tx = db.transaction(() => {
+      db.prepare('DELETE FROM users WHERE id = ?').run(id);
+      db.prepare('DELETE FROM user_tools WHERE user_id = ?').run(id);
+      db.prepare('DELETE FROM user_shops WHERE user_id = ?').run(id);
+    });
+    tx();
+    res.json({ ok: true });
   })
 );
 

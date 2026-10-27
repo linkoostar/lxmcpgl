@@ -71,22 +71,37 @@ function findNumber(obj: any, keys: string[], depth = 0): number | undefined {
   return undefined;
 }
 
-function normalizeTool(raw: any): { tool_id: string; name: string; description: string; raw: string } | null {
+// 上游 help 不提供 toolType 时，按工具名中的动词分词兜底判断读写类型
+const WRITE_TOKENS = new Set([
+  'put', 'add', 'create', 'update', 'delete', 'del', 'set', 'modify', 'cancel',
+  'edit', 'remove', 'save', 'import', 'send', 'archive', 'push', 'upload',
+  'pause', 'enable', 'disable', 'adjust', 'audit', 'approve', 'reject',
+  'mark', 'reset', 'bind', 'unbind', 'apply',
+]);
+
+function classifyByName(name: string): string {
+  const tokens = name.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+  return tokens.some((t) => WRITE_TOKENS.has(t)) ? 'write' : 'read';
+}
+
+function normalizeTool(raw: any): { tool_id: string; name: string; description: string; tool_type: string; raw: string } | null {
   if (!raw || typeof raw !== 'object') return null;
   const toolId = String(pick(raw, ['toolId', 'tool_id', 'id', 'toolName', 'name']) ?? '').trim();
   if (!toolId || /^[0-9]+$/.test(toolId)) return null;
   const name = String(pick(raw, ['name', 'displayName', 'title', 'tool_name', 'label']) ?? toolId);
   const description = String(pick(raw, ['description', 'desc', 'summary', 'tool_desc']) ?? '');
+  const toolTypeRaw = String(pick(raw, ['toolType', 'tool_type']) ?? '').toLowerCase();
+  const tool_type = toolTypeRaw === 'read' || toolTypeRaw === 'write' ? toolTypeRaw : classifyByName(toolId);
   let rawJson: string = '';
   try {
     rawJson = JSON.stringify(raw);
   } catch {
     rawJson = '';
   }
-  return { tool_id: toolId, name, description, raw: rawJson };
+  return { tool_id: toolId, name, description, tool_type, raw: rawJson };
 }
 
-function extractToolPage(payload: any): { items: Array<{ tool_id: string; name: string; description: string; raw: string }>; total?: number } {
+function extractToolPage(payload: any): { items: Array<{ tool_id: string; name: string; description: string; tool_type: string; raw: string }>; total?: number } {
   const arrays = collectArrays(payload).filter((a) => a.length > 0);
   let best: any[] = [];
   for (const a of arrays) {
@@ -96,7 +111,7 @@ function extractToolPage(payload: any): { items: Array<{ tool_id: string; name: 
   }
   const items = best
     .map(normalizeTool)
-    .filter((t): t is { tool_id: string; name: string; description: string; raw: string } => !!t);
+    .filter((t): t is { tool_id: string; name: string; description: string; tool_type: string; raw: string } => !!t);
   const total = findNumber(payload, ['total', 'totalCount', 'total_count', 'count', 'sum']);
   return { items, total };
 }
@@ -140,8 +155,8 @@ async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T, index: nu
 
 // ---------- 主流程 ----------
 
-async function fetchAllListedTools(client: UpstreamClient): Promise<{ tools: Map<string, { tool_id: string; name: string; description: string; raw: string }>; listed: number }> {
-  const tools = new Map<string, { tool_id: string; name: string; description: string; raw: string }>();
+async function fetchAllListedTools(client: UpstreamClient): Promise<{ tools: Map<string, { tool_id: string; name: string; description: string; tool_type: string; raw: string }>; listed: number }> {
+  const tools = new Map<string, { tool_id: string; name: string; description: string; tool_type: string; raw: string }>();
   const limit = 100;
   let offset = 0;
   let total: number | undefined;
@@ -201,6 +216,7 @@ export async function syncTools(): Promise<SyncResult> {
           description: t.description,
           input_schema: schema ? JSON.stringify(schema) : null,
           raw: t.raw,
+          tool_type: t.tool_type,
         });
       } catch (e: any) {
         errors.push(`search ${t.tool_id}: ${String(e?.message || e).slice(0, 120)}`);
@@ -232,7 +248,7 @@ export function listTools(q: string, page: number, pageSize: number): { total: n
   const total = (db.prepare(`SELECT COUNT(*) AS c FROM tools ${where}`).get(...params) as { c: number }).c;
   const rows = db
     .prepare(
-      `SELECT tool_id, exposed_name, name, description, input_schema, enabled, updated_at
+      `SELECT tool_id, exposed_name, name, description, input_schema, tool_type, enabled, updated_at
        FROM tools ${where} ORDER BY tool_id LIMIT ? OFFSET ?`
     )
     .all(...params, pageSize, (page - 1) * pageSize) as Array<ToolRow & { input_schema: string | null }>;
@@ -243,9 +259,52 @@ export function listTools(q: string, page: number, pageSize: number): { total: n
       exposed_name: r.exposed_name,
       name: r.name,
       description: r.description,
+      tool_type: r.tool_type || '',
       has_schema: !!r.input_schema,
       enabled: !!r.enabled,
       updated_at: r.updated_at,
     })),
   };
+}
+
+/** 批量启停：按 id 列表或按搜索条件（all=true 时 q 为空表示全部） */
+export function batchSetEnabled(opts: { tool_ids?: string[]; all?: boolean; q?: string }, enabled: boolean): number {
+  const flag = enabled ? 1 : 0;
+  if (opts.tool_ids && opts.tool_ids.length > 0) {
+    const stmt = db.prepare('UPDATE tools SET enabled = ? WHERE tool_id = ?');
+    const tx = db.transaction(() => {
+      for (const id of opts.tool_ids!) stmt.run(flag, id);
+    });
+    tx();
+    return opts.tool_ids.length;
+  }
+  if (opts.all) {
+    const q = String(opts.q ?? '').trim();
+    const info = q
+      ? db
+          .prepare('UPDATE tools SET enabled = ? WHERE tool_id LIKE ? OR name LIKE ? OR description LIKE ?')
+          .run(flag, `%${q}%`, `%${q}%`, `%${q}%`)
+      : db.prepare('UPDATE tools SET enabled = ?').run(flag);
+    return info.changes;
+  }
+  return 0;
+}
+
+/** 上游提示"工具参数定义已更新"时，重新拉取该工具 Schema 并入库 */
+export async function refreshToolSchema(client: UpstreamClient, toolId: string): Promise<void> {
+  try {
+    const resp = await client.callTool('search', { toolId });
+    if (resp?.error) return;
+    const schema = extractSchema(unwrapCallResult(resp));
+    if (schema) {
+      db.prepare('UPDATE tools SET input_schema = ?, updated_at = ? WHERE tool_id = ?').run(
+        JSON.stringify(schema),
+        new Date().toISOString(),
+        toolId
+      );
+      console.log(`[sync] 已刷新工具 Schema: ${toolId}`);
+    }
+  } catch (e: any) {
+    console.warn(`[sync] 刷新 Schema 失败 ${toolId}: ${String(e?.message || e).slice(0, 150)}`);
+  }
 }

@@ -29,6 +29,7 @@
       <div class="brand">领星 MCP 网关</div>
       <nav>
         <button class="nav-btn" data-page="tools">工具列表</button>
+        <button class="nav-btn" data-page="users">运营用户</button>
         <button class="nav-btn" data-page="settings">系统设置</button>
       </nav>
       <div class="spacer"></div>
@@ -45,12 +46,21 @@
         <span id="sync-status" class="muted"></span>
         <button id="btn-sync" class="btn primary">同步工具</button>
       </div>
+      <div id="batch-bar" class="batch-bar hidden">
+        <span id="batch-info" class="muted"></span>
+        <button id="btn-batch-enable" class="btn small primary">启用选中</button>
+        <button id="btn-batch-disable" class="btn small danger">停用选中</button>
+        <button id="btn-select-filtered" class="btn small">选中全部搜索结果</button>
+        <button id="btn-clear-select" class="btn small ghost">取消选择</button>
+      </div>
       <div class="table-wrap">
         <table>
           <thead>
             <tr>
-              <th style="width:220px">工具 ID</th>
+              <th style="width:36px"><input type="checkbox" id="chk-all-page" title="全选本页" /></th>
+              <th style="width:210px">工具 ID</th>
               <th>名称 / 描述</th>
+              <th style="width:70px">类型</th>
               <th style="width:90px">Schema</th>
               <th style="width:80px">启用</th>
               <th style="width:70px"></th>
@@ -63,6 +73,42 @@
         <button id="btn-prev" class="btn small">上一页</button>
         <span id="page-info" class="muted"></span>
         <button id="btn-next" class="btn small">下一页</button>
+      </div>
+    </main>
+
+    <!-- 运营用户 -->
+    <main id="page-users" class="page hidden">
+      <div class="toolbar">
+        <span class="muted">每个运营发独立 Key；可限制可用工具与可见店铺，支持限流与停用。</span>
+        <div class="spacer"></div>
+        <input id="new-user-name" placeholder="用户名（字母/数字）" style="width:180px" />
+        <input id="new-user-rate" placeholder="限速/分钟(0不限)" style="width:140px" />
+        <button id="btn-add-user" class="btn primary">添加用户</button>
+      </div>
+      <div id="new-key-tip" class="card hidden" style="border-color: var(--primary)">
+        <b>新用户 Key（只显示一次，请立即复制发给运营）：</b>
+        <div class="row" style="margin-top:8px">
+          <input id="new-key-value" readonly />
+          <button id="btn-copy-new-key" class="btn">复制</button>
+          <button id="btn-dismiss-new-key" class="btn ghost small">关闭</button>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>用户</th>
+              <th style="width:130px">Key</th>
+              <th style="width:80px">状态</th>
+              <th style="width:160px">工具权限</th>
+              <th style="width:140px">店铺权限</th>
+              <th style="width:110px">限速</th>
+              <th style="width:150px">最近调用</th>
+              <th style="width:250px"></th>
+            </tr>
+          </thead>
+          <tbody id="users-tbody"></tbody>
+        </table>
       </div>
     </main>
 
@@ -85,7 +131,7 @@
       </div>
 
       <div class="card">
-        <h2>下游接入（运营配置）</h2>
+        <h2>管理员通用 Key（全权限）</h2>
         <label>网关访问 Key
           <div class="row">
             <input id="down-key" readonly />
@@ -93,9 +139,26 @@
             <button id="btn-reset-key" class="btn danger">重置 Key</button>
           </div>
         </label>
+        <p class="muted">给运营分配受限 Key 请前往「运营用户」页；此 Key 拥有全部工具与店铺权限，建议仅管理员自用。</p>
         <p class="muted">把下面配置发给运营即可（粘贴到 Trae 的 MCP 配置）：</p>
         <pre id="mcp-snippet" class="code"></pre>
         <button id="btn-copy-snippet" class="btn small">复制配置</button>
+      </div>
+
+      <div class="card">
+        <h2>店铺与写操作管控</h2>
+        <div class="row" style="margin-bottom:12px">
+          <span>店铺数据：</span>
+          <span id="shop-count" class="muted">未同步</span>
+          <button id="btn-sync-shops" class="btn">同步店铺</button>
+          <span class="muted">（从 get_my_sids 拉取，用于「运营用户」的店铺级授权）</span>
+        </div>
+        <div class="row">
+          <label style="flex-direction:row;align-items:center;gap:6px;margin:0">
+            <input type="checkbox" id="chk-block-write" style="width:auto" />
+            禁止运营用户调用 write 类工具（改价、加否词、确认发货等）
+          </label>
+        </div>
       </div>
 
       <div class="card">
@@ -108,6 +171,45 @@
         <span id="pass-result" class="muted"></span>
       </div>
     </main>
+  </div>
+
+  <!-- 用户权限弹窗 -->
+  <div id="user-mask" class="modal-mask hidden">
+    <div class="modal">
+      <div class="modal-head">
+        <span id="user-modal-title"></span>
+        <button id="user-modal-close" class="btn ghost small">关闭</button>
+      </div>
+      <div class="user-modal-body scroll">
+        <div class="perm-section">
+          <div class="row">
+            <b>工具权限：</b>
+            <label style="flex-direction:row;align-items:center;gap:4px;margin:0"><input type="radio" name="perm-tools" value="all" style="width:auto" /> 全部启用工具</label>
+            <label style="flex-direction:row;align-items:center;gap:4px;margin:0"><input type="radio" name="perm-tools" value="custom" style="width:auto" /> 自定义白名单</label>
+            <div class="spacer"></div>
+            <input id="perm-tool-search" placeholder="筛选工具…" style="width:180px" />
+            <button id="perm-tool-all" class="btn small">全选</button>
+            <button id="perm-tool-none" class="btn small">清空</button>
+          </div>
+          <div id="perm-tool-list" class="perm-list"></div>
+        </div>
+        <div class="perm-section">
+          <div class="row">
+            <b>店铺权限：</b>
+            <label style="flex-direction:row;align-items:center;gap:4px;margin:0"><input type="radio" name="perm-shops" value="all" style="width:auto" /> 全部店铺</label>
+            <label style="flex-direction:row;align-items:center;gap:4px;margin:0"><input type="radio" name="perm-shops" value="custom" style="width:auto" /> 指定店铺</label>
+            <div class="spacer"></div>
+            <button id="perm-shop-all" class="btn small">全选</button>
+            <button id="perm-shop-none" class="btn small">清空</button>
+          </div>
+          <div id="perm-shop-list" class="perm-list"></div>
+        </div>
+      </div>
+      <div class="row">
+        <button id="user-modal-save" class="btn primary">保存权限</button>
+        <span id="user-modal-tip" class="muted"></span>
+      </div>
+    </div>
   </div>
 
   <!-- 工具详情弹窗 -->

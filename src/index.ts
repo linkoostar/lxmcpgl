@@ -1,9 +1,9 @@
 import express from 'express';
 import path from 'node:path';
 import { config } from './config.js';
-import { initDb, getSetting } from './db.js';
+import { initDb, getSetting, sha256, getUserByKeyHash, type UserRow } from './db.js';
 import { apiRouter, apiErrorHandler } from './web.js';
-import { handleMcpRequest } from './mcp.js';
+import { handleMcpRequest, identityFromUser, type McpIdentity } from './mcp.js';
 import type { Request, Response, NextFunction } from 'express';
 
 // 代理环境支持（沙箱/内网出口场景），NAS 部署无代理时无副作用
@@ -20,17 +20,37 @@ async function setupProxy(): Promise<void> {
 }
 
 function mcpAuth(req: Request, res: Response, next: NextFunction): void {
-  const key = getSetting('downstream_key');
   const auth = req.headers.authorization || '';
   const provided = auth.startsWith('Bearer ') ? auth.slice(7).trim() : String(req.headers['x-mcp-key'] ?? '').trim();
-  if (!key || provided !== key) {
+  if (!provided) {
     res.status(401).json({
       jsonrpc: '2.0',
-      error: { code: -32001, message: '未授权：请携带正确的下游访问 Key（Authorization: Bearer <key>）' },
+      error: { code: -32001, message: '未授权：请携带下游访问 Key（Authorization: Bearer <key>）' },
       id: null,
     });
     return;
   }
+
+  let identity: McpIdentity;
+  const user = getUserByKeyHash(sha256(provided));
+  if (user) {
+    if (!user.enabled) {
+      res.status(401).json({ jsonrpc: '2.0', error: { code: -32001, message: '该 Key 已被停用' }, id: null });
+      return;
+    }
+    identity = identityFromUser(user as UserRow);
+  } else if (provided === getSetting('downstream_key')) {
+    identity = { kind: 'admin' }; // 管理员通用 Key：全部权限
+  } else {
+    res.status(401).json({
+      jsonrpc: '2.0',
+      error: { code: -32001, message: '未授权：Key 无效' },
+      id: null,
+    });
+    return;
+  }
+
+  (req as any).mcpIdentity = identity;
   next();
 }
 
@@ -50,7 +70,7 @@ async function main(): Promise<void> {
       res.status(405).json({ jsonrpc: '2.0', error: { code: -32000, message: 'Method not allowed' }, id: null });
       return;
     }
-    handleMcpRequest(req, res).catch((e) => {
+    handleMcpRequest(req, res, (req as any).mcpIdentity).catch((e) => {
       console.error('[mcp] 请求处理异常:', e);
       if (!res.headersSent) {
         res.status(500).json({ jsonrpc: '2.0', error: { code: -32603, message: 'Internal error' }, id: null });
