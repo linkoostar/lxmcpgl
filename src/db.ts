@@ -255,6 +255,7 @@ export interface ToolRow {
   input_schema: string | null;
   raw: string | null;
   tool_type: string | null;
+  upstream?: string;
   enabled: number;
   updated_at: string;
 }
@@ -265,12 +266,13 @@ export function upsertTool(t: {
   name: string;
   description: string;
   input_schema: string | null;
-  raw: string | null;
+  raw?: string | null;
   tool_type: string;
+  upstream?: string;
 }): void {
   db.prepare(
-    `INSERT INTO tools (tool_id, exposed_name, name, description, input_schema, raw, tool_type, enabled, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
+    `INSERT INTO tools (tool_id, exposed_name, name, description, input_schema, raw, tool_type, upstream, enabled, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
      ON CONFLICT(tool_id) DO UPDATE SET
        exposed_name = excluded.exposed_name,
        name = excluded.name,
@@ -278,8 +280,9 @@ export function upsertTool(t: {
        input_schema = excluded.input_schema,
        raw = excluded.raw,
        tool_type = excluded.tool_type,
+       upstream = COALESCE(excluded.upstream, tools.upstream),
        updated_at = excluded.updated_at`
-  ).run(t.tool_id, t.exposed_name, t.name, t.description, t.input_schema, t.raw, t.tool_type, new Date().toISOString());
+  ).run(t.tool_id, t.exposed_name, t.name, t.description, t.input_schema, t.raw ?? null, t.tool_type, t.upstream ?? 'lingxing', new Date().toISOString());
 }
 
 export function getToolByExposedName(name: string): ToolRow | undefined {
@@ -401,6 +404,7 @@ export interface CallLog {
   tool_name: string;
   tool_id: string | null;
   tool_type: string | null;
+  upstream?: string;
   shop_refs: string;
   success: number;
   is_error: number;
@@ -414,6 +418,7 @@ export function insertCallLog(l: {
   tool_name: string;
   tool_id: string | null;
   tool_type: string | null;
+  upstream?: string;
   shop_refs: string[] | null;
   success: boolean;
   is_error: boolean;

@@ -327,3 +327,144 @@ export async function refreshToolSchema(client: UpstreamClient, toolId: string):
     console.warn(`[sync] 刷新 Schema 失败 ${toolId}: ${String(e?.message || e).slice(0, 150)}`);
   }
 }
+
+// =====================================================
+// M1 多上游同步 — 按 adapter 类型分发
+// =====================================================
+
+/** 同步所有 active 的 upstream，返回 { upstream: SyncResult } */
+export async function syncAllUpstreams(): Promise<{ results: Record<string, SyncResult>; totalSynced: number }> {
+  const upstreams = db
+    .prepare('SELECT * FROM upstreams WHERE active = 1')
+    .all() as Array<{ id: string; name: string; url: string; api_key: string; adapter: string; sync_strategy: string }>;
+
+  const results: Record<string, SyncResult> = {};
+  let totalSynced = 0;
+
+  for (const up of upstreams) {
+    try {
+      const r = await syncOneUpstream(up);
+      results[up.id] = r;
+      totalSynced += r.synced;
+      console.log(`[sync] ${up.name} (${up.adapter}) synced ${r.synced}/${r.total_listed} tools in ${r.duration_ms}ms`);
+    } catch (e: any) {
+      const msg = String(e?.message || e).slice(0, 300);
+      console.error(`[sync] ${up.name} FAILED: ${msg}`);
+      results[up.id] = {
+        total_listed: 0, synced: 0, schema_missing: 0, failed: 0,
+        errors: [msg], duration_ms: 0,
+      };
+    }
+  }
+
+  // 自动填充默认模板（只针对领星 read 工具，其他 upstream 的模板未来单独处理）
+  if (getSetting('default_tools_all') === '0') {
+    const cur = getSetting('default_tools');
+    if (!cur || cur === '[]') {
+      const readIds = getReadToolIds();
+      if (readIds.length > 0) {
+        setSettingJSON('default_tools', readIds);
+      }
+    }
+  }
+
+  setSetting('last_sync_at', new Date().toISOString());
+  return { results, totalSynced };
+}
+
+async function syncOneUpstream(up: { id: string; name: string; url: string; api_key: string; adapter: string; sync_strategy: string }): Promise<SyncResult> {
+  const started = Date.now();
+  const errors: string[] = [];
+
+  if (up.adapter === 'lingxing-meta') {
+    // 领星专用：help 分页 + search 轮询拉 schema
+    return await syncLingxingMeta(up);
+  }
+
+  if (up.adapter === 'flat-mcp') {
+    // 扁平 MCP：直接 listTools 拿全部 + schema
+    return await syncFlatMcp(up);
+  }
+
+  // 未知 adapter
+  throw new Error(`未知 adapter: ${up.adapter}`);
+}
+
+/** 扁平 MCP 同步（Sif/西柚/卖家精灵...）— 一步到位，不用 search 轮询 */
+async function syncFlatMcp(up: { id: string; name: string; url: string; api_key: string; adapter: string; sync_strategy: string }): Promise<SyncResult> {
+  const started = Date.now();
+  const { getAdapter } = await import('./adapter.js');
+  const adapter = getAdapter({ ...up, shop_field: 'asin', active: 1 });
+  const tools = await adapter.listTools({ ...up, shop_field: 'asin', active: 1 });
+
+  const tx = db.transaction(() => {
+    for (const t of tools) {
+      upsertTool({
+        tool_id: t.tool_id,
+        exposed_name: t.exposed_name ?? t.tool_id,
+        name: t.name ?? t.tool_id,
+        description: t.description ?? '',
+        input_schema: t.input_schema ?? null,
+        tool_type: t.tool_type ?? 'read',
+        upstream: up.id,
+      });
+    }
+  });
+  tx();
+
+  return {
+    total_listed: tools.length,
+    synced: tools.length,
+    schema_missing: tools.filter((t) => !t.input_schema).length,
+    failed: 0,
+    errors: [],
+    duration_ms: Date.now() - started,
+  };
+}
+
+/** 领星元工具同步（保留原 search 轮询逻辑，加 upstream 归属） */
+async function syncLingxingMeta(up: { id: string; name: string; url: string; api_key: string; adapter: string; sync_strategy: string }): Promise<SyncResult> {
+  const started = Date.now();
+  const client = getUpstreamClient(up.url, up.api_key ?? '');
+  const { tools, listed } = await fetchAllListedTools(client);
+  for (const id of META_TOOLS) tools.delete(id);
+
+  let schemaMissing = 0;
+  let failed = 0;
+  const errors: string[] = [];
+
+  const entries = [...tools.values()];
+  await mapLimit(entries, 6, async (t) => {
+    try {
+      const resp = await client.callTool('search', { toolId: t.tool_id });
+      if (resp?.error) {
+        errors.push(`search ${t.tool_id}: ${String(resp.error.message ?? '').slice(0, 120)}`);
+        failed++;
+        return;
+      }
+      const schema = extractSchema(unwrapCallResult(resp));
+      if (!schema) schemaMissing++;
+      upsertTool({
+        tool_id: t.tool_id,
+        exposed_name: sanitizeToolName(t.tool_id),
+        name: t.name,
+        description: t.description,
+        input_schema: schema ? JSON.stringify(schema) : null,
+        tool_type: t.tool_type,
+        upstream: up.id,
+      });
+    } catch (e: any) {
+      errors.push(`search ${t.tool_id}: ${String(e?.message || e).slice(0, 120)}`);
+      failed++;
+    }
+  });
+
+  return {
+    total_listed: listed,
+    synced: tools.size - failed,
+    schema_missing: schemaMissing,
+    failed,
+    errors: errors.slice(0, 20),
+    duration_ms: Date.now() - started,
+  };
+}

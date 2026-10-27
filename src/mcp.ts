@@ -256,13 +256,14 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
   );
 
   server.setRequestHandler(ListToolsRequestSchema, async () => {
-    const up = identity.upstream;
     let rows: Array<{ exposed_name: string; name: string; description: string; input_schema: string | null }>;
     if (identity.kind === 'admin') {
+      // admin 看所有 upstream 的工具（网关管理员全视角）
       rows = db
-        .prepare('SELECT exposed_name, name, description, input_schema FROM tools WHERE enabled = 1 AND upstream = ? ORDER BY tool_id')
-        .all(up) as any[];
+        .prepare('SELECT exposed_name, name, description, input_schema FROM tools WHERE enabled = 1 ORDER BY upstream, tool_id')
+        .all() as any[];
     } else {
+      const up = identity.upstream;
       if (!identity.all_tools) {
         const allowed = new Set(getUserToolIds(identity.id));
         const all = db
@@ -391,10 +392,13 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
 
     // ---- 调用上游（按 adapter 路由）----
     const caller = logCtx.caller;
-    const upConfig = db.prepare('SELECT * FROM upstreams WHERE id = ?').get(identity.upstream) as any;
+    // admin 是网关管理员，可调任何 upstream 的工具（按 tool.upstream 路由）
+    // 运营用户只能调自己 upstream 下的工具
+    const upId = identity.kind === 'admin' ? (tool.upstream ?? identity.upstream) : identity.upstream;
+    const upConfig = db.prepare('SELECT * FROM upstreams WHERE id = ?').get(upId) as any;
     if (!upConfig || !upConfig.active) {
-      logOutcome(false, true, `上游 ${identity.upstream} 未启用`);
-      return errorResult(`上游 ${identity.upstream} 未配置或已停用`);
+      logOutcome(false, true, `上游 ${upId} 未启用`);
+      return errorResult(`上游 ${upId} 未配置或已停用`);
     }
     if (!upConfig.api_key && !upConfig.url.includes('nocodb')) {
       logOutcome(false, true, '上游未配置 API Key');
