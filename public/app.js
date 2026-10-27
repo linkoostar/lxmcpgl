@@ -974,8 +974,13 @@ function syncLogDateRange() {
 }
 
 async function loadLogs() {
+  const statsParams = new URLSearchParams();
+  if (logState.upstream) statsParams.set('upstream', logState.upstream);
+  if (logState.caller) statsParams.set('caller', logState.caller);
+  if (logState.since) statsParams.set('since', logState.since);
+  if (logState.until) statsParams.set('until', logState.until);
   const [stats, callers, upstreams] = await Promise.all([
-    api('/call-logs/stats'),
+    api('/call-logs/stats?' + statsParams.toString()),
     api('/users'),
     api('/upstreams'),
   ]);
@@ -1122,7 +1127,15 @@ $('#log-search').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('
 $('#log-since-preset').addEventListener('change', () => syncLogDateRange());
 $('#log-since-date').addEventListener('change', () => syncLogDateRange());
 $('#log-until-date').addEventListener('change', () => syncLogDateRange());
-$('#btn-log-refresh').addEventListener('click', async () => { try { await loadLogs(); } catch (e) { toast(e.message); } });
+$('#btn-log-refresh').addEventListener('click', async () => {
+  // 先把当前控件值同步回 logState
+  logState.q = $('#log-search').value.trim();
+  logState.upstream = $('#log-upstream-filter').value;
+  logState.caller = $('#log-caller-filter').value;
+  logState.success = $('#log-success-filter').value;
+  syncLogDateRange();
+  try { await loadLogs(); } catch (e) { toast(e.message); }
+});
 $('#btn-log-prev').addEventListener('click', () => { if (logState.page > 1) { logState.page--; loadLogList().catch((e) => toast(e.message)); } });
 $('#btn-log-next').addEventListener('click', () => { if (logState.page * logState.pageSize < logState.total) { logState.page++; loadLogList().catch((e) => toast(e.message)); } });
 $('#btn-log-clean').addEventListener('click', async () => {
