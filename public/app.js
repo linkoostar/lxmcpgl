@@ -709,7 +709,7 @@ function bindUpstreamCard(id) {
 
 async function handleUpstreamAction(act, id, card) {
   if (act === 'test') {
-    card.querySelector('[data-act="test"]')?.textContent = '测试中…';
+    const btn = card.querySelector('[data-act="test"]'); if (btn) btn.textContent = '测试中…';
     try {
       const r = await api(`/upstreams/${id}/test`, { method: 'POST' });
       toast(r.ok ? `✅ 连通：${r.tool_count} 个工具` : `❌ ${r.error}`);
