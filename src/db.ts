@@ -428,8 +428,8 @@ export function insertCallLog(l: {
   const err = l.error ? String(l.error).slice(0, 500) : '';
   const shops = l.shop_refs ? JSON.stringify(l.shop_refs.slice(0, 50)) : '';
   db.prepare(
-    `INSERT INTO call_logs (ts, caller, user_id, tool_name, tool_id, tool_type, shop_refs, success, is_error, duration_ms, error)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    `INSERT INTO call_logs (ts, caller, user_id, tool_name, tool_id, tool_type, upstream, shop_refs, success, is_error, duration_ms, error)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
     new Date().toISOString(),
     l.caller,
@@ -437,6 +437,7 @@ export function insertCallLog(l: {
     l.tool_name,
     l.tool_id,
     l.tool_type,
+    l.upstream ?? '',
     shops,
     l.success ? 1 : 0,
     l.is_error ? 1 : 0,

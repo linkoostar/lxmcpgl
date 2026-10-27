@@ -361,6 +361,7 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
       toolName: name,
       toolId: null as string | null,
       toolType: null as string | null,
+      upstream: '' as string, // 路由到 upstream 时覆盖
       shopRefs,
       started: Date.now(),
     };
@@ -372,6 +373,7 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
         tool_name: logCtx.toolName,
         tool_id: logCtx.toolId,
         tool_type: logCtx.toolType,
+        upstream: logCtx.upstream,
         shop_refs: logCtx.shopRefs.length > 0 ? logCtx.shopRefs : null,
         success,
         is_error: isError,
@@ -456,6 +458,7 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
     const caller = logCtx.caller;
     // 不管 admin 还是运营用户，都按 tool.upstream 路由（list 里已经过滤过权限了）
     const upId = tool.upstream ?? identity.upstream;
+    logCtx.upstream = upId;  // 让后续所有 logOutcome 都写正确的 upstream
     // 额外校验：运营用户必须有这个 upstream 权限（防止 tools/call 被绕过）
     if (identity.kind === 'user') {
       const activeUpIds = upstreams.map((u) => u.id);
@@ -488,7 +491,7 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
       if (cost !== null) {
         db.prepare(
           'INSERT INTO cost_logs (upstream, user_id, tool_name, tool_id, cost_credits, duration_ms, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
-        ).run(identity.upstream, identity.kind === 'user' ? identity.id : null, tool.exposed_name, tool.tool_id, cost, duration, new Date().toISOString());
+        ).run(upId, identity.kind === 'user' ? identity.id : null, tool.exposed_name, tool.tool_id, cost, duration, new Date().toISOString());
       }
 
       if (callResult.isError) {
