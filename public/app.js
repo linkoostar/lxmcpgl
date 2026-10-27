@@ -1015,7 +1015,7 @@ function renderLogStats(stats) {
     <div class="log-stat-card"><div class="label">总调用</div><div class="value">${stats.total}</div></div>
     <div class="log-stat-card success"><div class="label">成功</div><div class="value">${stats.success || 0}</div><div class="muted" style="font-size:12px;margin-top:4px">成功率 ${rate}</div></div>
     <div class="log-stat-card failed"><div class="label">失败 / 拒绝</div><div class="value">${stats.failed || 0}</div></div>
-    <div class="log-card credits"><div class="label">消耗 Credits</div><div class="value" style="color:#d97706">${Number(stats.total_credits || 0).toLocaleString()}</div></div>
+    <div class="log-stat-card credits"><div class="label">消耗 Credits</div><div class="value" style="color:#d97706">${Number(stats.total_credits || 0).toLocaleString()}</div></div>
     <div class="log-stat-card avg"><div class="label">平均耗时</div><div class="value">${stats.avg_ms != null ? stats.avg_ms + ' ms' : '—'}</div></div>
   `;
   // 独立横列：上游汇总 + 热门工具 + 调用者
