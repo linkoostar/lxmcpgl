@@ -113,7 +113,7 @@ function migrate(): void {
   const tables: Array<{ name: string; defaultVal?: string; extraIdx?: string }> = [
     { name: 'tools',      defaultVal: 'lingxing', extraIdx: 'idx_tools_upstream' },
     { name: 'shops',      defaultVal: 'lingxing', extraIdx: 'idx_shops_upstream' },
-    { name: 'users',      defaultVal: 'lingxing' },
+    { name: 'users',      defaultVal: '' }, // '' 解锁全部 active upstream
     { name: 'user_tools', defaultVal: 'lingxing' },
     { name: 'user_shops', defaultVal: 'lingxing' },
     { name: 'call_logs',  defaultVal: 'lingxing', extraIdx: 'idx_call_logs_upstream' },
@@ -130,7 +130,6 @@ function migrate(): void {
   // 数据兜底：任何 upstream 为 NULL/空的老记录补 'lingxing'
   db.exec(`UPDATE tools      SET upstream = 'lingxing' WHERE upstream IS NULL OR upstream = ''`);
   db.exec(`UPDATE shops      SET upstream = 'lingxing' WHERE upstream IS NULL OR upstream = ''`);
-  db.exec(`UPDATE users      SET upstream = 'lingxing' WHERE upstream IS NULL OR upstream = ''`);
   db.exec(`UPDATE user_tools SET upstream = 'lingxing' WHERE upstream IS NULL OR upstream = ''`);
   db.exec(`UPDATE user_shops SET upstream = 'lingxing' WHERE upstream IS NULL OR upstream = ''`);
   db.exec(`UPDATE call_logs  SET upstream = 'lingxing' WHERE upstream IS NULL OR upstream = ''`);
