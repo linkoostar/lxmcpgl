@@ -153,6 +153,7 @@ function migrate(): void {
   if (!upCols.includes('notes')) db.exec(`ALTER TABLE upstreams ADD COLUMN notes TEXT DEFAULT ''`);
   if (!upCols.includes('created_at')) db.exec(`ALTER TABLE upstreams ADD COLUMN created_at TEXT DEFAULT ''`);
   if (!upCols.includes('updated_at')) db.exec(`ALTER TABLE upstreams ADD COLUMN updated_at TEXT DEFAULT ''`);
+  if (!upCols.includes('headers')) db.exec(`ALTER TABLE upstreams ADD COLUMN headers TEXT DEFAULT '{}'`);
 
   // 工具分类兜底
   backfillToolTypes();
@@ -528,6 +529,7 @@ export interface UpstreamRow {
   sync_strategy: string;
   shop_field: string;
   notes: string;
+  headers: string; // JSON string, e.g. '{"x-api-key":"xxx"}'
   created_at: string;
   updated_at: string;
 }
@@ -558,14 +560,21 @@ export function upsertUpstream(row: {
   sync_strategy?: string;
   shop_field?: string;
   notes?: string;
+  headers?: string | Record<string, string>;
 }): UpstreamRow {
   const now = new Date().toISOString();
   const existing = getUpstream(row.id);
   // 新 key 为空则保留旧 key
   const finalKey = (row.api_key && row.api_key.trim() !== '') ? row.api_key.trim() : (existing?.api_key ?? '');
+  // headers: null/undefined 保留旧，对象或字符串都转成 JSON 字符串
+  let finalHeaders = existing?.headers ?? '{}';
+  if (row.headers !== undefined && row.headers !== null) {
+    if (typeof row.headers === 'string') finalHeaders = row.headers.trim() || '{}';
+    else finalHeaders = JSON.stringify(row.headers);
+  }
   db.prepare(
-    `INSERT INTO upstreams (id, name, url, api_key, adapter, active, sync_strategy, shop_field, notes, created_at, updated_at)
-     VALUES (@id, @name, @url, @api_key, @adapter, @active, @sync_strategy, @shop_field, @notes, @created_at, @updated_at)
+    `INSERT INTO upstreams (id, name, url, api_key, adapter, active, sync_strategy, shop_field, notes, headers, created_at, updated_at)
+     VALUES (@id, @name, @url, @api_key, @adapter, @active, @sync_strategy, @shop_field, @notes, @headers, @created_at, @updated_at)
      ON CONFLICT(id) DO UPDATE SET
        name = excluded.name,
        url = excluded.url,
@@ -575,6 +584,7 @@ export function upsertUpstream(row: {
        sync_strategy = excluded.sync_strategy,
        shop_field = excluded.shop_field,
        notes = excluded.notes,
+       headers = excluded.headers,
        updated_at = excluded.updated_at`
   ).run({
     id: row.id,
@@ -586,10 +596,23 @@ export function upsertUpstream(row: {
     sync_strategy: row.sync_strategy ?? 'pull',
     shop_field: row.shop_field ?? 'sid',
     notes: row.notes ?? '',
+    headers: finalHeaders,
     created_at: existing?.created_at ?? now,
     updated_at: now,
   });
   return getUpstream(row.id)!;
+}
+
+/** 把 UpstreamRow.headers JSON 字符串安全解析成对象（调用方用） */
+export function parseUpstreamHeaders(row: UpstreamRow | undefined): Record<string, string> {
+  if (!row?.headers) return {};
+  try {
+    const obj = JSON.parse(row.headers);
+    if (typeof obj === 'object' && obj !== null) return obj as Record<string, string>;
+    return {};
+  } catch {
+    return {};
+  }
 }
 
 export function deleteUpstream(id: string): number {

@@ -20,6 +20,7 @@ export interface UpstreamConfig {
   sync_strategy: string;
   shop_field: string;
   notes?: string;
+  headers?: string; // JSON string of { "x-api-key": "xxx", ... }
 }
 
 /** 标准化的工具定义（用于同步到 tools 表） */
@@ -204,30 +205,44 @@ class FlatMcpAdapter implements UpstreamAdapter {
   }
 
   private getOrCreateClient(config: UpstreamConfig): FlatMcpClient {
-    const key = `${config.url}:${config.api_key ?? ''}`;
+    const key = `${config.url}:${config.api_key ?? ''}:${config.headers ?? '{}'}`;
     let c = this.clients.get(key);
     if (!c) {
-      c = new FlatMcpClient(config.url, config.api_key ?? '');
+      // 解析自定义 headers（JSON string → object）
+      let customHeaders: Record<string, string> = {};
+      if (config.headers) {
+        try { customHeaders = JSON.parse(config.headers); } catch { /* ignore */ }
+      }
+      c = new FlatMcpClient(config.url, config.api_key ?? '', customHeaders);
       this.clients.set(key, c);
     }
     return c;
   }
 }
 
-/** 标准扁平 MCP client（HTTP + Authorization Bearer） */
+/** 标准扁平 MCP client（HTTP streamable + 可选自定义 headers） */
 class FlatMcpClient {
   private initialized = false;
-  constructor(private url: string, private apiKey: string) {}
+  constructor(
+    private url: string,
+    private apiKey: string,
+    private customHeaders: Record<string, string> = {}
+  ) {}
 
   private async rpc(method: string, params: unknown, timeoutMs = 30000): Promise<any> {
     const body = JSON.stringify({ jsonrpc: '2.0', id: Date.now(), method, params });
+    // 先放自定义 headers，再用标准 headers 覆盖（Content-Type/Accept 不能被覆盖）
+    const headers: Record<string, string> = {
+      ...this.customHeaders,
+      'Content-Type': 'application/json',
+      'Accept': 'application/json, text/event-stream',
+    };
+    if (this.apiKey && !headers['Authorization'] && !headers['authorization']) {
+      headers['Authorization'] = `Bearer ${this.apiKey}`;
+    }
     const resp = await fetch(this.url, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Accept': 'application/json, text/event-stream',
-        ...(this.apiKey ? { Authorization: `Bearer ${this.apiKey}` } : {}),
-      },
+      headers,
       body,
       signal: AbortSignal.timeout(timeoutMs),
     });

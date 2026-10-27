@@ -665,6 +665,7 @@ function upstreamCardHTML(u) {
           ${u.id === 'lingxing' ? '' : `<button class="btn small danger" data-act="delete" data-id="${u.id}">删除</button>`}
         </div>
         <div class="muted" style="margin-top:4px;font-size:12px">${u.url} · API Key: ${u.api_key_set ? u.api_key_masked : '<span style="color:#b91c1c">未设置</span>'}</div>
+        ${u.headers_preview ? `<div class="muted" style="margin-top:2px;font-size:12px">🔑 Headers: ${u.headers_preview}</div>` : ''}
         ${u.notes ? `<div class="muted" style="margin-top:2px;font-size:12px">${u.notes}</div>` : ''}
       </div>`;
   }
@@ -688,6 +689,7 @@ function upstreamCardHTML(u) {
         </label>
       </div>
       <label style="flex-direction:column;margin-top:6px">备注<input class="ed-notes" value="${escapeHTML(u.notes || '')}" /></label>
+      <label style="flex-direction:column;margin-top:6px">Headers（JSON 对象，可选 — 需要自定义鉴权头比如 NocoDB 的 x-api-key 时填）<textarea class="ed-headers" rows="2" style="font-family:monospace;font-size:12px;padding:7px 8px;border-radius:8px;border:1px solid var(--border)">${escapeHTML(u.headers || '{}')}</textarea></label>
       <div class="row" style="margin-top:10px">
         <button class="btn primary small" data-act="save-edit" data-id="${u.id}">保存</button>
         <button class="btn small" data-act="cancel-edit" data-id="${u.id}">取消</button>
@@ -740,6 +742,7 @@ async function handleUpstreamAction(act, id, card) {
       adapter: card.querySelector('.ed-adapter').value,
       active: card.querySelector('.ed-active').checked,
       notes: card.querySelector('.ed-notes').value.trim(),
+      headers: card.querySelector('.ed-headers').value.trim() || '{}',
     };
     const key = card.querySelector('.ed-key').value.trim();
     if (key) patch.api_key = key;
@@ -764,6 +767,7 @@ $('#nu-test').addEventListener('click', async () => {
       url: $('#nu-url').value.trim(),
       api_key: $('#nu-key').value.trim(),
       adapter: $('#nu-adapter').value,
+      headers: $('#nu-headers').value.trim() || '{}',
     };
     const r = await api(`/upstreams/${$('#nu-id').value.trim() || 'new'}/test`, { method: 'POST', body });
     el.textContent = r.ok ? `✅ 连通：${r.tool_count} 个工具` : `❌ ${r.error}`;
@@ -780,13 +784,15 @@ $('#nu-save').addEventListener('click', async () => {
     adapter: $('#nu-adapter').value,
     active: $('#nu-active').checked,
     notes: $('#nu-notes').value.trim(),
+    headers: $('#nu-headers').value.trim() || '{}',
   };
   try {
     await api('/upstreams', { method: 'POST', body });
     toast('已保存 upstream');
     // 清表单
     $('#nu-id').value = ''; $('#nu-name').value = ''; $('#nu-url').value = '';
-    $('#nu-key').value = ''; $('#nu-notes').value = ''; $('#nu-test-result').textContent = '';
+    $('#nu-key').value = ''; $('#nu-notes').value = ''; $('#nu-headers').value = '{}';
+    $('#nu-test-result').textContent = '';
     $('#upstream-new-form').open = false;
     await loadUpstreams();
     // 如果勾了启用，顺便同步

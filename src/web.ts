@@ -299,6 +299,8 @@ apiRouter.get(
       notes: u.notes,
       api_key_set: !!u.api_key,
       api_key_masked: maskUpstreamKey(u.api_key),
+      headers: u.headers || '{}',
+      headers_preview: summarizeHeaders(u.headers),
       tool_count: counts[u.id] ?? 0,
       created_at: u.created_at,
       updated_at: u.updated_at,
@@ -307,11 +309,42 @@ apiRouter.get(
   })
 );
 
+function validateHeadersInput(raw: unknown): string | null {
+  if (raw === undefined || raw === null) return null; // null = 不改
+  const str = typeof raw === 'string' ? raw.trim() : JSON.stringify(raw);
+  if (!str || str === '{}') return '{}';
+  try {
+    const obj = JSON.parse(str);
+    if (typeof obj !== 'object' || obj === null || Array.isArray(obj)) return 'headers 必须是 JSON 对象';
+    return str;
+  } catch {
+    return 'headers 不是合法 JSON';
+  }
+}
+
+/** 给前端展示 headers 有多少条（值脱敏） */
+function summarizeHeaders(headersJson: string): string {
+  if (!headersJson || headersJson === '{}') return '';
+  try {
+    const obj = JSON.parse(headersJson);
+    const keys = Object.keys(obj);
+    if (!keys.length) return '';
+    return keys.map((k) => `${k}: ${maskHeaderValue(String(obj[k]))}`).join(', ');
+  } catch {
+    return '';
+  }
+}
+function maskHeaderValue(v: string): string {
+  if (!v) return '';
+  if (v.length <= 6) return '****';
+  return `${v.slice(0, 3)}****${v.slice(-3)}`;
+}
+
 apiRouter.post(
   '/upstreams',
   requireAuth,
   wrap(async (req, res) => {
-    const { id, name, url, api_key, adapter, active, notes } = req.body ?? {};
+    const { id, name, url, api_key, adapter, active, notes, headers } = req.body ?? {};
     const sid = String(id ?? '').trim();
     const err = validateUpstreamId(sid);
     if (err) { res.status(400).json({ error: err }); return; }
@@ -322,6 +355,8 @@ apiRouter.post(
     if (!/^https?:\/\//.test(surl)) { res.status(400).json({ error: 'url 必须以 http(s):// 开头' }); return; }
     const sadapter = String(adapter ?? 'flat-mcp').trim();
     if (!KNOWN_ADAPTERS.includes(sadapter)) { res.status(400).json({ error: `adapter 需为 ${KNOWN_ADAPTERS.join(' / ')}` }); return; }
+    const headersErr = validateHeadersInput(headers);
+    if (headersErr && typeof headersErr === 'string' && headersErr.startsWith('headers')) { res.status(400).json({ error: headersErr }); return; }
     const row = upsertUpstream({
       id: sid,
       name: sname,
@@ -330,6 +365,7 @@ apiRouter.post(
       adapter: sadapter,
       active: active !== undefined ? (active ? 1 : 0) : 1,
       notes: notes ? String(notes) : '',
+      headers: headersErr === null ? '{}' : headersErr,
     });
     res.json({ ok: true, upstream: row.id });
   })
@@ -371,6 +407,12 @@ apiRouter.put(
     }
     if (b.active !== undefined) patch.active = b.active ? 1 : 0;
     if (b.notes !== undefined) patch.notes = String(b.notes);
+    if (b.headers !== undefined) {
+      const h = validateHeadersInput(b.headers);
+      if (h && h.startsWith('headers')) { res.status(400).json({ error: h }); return; }
+      // null 表示前端传了但不想改 — 不传给 upsert，保留旧值
+      if (h !== null) patch.headers = h;
+    }
     upsertUpstream(patch);
     // 如果改的是领星上游（lingxing），同步更新老 settings 兼容
     if (sid === 'lingxing') {
@@ -411,6 +453,7 @@ apiRouter.post(
           api_key: b.api_key ? String(b.api_key).trim() : '',
           adapter: String(b.adapter ?? 'flat-mcp').trim(),
           active: 1, sync_strategy: 'pull', shop_field: 'sid', notes: '',
+          headers: String(b.headers ?? '{}'),
           created_at: '', updated_at: '',
         }
       : getUpstream(sid);

@@ -155,6 +155,9 @@
           <label style="flex-direction:column;margin-top:8px">备注
             <input id="nu-notes" placeholder="选填，描述此上游用途" />
           </label>
+          <label style="flex-direction:column;margin-top:8px">Headers（JSON 对象，选填 — 比如 NocoDB 用 x-api-key 鉴权时填 <code>{&quot;x-api-key&quot;: &quot;你的key&quot;}</code>）
+            <textarea id="nu-headers" rows="2" placeholder='{"x-api-key": ""}' style="font-family:monospace;font-size:12px;padding:7px 8px;border-radius:8px;border:1px solid var(--border)">{}</textarea>
+          </label>
           <div class="row" style="margin-top:12px">
             <label style="flex-direction:row;align-items:center;gap:6px;margin:0"><input type="checkbox" id="nu-active" checked style="width:auto" /> 启用后立即同步</label>
             <div class="spacer"></div>
