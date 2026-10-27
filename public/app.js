@@ -337,9 +337,20 @@ function showNewKey(key, username) {
   $('#new-key-tip').classList.remove('hidden');
   $('#new-key-value').value = key;
   $('#new-key-tip').querySelector('b').textContent = `${username} 的 Key（只显示一次，请立即复制发给运营）：`;
+  const cfg = {
+    mcpServers: {
+      'lingxing-gateway': {
+        type: 'streamableHttp',
+        url: `${location.origin}/mcp`,
+        headers: { Authorization: `Bearer ${key}` },
+      },
+    },
+  };
+  $('#new-key-mcp').textContent = JSON.stringify(cfg, null, 2);
   $('#new-key-tip').scrollIntoView({ behavior: 'smooth', block: 'center' });
 }
 $('#btn-copy-new-key').addEventListener('click', () => copyText($('#new-key-value').value, 'Key 已复制'));
+$('#btn-copy-new-key-mcp').addEventListener('click', () => copyText($('#new-key-mcp').textContent, 'MCP 配置已复制'));
 $('#btn-dismiss-new-key').addEventListener('click', () => $('#new-key-tip').classList.add('hidden'));
 
 $('#btn-add-user').addEventListener('click', async () => {
@@ -351,16 +362,23 @@ $('#btn-add-user').addEventListener('click', async () => {
     showNewKey(r.downstream_key, username);
     $('#new-user-name').value = '';
     $('#new-user-rate').value = '';
-    loadUsers();
+    await loadUsers();
+    // 自动弹权限弹窗，使用新用户的 id
+    await ensureToolsCache();
+    openUserPerm({ id: r.id, username });
   } catch (e) { toast(e.message); }
 });
 
 /* ---------- 用户权限弹窗 ---------- */
 
-const permState = { userId: null, allTools: true, toolIds: new Set(), allShops: true, shopIds: new Set(), shopsCache: null };
+const permState = {
+  userId: null, mode: 'user', // mode: 'user' 或 'template'
+  allTools: true, toolIds: new Set(), allShops: true, shopIds: new Set(), shopsCache: null
+};
 
 async function openUserPerm(u) {
   const detail = await api('/users/' + u.id);
+  permState.mode = 'user';
   permState.userId = u.id;
   permState.allTools = detail.all_tools;
   permState.toolIds = new Set(detail.tool_ids);
@@ -381,6 +399,34 @@ async function openUserPerm(u) {
   document.querySelector('input[name="perm-shops"][value="all"]').checked = detail.all_shops;
   document.querySelector('input[name="perm-shops"][value="custom"]').checked = !detail.all_shops;
 
+  $('#user-modal-save').textContent = '保存权限';
+  $('#user-mask').classList.remove('hidden');
+}
+
+async function openTemplateEditor() {
+  const s = await api('/settings');
+  permState.mode = 'template';
+  permState.userId = null;
+  permState.allTools = !!s.default_tools_all;
+  permState.toolIds = new Set(s.default_tools);
+  permState.allShops = !!s.default_shops_all;
+  permState.shopIds = new Set(s.default_shops);
+  $('#user-modal-title').textContent = '默认权限模板（新建运营用户自动继承）';
+  $('#user-modal-tip').textContent = '';
+
+  if (!permState.shopsCache) {
+    const shops = await api('/shops');
+    permState.shopsCache = shops.items;
+  }
+  renderPermTools();
+  renderPermShops();
+
+  document.querySelector('input[name="perm-tools"][value="all"]').checked = permState.allTools;
+  document.querySelector('input[name="perm-tools"][value="custom"]').checked = !permState.allTools;
+  document.querySelector('input[name="perm-shops"][value="all"]').checked = permState.allShops;
+  document.querySelector('input[name="perm-shops"][value="custom"]').checked = !permState.allShops;
+
+  $('#user-modal-save').textContent = '保存模板';
   $('#user-mask').classList.remove('hidden');
 }
 
@@ -461,6 +507,14 @@ $('#perm-tool-none').addEventListener('click', () => {
   permState.toolIds.clear();
   renderPermTools();
 });
+$('#perm-tool-read').addEventListener('click', () => {
+  (permState.toolsCache || []).filter((t) => t.tool_type === 'read').forEach((t) => permState.toolIds.add(t.tool_id));
+  renderPermTools();
+});
+$('#perm-tool-write').addEventListener('click', () => {
+  (permState.toolsCache || []).filter((t) => t.tool_type === 'write').forEach((t) => permState.toolIds.add(t.tool_id));
+  renderPermTools();
+});
 $('#perm-shop-all').addEventListener('click', () => {
   (permState.shopsCache || []).forEach((s) => permState.shopIds.add(s.sid));
   renderPermShops();
@@ -473,21 +527,36 @@ $('#user-modal-close').addEventListener('click', () => $('#user-mask').classList
 $('#user-mask').addEventListener('click', (e) => { if (e.target === $('#user-mask')) $('#user-mask').classList.add('hidden'); });
 
 $('#user-modal-save').addEventListener('click', async () => {
-  if (!permState.userId) return;
   try {
-    await api('/users/' + permState.userId, {
-      method: 'PUT',
-      body: {
-        all_tools: document.querySelector('input[name="perm-tools"][value="all"]').checked,
-        tool_ids: [...permState.toolIds],
-        all_shops: document.querySelector('input[name="perm-shops"][value="all"]').checked,
-        shop_ids: [...permState.shopIds],
-      },
-    });
-    $('#user-modal-tip').textContent = '已保存';
-    toast('权限已保存');
-    loadUsers();
-    setTimeout(() => $('#user-mask').classList.add('hidden'), 600);
+    const payload = {
+      all_tools: document.querySelector('input[name="perm-tools"][value="all"]').checked,
+      tool_ids: [...permState.toolIds],
+      all_shops: document.querySelector('input[name="perm-shops"][value="all"]').checked,
+      shop_ids: [...permState.shopIds],
+    };
+    if (permState.mode === 'template') {
+      await api('/settings', {
+        method: 'PUT',
+        body: {
+          default_tools_all: payload.all_tools,
+          default_shops_all: payload.all_shops,
+          default_tools: payload.tool_ids,
+          default_shops: payload.shop_ids,
+        },
+      });
+      $('#user-modal-tip').textContent = '模板已保存';
+      toast('默认权限模板已保存');
+      if ($('#page-settings').classList.contains('hidden') === false) {
+        loadSettings().catch(() => {});
+      }
+    } else {
+      if (!permState.userId) return;
+      await api('/users/' + permState.userId, { method: 'PUT', body: payload });
+      $('#user-modal-tip').textContent = '已保存';
+      toast('权限已保存');
+      loadUsers();
+    }
+    setTimeout(() => $('#user-mask').classList.add('hidden'), 500);
   } catch (e) { $('#user-modal-tip').textContent = e.message; }
 });
 
@@ -502,7 +571,39 @@ async function loadSettings() {
   $('#shop-count').textContent = s.shop_count > 0 ? `已同步 ${s.shop_count} 店` : '未同步';
   $('#chk-block-write').checked = !!s.block_write;
   renderSnippet(s.downstream_key);
+
+  // 默认权限模板摘要
+  const tc = s.tool_type_count || { read: 0, write: 0, other: 0 };
+  let toolsTxt, shopsTxt;
+  if (s.default_tools_all) toolsTxt = `全部启用工具（read ${tc.read} + write ${tc.write}${tc.other ? ` + 其他 ${tc.other}` : ''}）`;
+  else toolsTxt = `自定义白名单 ${s.default_tools?.length || 0} 个工具`;
+  if (s.default_shops_all) shopsTxt = `全部店铺（${s.shop_count || 0} 店）`;
+  else shopsTxt = `指定 ${s.default_shops?.length || 0} 店`;
+  $('#tpl-summary').textContent = `模板：${toolsTxt} · ${shopsTxt}`;
 }
+
+$('#btn-tpl-edit').addEventListener('click', async () => {
+  await ensureToolsCache();
+  await openTemplateEditor();
+});
+
+$('#btn-tpl-readonly').addEventListener('click', async () => {
+  if (!confirm('确认把默认模板设为：全部 read 类工具 + 全部店铺？')) return;
+  await ensureToolsCache();
+  const readIds = (permState.toolsCache || []).filter((t) => t.tool_type === 'read').map((t) => t.tool_id);
+  try {
+    await api('/settings', {
+      method: 'PUT',
+      body: {
+        default_tools_all: false,
+        default_shops_all: true,
+        default_tools: readIds,
+      },
+    });
+    toast(`已设为只读模板：${readIds.length} 个 read 工具 + 全部店铺`);
+    loadSettings().catch(() => {});
+  } catch (e) { toast(e.message); }
+});
 
 function renderSnippet(key) {
   const cfg = {
@@ -588,7 +689,19 @@ $('#btn-change-pass').addEventListener('click', async () => {
 });
 
 function copyText(text, msg) {
-  navigator.clipboard.writeText(text).then(() => toast(msg)).catch(() => toast('复制失败，请手动选择复制'));
+  const fallback = () => {
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+      document.body.appendChild(ta); ta.select();
+      const ok = document.execCommand('copy');
+      document.body.removeChild(ta);
+      toast(ok ? msg : '复制失败，请手动选择复制');
+    } catch { toast('复制失败，请手动选择复制'); }
+  };
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(text).then(() => toast(msg)).catch(fallback);
+  } else fallback();
 }
 
 function escapeHtml(s) {

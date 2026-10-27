@@ -89,9 +89,11 @@
         <b>新用户 Key（只显示一次，请立即复制发给运营）：</b>
         <div class="row" style="margin-top:8px">
           <input id="new-key-value" readonly />
-          <button id="btn-copy-new-key" class="btn">复制</button>
+          <button id="btn-copy-new-key-mcp" class="btn primary">复制 MCP 配置</button>
+          <button id="btn-copy-new-key" class="btn">仅复制 Key</button>
           <button id="btn-dismiss-new-key" class="btn ghost small">关闭</button>
         </div>
+        <pre id="new-key-mcp" class="code scroll" style="max-height:140px;margin-top:10px"></pre>
       </div>
       <div class="table-wrap">
         <table>
@@ -170,6 +172,18 @@
         </div>
         <span id="pass-result" class="muted"></span>
       </div>
+
+      <div class="card">
+        <h2>默认权限模板</h2>
+        <p class="muted">新建运营用户时自动继承此模板（如新建时指定了参数则以指定为准）。推荐：全部 read 类 + 全部店铺，运营只能查数据不能改。</p>
+        <div class="row" style="margin-bottom:10px">
+          <span id="tpl-summary" class="muted">加载中…</span>
+        </div>
+        <div class="row wrap">
+          <button id="btn-tpl-edit" class="btn">编辑模板</button>
+          <button id="btn-tpl-readonly" class="btn">一键设为「全部 read 类 + 全部店铺」</button>
+        </div>
+      </div>
     </main>
   </div>
 
@@ -190,6 +204,8 @@
             <input id="perm-tool-search" placeholder="筛选工具…" style="width:180px" />
             <button id="perm-tool-all" class="btn small">全选</button>
             <button id="perm-tool-none" class="btn small">清空</button>
+            <button id="perm-tool-read" class="btn small">勾选全部 read</button>
+            <button id="perm-tool-write" class="btn small">勾选全部 write</button>
           </div>
           <div id="perm-tool-list" class="perm-list"></div>
         </div>

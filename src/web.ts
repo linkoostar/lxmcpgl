@@ -5,6 +5,8 @@ import {
   db,
   getSetting,
   setSetting,
+  getSettingJSON,
+  setSettingJSON,
   hashPassword,
   verifyPassword,
   sha256,
@@ -18,6 +20,8 @@ import {
   getUserShopIds,
   setUserTools,
   setUserShops,
+  getReadToolIds,
+  getToolCountByType,
 } from './db.js';
 import { config, META_TOOLS } from './config.js';
 import { getUpstreamClient, resetUpstreamClient, UpstreamError } from './upstream.js';
@@ -160,6 +164,7 @@ apiRouter.get(
   wrap(async (_req, res) => {
     const upstreamKey = getSetting('upstream_key');
     const toolCount = (db.prepare('SELECT COUNT(*) AS c FROM tools').get() as { c: number }).c;
+    const typeCount = getToolCountByType();
     res.json({
       upstream_url: getSetting('upstream_url'),
       upstream_key_set: !!upstreamKey,
@@ -167,9 +172,15 @@ apiRouter.get(
       downstream_key: getSetting('downstream_key'),
       last_sync_at: getSetting('last_sync_at'),
       tool_count: toolCount,
+      tool_type_count: typeCount,
       syncing: isSyncing(),
       block_write: getSetting('block_write') === '1',
       shop_count: listShops().length,
+      // 默认权限模板
+      default_tools_all: getSetting('default_tools_all') === '1',
+      default_shops_all: getSetting('default_shops_all') === '1',
+      default_tools: getSettingJSON<string[]>('default_tools', []),
+      default_shops: getSettingJSON<string[]>('default_shops', []),
     });
   })
 );
@@ -192,6 +203,19 @@ apiRouter.put(
     }
     if (req.body?.block_write !== undefined) {
       setSetting('block_write', req.body.block_write ? '1' : '0');
+    }
+    // 默认权限模板
+    if (req.body?.default_tools_all !== undefined) {
+      setSetting('default_tools_all', req.body.default_tools_all ? '1' : '0');
+    }
+    if (req.body?.default_shops_all !== undefined) {
+      setSetting('default_shops_all', req.body.default_shops_all ? '1' : '0');
+    }
+    if (Array.isArray(req.body?.default_tools)) {
+      setSettingJSON('default_tools', req.body.default_tools.map(String));
+    }
+    if (Array.isArray(req.body?.default_shops)) {
+      setSettingJSON('default_shops', req.body.default_shops.map(String));
     }
     resetUpstreamClient();
     res.json({ ok: true });
@@ -397,12 +421,36 @@ apiRouter.post(
       return;
     }
     const key = userKey();
+    // 从默认权限模板继承（若调用方直接提供则优先）
+    const toolsAll = req.body?.all_tools !== undefined
+      ? (req.body.all_tools ? 1 : 0)
+      : (getSetting('default_tools_all') === '1' ? 1 : 0);
+    const shopsAll = req.body?.all_shops !== undefined
+      ? (req.body.all_shops ? 1 : 0)
+      : (getSetting('default_shops_all') === '1' ? 1 : 0);
+
     const info = db
       .prepare(
-        'INSERT INTO users (username, key_hash, key_prefix, enabled, rate_limit, all_tools, all_shops, created_at, last_used_at) VALUES (?, ?, ?, 1, ?, 1, 1, ?, ?)'
+        'INSERT INTO users (username, key_hash, key_prefix, enabled, rate_limit, all_tools, all_shops, created_at, last_used_at) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?)'
       )
-      .run(username, sha256(key), key.slice(0, 8), rateLimit, new Date().toISOString(), '');
-    res.json({ ok: true, id: info.lastInsertRowid, downstream_key: key });
+      .run(username, sha256(key), key.slice(0, 8), rateLimit, toolsAll, shopsAll, new Date().toISOString(), '');
+
+    const newUserId = Number(info.lastInsertRowid);
+    // 非全量时设置白名单
+    if (!toolsAll) {
+      const toolIds = Array.isArray(req.body?.tool_ids)
+        ? req.body.tool_ids.map(String)
+        : getSettingJSON<string[]>('default_tools', []);
+      if (toolIds.length > 0) setUserTools(newUserId, toolIds);
+    }
+    if (!shopsAll) {
+      const shopIds = Array.isArray(req.body?.shop_ids)
+        ? req.body.shop_ids.map(String)
+        : getSettingJSON<string[]>('default_shops', []);
+      if (shopIds.length > 0) setUserShops(newUserId, shopIds);
+    }
+
+    res.json({ ok: true, id: newUserId, downstream_key: key });
   })
 );
 

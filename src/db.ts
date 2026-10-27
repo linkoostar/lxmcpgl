@@ -65,6 +65,30 @@ function migrate(): void {
   if (!cols.includes('tool_type')) {
     db.exec(`ALTER TABLE tools ADD COLUMN tool_type TEXT DEFAULT ''`);
   }
+  // 工具分类兜底：给 tool_type 为空的老数据补算
+  backfillToolTypes();
+}
+
+/** 老数据兜底：按工具名中的动词分词判断读写类型 */
+const WRITE_TOKENS = new Set([
+  'put', 'add', 'create', 'update', 'delete', 'del', 'set', 'modify', 'cancel',
+  'edit', 'remove', 'save', 'import', 'send', 'archive', 'push', 'upload',
+  'pause', 'enable', 'disable', 'adjust', 'audit', 'approve', 'reject',
+  'mark', 'reset', 'bind', 'unbind', 'apply',
+]);
+function classifyByName(name: string): string {
+  const tokens = String(name || '').toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+  return tokens.some((t) => WRITE_TOKENS.has(t)) ? 'write' : 'read';
+}
+function backfillToolTypes(): void {
+  const rows = (db.prepare("SELECT tool_id FROM tools WHERE tool_type IS NULL OR tool_type = ''").all() as Array<{ tool_id: string }>);
+  if (rows.length === 0) return;
+  const stmt = db.prepare('UPDATE tools SET tool_type = ? WHERE tool_id = ?');
+  const tx = db.transaction(() => {
+    for (const r of rows) stmt.run(classifyByName(r.tool_id), r.tool_id);
+  });
+  tx();
+  console.log(`[db] 已为 ${rows.length} 个工具补算 tool_type 分类`);
 }
 
 export function getSetting(key: string): string {
@@ -76,6 +100,16 @@ export function setSetting(key: string, value: string): void {
   db.prepare(
     'INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value'
   ).run(key, value);
+}
+
+export function getSettingJSON<T>(key: string, fallback: T): T {
+  const raw = getSetting(key);
+  if (!raw) return fallback;
+  try { return JSON.parse(raw) as T; } catch { return fallback; }
+}
+
+export function setSettingJSON(key: string, value: unknown): void {
+  setSetting(key, JSON.stringify(value));
 }
 
 function randomHex(n: number): string {
@@ -110,6 +144,12 @@ function seed(): void {
     admin_password_hash: hashPassword(config.adminPassword),
     last_sync_at: '',
     block_write: '0',
+    // 默认权限模板 —— 新增运营用户时自动继承
+    // all_tools=1 + all_shops=1 表示全放开；=0 时用 tool_ids / shop_ids JSON 列表
+    default_tools_all: '1',
+    default_shops_all: '1',
+    default_tools: '[]',
+    default_shops: '[]',
   };
   const stmt = db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)');
   for (const [k, v] of Object.entries(defaults)) stmt.run(k, v);
@@ -237,4 +277,25 @@ export function setUserShops(userId: number, sids: string[]): void {
 
 export function touchUser(userId: number): void {
   db.prepare('UPDATE users SET last_used_at = ? WHERE id = ?').run(new Date().toISOString(), userId);
+}
+
+// ---------- 工具查询辅助 ----------
+
+export function getReadToolIds(): string[] {
+  return (db.prepare('SELECT tool_id FROM tools WHERE tool_type = ?').all('read') as Array<{ tool_id: string }>).map(
+    (r) => r.tool_id
+  );
+}
+
+export function getToolCountByType(): { read: number; write: number; other: number } {
+  const rows = db
+    .prepare("SELECT tool_type, COUNT(*) AS c FROM tools GROUP BY tool_type")
+    .all() as Array<{ tool_type: string; c: number }>;
+  const result = { read: 0, write: 0, other: 0 };
+  for (const r of rows) {
+    if (r.tool_type === 'read') result.read = r.c;
+    else if (r.tool_type === 'write') result.write = r.c;
+    else result.other += r.c;
+  }
+  return result;
 }
