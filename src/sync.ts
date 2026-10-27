@@ -1,4 +1,4 @@
-import { db, getSetting, setSetting, upsertTool, type ToolRow } from './db.js';
+import { db, getSetting, setSetting, setSettingJSON, getReadToolIds, upsertTool, type ToolRow } from './db.js';
 import { META_TOOLS } from './config.js';
 import { getUpstreamClient, type UpstreamClient } from './upstream.js';
 
@@ -233,6 +233,20 @@ export async function syncTools(): Promise<SyncResult> {
       duration_ms: Date.now() - started,
     };
     setSetting('last_sync_at', new Date().toISOString());
+
+    // 自动初始化默认权限模板：如果管理员还没配过（default_tools_all=0 且 default_tools 空），
+    // 把当前所有 read 类工具 id 填进去，让新建运营自动继承只读模板。
+    if (getSetting('default_tools_all') === '0') {
+      const cur = getSetting('default_tools');
+      if (!cur || cur === '[]') {
+        const readIds = getReadToolIds();
+        if (readIds.length > 0) {
+          setSettingJSON('default_tools', readIds);
+          console.log(`[sync] 自动填充默认权限模板：${readIds.length} 个 read 工具`);
+        }
+      }
+    }
+
     return result;
   } finally {
     syncing = false;

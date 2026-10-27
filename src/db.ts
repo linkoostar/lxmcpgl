@@ -162,8 +162,9 @@ function seed(): void {
     last_sync_at: '',
     block_write: '0',
     // 默认权限模板 —— 新增运营用户时自动继承
-    // all_tools=1 + all_shops=1 表示全放开；=0 时用 tool_ids / shop_ids JSON 列表
-    default_tools_all: '1',
+    // 安全起步：先 all_tools=0 + all_shops=1。工具白名单在 syncTools 首次完成后自动填 read 类。
+    // 管理员随时可以在「系统设置」页改模板。
+    default_tools_all: '0',
     default_shops_all: '1',
     default_tools: '[]',
     default_shops: '[]',
