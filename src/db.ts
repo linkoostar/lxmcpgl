@@ -452,6 +452,8 @@ export function listCallLogs(opts: {
   tool?: string;
   success?: '1' | '0';
   since?: string;
+  until?: string;
+  upstream?: string;
   page: number;
   pageSize: number;
 }): { total: number; items: CallLog[] } {
@@ -466,6 +468,8 @@ export function listCallLogs(opts: {
   if (opts.tool) { conds.push('tool_name = ?'); args.push(opts.tool); }
   if (opts.success !== undefined) { conds.push('success = ?'); args.push(opts.success); }
   if (opts.since) { conds.push('ts >= ?'); args.push(opts.since); }
+  if (opts.until) { conds.push('ts <= ?'); args.push(opts.until); }
+  if (opts.upstream) { conds.push('upstream = ?'); args.push(opts.upstream); }
   const where = conds.length > 0 ? `WHERE ${conds.join(' AND ')}` : '';
   const total = (db.prepare(`SELECT COUNT(*) AS c FROM call_logs ${where}`).all(...args) as { c: number }[])[0].c;
   const rows = db
@@ -476,29 +480,66 @@ export function listCallLogs(opts: {
   return { total, items: rows };
 }
 
-export function getCallLogStats(since?: string): {
+export interface CallLogStatsOpts {
+  since?: string;
+  until?: string;
+  upstream?: string;
+  caller?: string;
+}
+
+export function getCallLogStats(opts: CallLogStatsOpts = {}): {
   total: number;
   success: number;
   failed: number;
   unique_callers: number;
   unique_tools: number;
   avg_ms: number | null;
+  total_credits: number;
+  upstream_stats: Array<{ upstream: string; count: number; credits: number; avg_ms: number }>;
   top_tools: Array<{ tool_name: string; count: number }>;
   top_callers: Array<{ caller: string; count: number }>;
 } {
-  const w = since ? 'WHERE ts >= ?' : '';
-  const a = since ? [since] : [];
+  // 构造统一 where 条件 — 所有子查询复用
+  const conds: string[] = [];
+  const args: unknown[] = [];
+  if (opts.since) { conds.push('ts >= ?'); args.push(opts.since); }
+  if (opts.until) { conds.push('ts <= ?'); args.push(opts.until); }
+  if (opts.upstream) { conds.push('upstream = ?'); args.push(opts.upstream); }
+  if (opts.caller) { conds.push('caller = ?'); args.push(opts.caller); }
+  const where = conds.length > 0 ? `WHERE ${conds.join(' AND ')}` : '';
+
   const summary = db
     .prepare(`SELECT COUNT(*) AS total, SUM(success) AS success, SUM(CASE WHEN success=0 THEN 1 ELSE 0 END) AS failed,
                      AVG(duration_ms) AS avg_ms, COUNT(DISTINCT caller) AS unique_callers, COUNT(DISTINCT tool_name) AS unique_tools
-              FROM call_logs ${w}`)
-    .all(...a)[0] as any;
+              FROM call_logs ${where}`)
+    .all(...args)[0] as any;
+
+  // upstream 维度汇总 — 按 upstream 聚调用次数 + 总 credits + 平均耗时
+  // credits 从 cost_logs JOIN 过来（同一时间范围内）
+  const upstreamStats = db
+    .prepare(`SELECT c.upstream, COUNT(*) AS count, AVG(c.duration_ms) AS avg_ms,
+                    COALESCE(SUM(co.cost_credits), 0) AS credits
+             FROM call_logs c
+             LEFT JOIN cost_logs co ON co.upstream = c.upstream AND co.tool_name = c.tool_name
+               ${where.replace(/ts/g, 'c.ts').replace(/upstream/g, 'c.upstream').replace(/caller/g, 'c.caller')}
+             GROUP BY c.upstream
+             ORDER BY count DESC`)
+    .all(...args) as Array<{ upstream: string; count: number; avg_ms: number; credits: number }>;
+
+  // 全局总 credits
+  const totalCreditsRow = db
+    .prepare(`SELECT COALESCE(SUM(cost_credits), 0) AS total FROM cost_logs cl
+              LEFT JOIN call_logs ca ON ca.upstream = cl.upstream AND ca.tool_name = cl.tool_name
+              ${where.replace(/ts/g, 'ca.ts').replace(/upstream/g, 'ca.upstream').replace(/caller/g, 'ca.caller')}`)
+    .all(...args)[0] as { total: number };
+
   const topTools = db
-    .prepare(`SELECT tool_name, COUNT(*) AS count FROM call_logs ${w} GROUP BY tool_name ORDER BY count DESC LIMIT 8`)
-    .all(...a) as Array<{ tool_name: string; count: number }>;
+    .prepare(`SELECT tool_name, COUNT(*) AS count FROM call_logs ${where} GROUP BY tool_name ORDER BY count DESC LIMIT 8`)
+    .all(...args) as Array<{ tool_name: string; count: number }>;
   const topCallers = db
-    .prepare(`SELECT caller, COUNT(*) AS count FROM call_logs ${w} GROUP BY caller ORDER BY count DESC LIMIT 6`)
-    .all(...a) as Array<{ caller: string; count: number }>;
+    .prepare(`SELECT caller, COUNT(*) AS count FROM call_logs ${where} GROUP BY caller ORDER BY count DESC LIMIT 6`)
+    .all(...args) as Array<{ caller: string; count: number }>;
+
   return {
     total: summary.total ?? 0,
     success: summary.success ?? 0,
@@ -506,6 +547,13 @@ export function getCallLogStats(since?: string): {
     unique_callers: summary.unique_callers ?? 0,
     unique_tools: summary.unique_tools ?? 0,
     avg_ms: summary.avg_ms != null ? Math.round(Number(summary.avg_ms)) : null,
+    total_credits: Number(totalCreditsRow?.total ?? 0),
+    upstream_stats: upstreamStats.map((u) => ({
+      upstream: u.upstream,
+      count: u.count,
+      credits: Number(u.credits ?? 0),
+      avg_ms: u.avg_ms != null ? Math.round(Number(u.avg_ms)) : 0,
+    })),
     top_tools: topTools,
     top_callers: topCallers,
   };

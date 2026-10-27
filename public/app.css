@@ -174,8 +174,9 @@ td .desc { color: var(--muted); font-size: 12px; display: block;
 .log-stat-card.success .value { color: #059669; }
 .log-stat-card.failed .value { color: #dc2626; }
 .log-stat-card.avg .value { color: var(--primary); }
+.log-stat-card.credits .value { color: #d97706; }
 .log-stats-detail {
-  display: grid; grid-template-columns: 1fr 1fr; gap: 12px;
+  display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px;
   background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
   padding: 12px 16px; margin-bottom: 16px;
 }

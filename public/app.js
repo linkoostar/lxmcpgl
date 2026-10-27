@@ -945,15 +945,39 @@ function escapeHtml(s) {
   return String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
-/* ---------- 调用日志 ---------- */
+/* ---------- 调用统计 ---------- */
 
-const logState = { q: '', caller: '', success: '', since: '', page: 1, pageSize: 50, total: 0 };
+const logState = { q: '', upstream: '', caller: '', success: '', since: '', until: '', preset: '7', page: 1, pageSize: 50, total: 0 };
+
+/** 从筛选控件同步日期范围到 logState.since/until */
+function syncLogDateRange() {
+  const preset = $('#log-since-preset').value;
+  if (preset === 'custom') {
+    document.getElementById('log-since-date').style.display = '';
+    document.getElementById('log-until-date').style.display = '';
+    document.getElementById('log-date-sep').style.display = '';
+    const s = $('#log-since-date').value;
+    const u = $('#log-until-date').value;
+    logState.since = s ? new Date(s + 'T00:00:00').toISOString() : '';
+    logState.until = u ? new Date(u + 'T23:59:59').toISOString() : '';
+  } else {
+    document.getElementById('log-since-date').style.display = 'none';
+    document.getElementById('log-until-date').style.display = 'none';
+    document.getElementById('log-date-sep').style.display = 'none';
+    if (!preset) { logState.since = ''; logState.until = ''; return; }
+    const days = preset === 'today' ? 1 : Number(preset);
+    const now = new Date();
+    const start = new Date(now.getTime() - days * 24 * 3600 * 1000);
+    logState.since = start.toISOString();
+    logState.until = '';
+  }
+}
 
 async function loadLogs() {
-  // 同时拉 stats 和 列表
-  const [stats, callers] = await Promise.all([
+  const [stats, callers, upstreams] = await Promise.all([
     api('/call-logs/stats'),
     api('/users'),
+    api('/upstreams'),
   ]);
   renderLogStats(stats);
 
@@ -963,10 +987,12 @@ async function loadLogs() {
   sel.append(new Option('admin', 'admin'));
   for (const u of callers.items) sel.append(new Option(u.username, u.username));
 
-  // 如果是首次进入且没设置筛选，用最近 7 天
-  if (!logState.since && !logState.preset) {
-    // 首次使用默认查全部
-  }
+  // 填充 upstream 筛选下拉
+  const usel = $('#log-upstream-filter');
+  const curUp = logState.upstream;
+  usel.innerHTML = '<option value="">全部上游</option>' +
+    upstreams.items.map((u) => `<option value="${u.id}" ${curUp === u.id ? 'selected' : ''}>${escapeHtml(u.name)}</option>`).join('');
+
   await loadLogList();
 }
 
@@ -975,20 +1001,33 @@ function renderLogStats(stats) {
   const rate = stats.total > 0 ? ((stats.success / stats.total) * 100).toFixed(1) + '%' : '—';
   const topTools = (stats.top_tools || []).slice(0, 8);
   const topCallers = (stats.top_callers || []).slice(0, 5);
-  const toolChips = topTools.map((t) => `<span class="chip">${t.tool_id || t.tool_name} <b>×${t.count}</b></span>`).join('') || '<span class="muted">—</span>';
-  const callerChips = topCallers.map((t) => `<span class="chip caller">${t.caller} <b>×${t.count}</b></span>`).join('') || '<span class="muted">—</span>';
+  const toolChips = topTools.map((t) => `<span class="chip">${escapeHtml(t.tool_name)} <b>×${t.count}</b></span>`).join('') || '<span class="muted">—</span>';
+  const callerChips = topCallers.map((t) => `<span class="chip caller">${escapeHtml(t.caller)} <b>×${t.count}</b></span>`).join('') || '<span class="muted">—</span>';
+
+  // upstream 汇总条
+  const ups = stats.upstream_stats || [];
+  const upHtml = ups.map((u) => {
+    const credBadge = u.credits > 0 ? ` <b style="color:#d97706">${u.credits} credits</b>` : '';
+    return `<span class="chip">${escapeHtml(u.upstream)} ×${u.count}${credBadge}</span>`;
+  }).join('') || '<span class="muted">—</span>';
+
   root.innerHTML = `
     <div class="log-stat-card"><div class="label">总调用</div><div class="value">${stats.total}</div></div>
     <div class="log-stat-card success"><div class="label">成功</div><div class="value">${stats.success || 0}</div><div class="muted" style="font-size:12px;margin-top:4px">成功率 ${rate}</div></div>
     <div class="log-stat-card failed"><div class="label">失败 / 拒绝</div><div class="value">${stats.failed || 0}</div></div>
+    <div class="log-card credits"><div class="label">消耗 Credits</div><div class="value" style="color:#d97706">${Number(stats.total_credits || 0).toLocaleString()}</div></div>
     <div class="log-stat-card avg"><div class="label">平均耗时</div><div class="value">${stats.avg_ms != null ? stats.avg_ms + ' ms' : '—'}</div></div>
   `;
-  // 独立横列：热门工具 + 调用者（先清旧的再插新的）
+  // 独立横列：上游汇总 + 热门工具 + 调用者
   const prev = document.querySelector('.log-stats-detail');
   if (prev) prev.remove();
   const detail = document.createElement('div');
   detail.className = 'log-stats-detail';
   detail.innerHTML = `
+    <div class="detail-col">
+      <div class="detail-head">📦 上游分布 <span class="muted">（${ups.length} 个）</span></div>
+      <div class="chip-row">${upHtml}</div>
+    </div>
     <div class="detail-col">
       <div class="detail-head">🔥 热门工具 <span class="muted">（调用 ${stats.unique_tools || 0} 种）</span></div>
       <div class="chip-row">${toolChips}</div>
@@ -1004,9 +1043,11 @@ function renderLogStats(stats) {
 async function loadLogList() {
   const params = new URLSearchParams();
   if (logState.q) params.set('q', logState.q);
+  if (logState.upstream) params.set('upstream', logState.upstream);
   if (logState.caller) params.set('caller', logState.caller);
   if (logState.success) params.set('success', logState.success);
   if (logState.since) params.set('since', logState.since);
+  if (logState.until) params.set('until', logState.until);
   params.set('page', logState.page);
   params.set('page_size', logState.pageSize);
 
@@ -1018,58 +1059,69 @@ async function loadLogList() {
   for (const l of items) {
     const tr = document.createElement('tr');
     const ts = new Date(l.ts);
-    const td0 = document.createElement('td');
-    td0.textContent = ts.toLocaleString();
-
-    const td1 = document.createElement('td');
-    td1.textContent = l.caller;
-    td1.style.fontWeight = l.caller === 'admin' ? '600' : '';
-
-    const td2 = document.createElement('td');
-    td2.innerHTML = `<code>${escapeHtml(l.tool_name)}</code>`;
-    if (l.tool_id) td2.innerHTML += `<div class="desc">${escapeHtml(l.tool_id)}</div>`;
-
-    const td3 = document.createElement('td');
-    if (l.tool_type === 'write') td3.innerHTML = '<span class="tag warn">write</span>';
-    else if (l.tool_type === 'read') td3.innerHTML = '<span class="tag ok">read</span>';
-    else td3.innerHTML = '<span class="muted">-</span>';
-
-    const td4 = document.createElement('td');
-    td4.textContent = l.duration_ms != null ? `${l.duration_ms}ms` : '-';
-
-    const td5 = document.createElement('td');
-    if (l.success) td5.innerHTML = '<span class="tag ok">成功</span>';
-    else td5.innerHTML = `<span class="tag no">${l.is_error ? '失败' : '拒绝'}</span>`;
-
-    const td6 = document.createElement('td');
-    const shops = (() => {
-      try { return l.shop_refs ? JSON.parse(l.shop_refs) : null; } catch { return null; }
-    })();
-    const parts = [];
-    if (l.error) parts.push(`<span class="desc" style="color:#dc2626">${escapeHtml(l.error)}</span>`);
-    if (shops && shops.length) parts.push(`<span class="muted">店铺: ${shops.join(', ')}</span>`);
-    td6.innerHTML = parts.join(' ') || '<span class="muted">—</span>';
-
-    tr.append(td0, td1, td2, td3, td4, td5, td6);
+    const cells = [
+      td(ts.toLocaleString()),
+      td(l.upstream || '—', l.upstream ? 'color:#2563eb;font-weight:500' : ''),
+      td(l.caller, l.caller === 'admin' ? 'font-weight:600' : ''),
+      (() => {
+        const c = document.createElement('td');
+        c.innerHTML = `<code>${escapeHtml(l.tool_name)}</code>`;
+        if (l.tool_id) c.innerHTML += `<div class="desc">${escapeHtml(l.tool_id)}</div>`;
+        return c;
+      })(),
+      (() => {
+        const c = document.createElement('td');
+        if (l.tool_type === 'write') c.innerHTML = '<span class="tag warn">write</span>';
+        else if (l.tool_type === 'read') c.innerHTML = '<span class="tag ok">read</span>';
+        else c.innerHTML = '<span class="muted">-</span>';
+        return c;
+      })(),
+      td(l.duration_ms != null ? `${l.duration_ms}ms` : '-'),
+      (() => {
+        const c = document.createElement('td');
+        if (l.success) c.innerHTML = '<span class="tag ok">成功</span>';
+        else c.innerHTML = `<span class="tag no">${l.is_error ? '失败' : '拒绝'}</span>`;
+        return c;
+      })(),
+      (() => {
+        const c = document.createElement('td');
+        const shops = (() => { try { return l.shop_refs ? JSON.parse(l.shop_refs) : null; } catch { return null; } })();
+        const parts = [];
+        if (l.error) parts.push(`<span class="desc" style="color:#dc2626">${escapeHtml(l.error)}</span>`);
+        if (shops && shops.length) parts.push(`<span class="muted">店铺: ${shops.join(', ')}</span>`);
+        c.innerHTML = parts.join(' ') || '<span class="muted">—</span>';
+        return c;
+      })(),
+    ];
+    tr.append(...cells);
     tbody.appendChild(tr);
   }
   if (!items.length) {
-    tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--muted);padding:30px">暂无调用记录，运营或管理员使用 MCP 网关后会自动记录</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--muted);padding:30px">暂无调用记录，运营或管理员使用 MCP 网关后会自动记录</td></tr>';
   }
+}
+
+/** 构造一个简单 td（带可选内联样式） */
+function td(text, style = '') {
+  const c = document.createElement('td');
+  c.textContent = text;
+  if (style) c.setAttribute('style', style);
+  return c;
 }
 
 $('#btn-log-search').addEventListener('click', async () => {
   logState.q = $('#log-search').value.trim();
+  logState.upstream = $('#log-upstream-filter').value;
   logState.caller = $('#log-caller-filter').value;
   logState.success = $('#log-success-filter').value;
-  logState.since = $('#log-since-filter').value
-    ? new Date(Date.now() - Number($('#log-since-filter').value) * 3600 * 1000).toISOString()
-    : '';
+  syncLogDateRange();
   logState.page = 1;
-  logState.preset = true;
-  try { await loadLogList(); } catch (e) { toast(e.message); }
+  try { await loadLogs(); } catch (e) { toast(e.message); }
 });
 $('#log-search').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('#btn-log-search').click(); });
+$('#log-since-preset').addEventListener('change', () => syncLogDateRange());
+$('#log-since-date').addEventListener('change', () => syncLogDateRange());
+$('#log-until-date').addEventListener('change', () => syncLogDateRange());
 $('#btn-log-refresh').addEventListener('click', async () => { try { await loadLogs(); } catch (e) { toast(e.message); } });
 $('#btn-log-prev').addEventListener('click', () => { if (logState.page > 1) { logState.page--; loadLogList().catch((e) => toast(e.message)); } });
 $('#btn-log-next').addEventListener('click', () => { if (logState.page * logState.pageSize < logState.total) { logState.page++; loadLogList().catch((e) => toast(e.message)); } });
@@ -1080,6 +1132,31 @@ $('#btn-log-clean').addEventListener('click', async () => {
     toast(`已清理 ${r.deleted} 条旧日志`);
     loadLogs().catch(() => {});
   } catch (e) { toast(e.message); }
+});
+$('#btn-log-export').addEventListener('click', () => {
+  const params = new URLSearchParams();
+  if (logState.q) params.set('q', logState.q);
+  if (logState.upstream) params.set('upstream', logState.upstream);
+  if (logState.caller) params.set('caller', logState.caller);
+  if (logState.success) params.set('success', logState.success);
+  if (logState.since) params.set('since', logState.since);
+  if (logState.until) params.set('until', logState.until);
+  params.set('page_size', 5000);
+  const token = localStorage.getItem('lx_token');
+  const url = '/api/call-logs/export.csv?' + params.toString();
+  // 用隐藏 iframe 触发下载（带 Authorization header 通过 fetch → blob → a 标签）
+  fetch(url, { headers: { Authorization: 'Bearer ' + token } })
+    .then((r) => {
+      if (!r.ok) throw new Error('导出失败: HTTP ' + r.status);
+      return r.blob();
+    })
+    .then((blob) => {
+      const a = document.createElement('a');
+      const fname = `call_logs_${new Date().toISOString().slice(0, 10)}.csv`;
+      a.href = URL.createObjectURL(blob); a.download = fname; a.click();
+      URL.revokeObjectURL(a.href);
+    })
+    .catch((e) => toast(e.message));
 });
 
 /* ---------- 初始化 ---------- */

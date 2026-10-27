@@ -839,9 +839,11 @@ apiRouter.get(
     const tool = String(req.query.tool ?? '').trim();
     const success = req.query.success !== undefined ? String(req.query.success) as '1' | '0' : undefined;
     const since = String(req.query.since ?? '').trim() || undefined;
+    const until = String(req.query.until ?? '').trim() || undefined;
+    const upstream = String(req.query.upstream ?? '').trim() || undefined;
     const page = Math.max(1, parseInt(String(req.query.page ?? '1'), 10) || 1);
     const pageSize = Math.min(200, Math.max(1, parseInt(String(req.query.page_size ?? '50'), 10) || 50));
-    const r = listCallLogs({ q, caller, tool, success, since, page, pageSize });
+    const r = listCallLogs({ q, caller, tool, success, since, until, upstream, page, pageSize });
     res.json(r);
   })
 );
@@ -851,7 +853,43 @@ apiRouter.get(
   requireAuth,
   wrap(async (req, res) => {
     const since = String(req.query.since ?? '').trim() || undefined;
-    res.json(getCallLogStats(since));
+    const until = String(req.query.until ?? '').trim() || undefined;
+    const upstream = String(req.query.upstream ?? '').trim() || undefined;
+    const caller = String(req.query.caller ?? '').trim() || undefined;
+    res.json(getCallLogStats({ since, until, upstream, caller }));
+  })
+);
+
+// CSV 导出 — 拉最多 5000 条，流式输出
+apiRouter.get(
+  '/call-logs/export.csv',
+  requireAuth,
+  wrap(async (req, res) => {
+    const q = String(req.query.q ?? '').trim();
+    const caller = String(req.query.caller ?? '').trim();
+    const tool = String(req.query.tool ?? '').trim();
+    const success = req.query.success !== undefined ? String(req.query.success) as '1' | '0' : undefined;
+    const since = String(req.query.since ?? '').trim() || undefined;
+    const until = String(req.query.until ?? '').trim() || undefined;
+    const upstream = String(req.query.upstream ?? '').trim() || undefined;
+    const MAX = 5000;
+    const r = listCallLogs({ q, caller, tool, success, since, until, upstream, page: 1, pageSize: MAX });
+    const headers = ['时间', '上游', '调用者', '工具', '上游tool_id', '类型', '成功', '耗时ms', '关联店铺', '错误'];
+    const esc = (v: unknown) => {
+      const s = v == null ? '' : String(v);
+      if (/[",\n]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
+      return s;
+    };
+    const rows = r.items.map((row) => [
+      row.ts, row.upstream || '', row.caller, row.tool_name, row.tool_id || '',
+      row.tool_type || '', row.success ? '是' : '否', row.duration_ms ?? '',
+      row.shop_refs || '', row.error || '',
+    ].map(esc).join(','));
+    const csv = '\uFEFF' + [headers.join(','), ...rows].join('\n'); // BOM 让 Excel 正确识别 UTF-8
+    const fname = `call_logs_${new Date().toISOString().slice(0,10)}.csv`;
+    res.setHeader('Content-Disposition', `attachment; filename=${fname}`);
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.send(csv);
   })
 );
 
