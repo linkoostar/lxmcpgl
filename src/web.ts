@@ -498,9 +498,10 @@ apiRouter.get(
     const page = Math.max(1, parseInt(String(req.query.page ?? '1'), 10) || 1);
     const pageSize = Math.min(500, Math.max(1, parseInt(String(req.query.page_size ?? '50'), 10) || 50));
     const toolType = String(req.query.tool_type ?? '').trim() || undefined;
+    const upstream = String(req.query.upstream ?? '').trim() || undefined;
     let enabled: number | undefined = undefined;
     if (req.query.enabled !== undefined && req.query.enabled !== '') enabled = String(req.query.enabled) === '1' ? 1 : 0;
-    res.json(listTools(q, page, pageSize, toolType, enabled));
+    res.json(listTools(q, page, pageSize, toolType, enabled, upstream));
   })
 );
 

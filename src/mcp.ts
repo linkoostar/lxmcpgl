@@ -12,6 +12,7 @@ import {
   insertCallLog,
   listUpstreams,
   getUpstreamToolCounts,
+  parseUpstreamHeaders,
   type UserRow,
 } from './db.js';
 import { getUpstreamClient } from './upstream.js';
@@ -469,9 +470,11 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
       logOutcome(false, true, `上游 ${upId} 未启用`);
       return errorResult(`上游 ${upId} 未配置或已停用`);
     }
-    if (!upConfig.api_key && !upConfig.url.includes('nocodb')) {
+    // api_key 必填 — 除非 upstream 已经配置了自定义 headers 鉴权（如 NocoDB/ABA搜索词用 x-api-key）
+    const hasCustomHeaders = Object.keys(parseUpstreamHeaders(upConfig)).length > 0;
+    if (!upConfig.api_key && !hasCustomHeaders) {
       logOutcome(false, true, '上游未配置 API Key');
-      return errorResult(`上游 ${upConfig.name} 未配置 API Key，请联系管理员`);
+      return errorResult(`上游 ${upConfig.name} 未配置 API Key 或鉴权 Headers，请联系管理员`);
     }
     try {
       // 延迟 import 避免循环依赖

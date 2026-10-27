@@ -253,7 +253,7 @@ export async function syncTools(): Promise<SyncResult> {
   }
 }
 
-export function listTools(q: string, page: number, pageSize: number, toolType?: string, enabled?: number): { total: number; items: Array<Record<string, unknown>> } {
+export function listTools(q: string, page: number, pageSize: number, toolType?: string, enabled?: number, upstream?: string): { total: number; items: Array<Record<string, unknown>> } {
   const conds: string[] = [];
   const params: unknown[] = [];
   if (q) {
@@ -261,6 +261,7 @@ export function listTools(q: string, page: number, pageSize: number, toolType?: 
     const like = `%${q}%`;
     params.push(like, like, like, like);
   }
+  if (upstream) { conds.push('upstream = ?'); params.push(upstream); }
   if (toolType) { conds.push('tool_type = ?'); params.push(toolType); }
   if (enabled !== undefined && enabled !== null) { conds.push('enabled = ?'); params.push(enabled); }
   const where = conds.length > 0 ? `WHERE ${conds.join(' AND ')}` : '';
@@ -334,7 +335,7 @@ export async function refreshToolSchema(client: UpstreamClient, toolId: string):
 // =====================================================
 
 /** 同步所有 active 的 upstream，返回 { upstream: SyncResult } */
-export async function syncAllUpstreams(): Promise<{ results: Record<string, SyncResult>; totalSynced: number }> {
+export async function syncAllUpstreams(): Promise<any> {
   const upstreams = db
     .prepare('SELECT * FROM upstreams WHERE active = 1')
     .all() as Array<{ id: string; name: string; url: string; api_key: string; adapter: string; sync_strategy: string }>;
@@ -370,7 +371,21 @@ export async function syncAllUpstreams(): Promise<{ results: Record<string, Sync
   }
 
   setSetting('last_sync_at', new Date().toISOString());
-  return { results, totalSynced };
+  // 汇总所有 upstream 的统计到顶层，方便前端 toast 直接读
+  const allSynced = Object.values(results).reduce((s, r) => s + r.synced, 0);
+  const allListed = Object.values(results).reduce((s, r) => s + r.total_listed, 0);
+  const allMissing = Object.values(results).reduce((s, r) => s + r.schema_missing, 0);
+  const allFailed = Object.values(results).reduce((s, r) => s + r.failed, 0);
+  const allDuration = Object.values(results).reduce((s, r) => s + r.duration_ms, 0);
+  return {
+    results,
+    upstream_count: Object.keys(results).length,
+    synced: allSynced,
+    total_listed: allListed,
+    schema_missing: allMissing,
+    failed: allFailed,
+    duration_ms: allDuration,
+  };
 }
 
 async function syncOneUpstream(up: { id: string; name: string; url: string; api_key: string; adapter: string; sync_strategy: string }): Promise<SyncResult> {
