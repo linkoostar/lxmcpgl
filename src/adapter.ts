@@ -132,7 +132,65 @@ class LingxingMetaAdapter implements UpstreamAdapter {
     // 复用现有 UpstreamClient
     const { getUpstreamClient } = await import('./upstream.js');
     const client = getUpstreamClient(config.url, config.api_key ?? '');
-    const resp = await client.callTool('action', { toolId, params: args });
+
+    // ===== 参数格式：扁平展开，和 sync.ts 一致 =====
+    // 真实领星 upstream 的 meta 工具（help/search/action）都期望 arguments 扁平：
+    //   action({ toolId: 'xxx', report_date: '...', page: 1, length: 20 })
+    // 不是嵌套在 params 里：
+    //   action({ toolId: 'xxx', params: { report_date: '...', page: 1, length: 20 } })
+    // 后者会导致上游看不到业务参数（page/length 全被忽略），表现为翻页无效、返回默认条数
+    const flatArgs = { toolId, ...args };
+    const resp = await client.callTool('action', flatArgs);
+
+    // ===== 诊断日志：打印上游原始响应结构（开发/排查用，不影响逻辑） =====
+    try {
+      const result = resp?.result;
+      const contentArr = result?.content;
+      const parts: string[] = [];
+      parts.push('upstream_response_keys=[' + Object.keys(resp ?? {}).join(',') + ']');
+      parts.push('result_keys=[' + (result ? Object.keys(result).join(',') : 'N/A') + ']');
+      if (Array.isArray(contentArr)) {
+        parts.push('content_parts=' + contentArr.length);
+        for (let i = 0; i < contentArr.length; i++) {
+          const part = contentArr[i];
+          if (part && typeof part === 'object') {
+            const keys = Object.keys(part).join(',');
+            parts.push('content[' + i + '] keys=[' + keys + ']');
+            if (typeof (part as any).text === 'string') {
+              const txt = (part as any).text as string;
+              parts.push('content[' + i + '].text.length=' + txt.length);
+              try {
+                const parsed = JSON.parse(txt);
+                const arrayLens: string[] = [];
+                const walk = (node: unknown, path: string) => {
+                  if (Array.isArray(node)) {
+                    arrayLens.push(path + '→' + node.length);
+                    node.forEach((it, idx) => {
+                      if (idx < 2) walk(it, path + '[' + idx + ']');
+                    });
+                  } else if (node && typeof node === 'object') {
+                    for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
+                      walk(v, path ? path + '.' + k : k);
+                    }
+                  }
+                };
+                walk(parsed, '');
+                parts.push('content[' + i + '] arrays: ' + arrayLens.join('; '));
+              } catch {
+                parts.push('content[' + i + '].text 非 JSON');
+              }
+            }
+          }
+        }
+      } else {
+        parts.push('content 不是数组: ' + typeof contentArr);
+      }
+      parts.push('isError=' + (result?.isError ?? 'N/A'));
+      console.log('[gw-diag] upstream raw [' + toolId + '] ' + parts.join(' | '));
+    } catch (e) {
+      console.log('[gw-diag] upstream raw [' + toolId + '] 诊断异常: ' + String(e));
+    }
+
     if (resp?.error) {
       return {
         content: [],

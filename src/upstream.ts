@@ -69,9 +69,26 @@ export class UpstreamClient {
   private async readResponse(res: Response, text: string, id: number): Promise<JsonRpcResponse | null> {
     if (!res.ok) throw new UpstreamError(res.status, `HTTP ${res.status}: ${text.slice(0, 300)}`);
     const ct = res.headers.get('content-type') || '';
+    try {
+      console.log('[gw-diag] upstream HTTP ct=' + (ct || '(empty)') + ' text.length=' + text.length + ' id=' + id);
+    } catch { /* ignore */ }
+
     if (ct.includes('text/event-stream')) {
       const msgs = this.parseSse(text);
-      return msgs.find((m) => m && m.id === id) ?? null;
+      try {
+        const ids = msgs.map((m) => String(m?.id ?? 'null'));
+        console.log('[gw-diag] upstream SSE events=' + msgs.length + ' ids=[' + ids.join(',') + '] 找匹配 id=' + id);
+      } catch { /* ignore */ }
+      const matched = msgs.find((m) => m && m.id === id);
+      if (!matched && msgs.length > 0) {
+        try {
+          msgs.forEach((m, i) => {
+            const head = JSON.stringify(m).slice(0, 200);
+            console.log('[gw-diag] SSE[' + i + '] head=' + head);
+          });
+        } catch { /* ignore */ }
+      }
+      return matched ?? null;
     }
     if (!text.trim()) return null;
     try {
