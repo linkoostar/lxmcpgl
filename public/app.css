@@ -82,10 +82,13 @@ input:focus { border-color: var(--primary); }
   background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); overflow: auto;
 }
 table { width: 100%; border-collapse: collapse; }
+.tool-table { table-layout: fixed; }
+.tool-table th:nth-child(3), .tool-table td:nth-child(3) { /* 名称/描述列占剩余空间 */ width: auto; }
+.tool-table td code { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 180px; }
 th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
 th { font-size: 12px; color: var(--muted); font-weight: 600; background: #fafbfc; position: sticky; top: 0; }
 tbody tr:hover { background: #f8faff; }
-td .desc { color: var(--muted); font-size: 12px; display: block; max-width: 560px;
+td .desc { color: var(--muted); font-size: 12px; display: block;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tag {
   display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px;
@@ -115,20 +118,21 @@ td .desc { color: var(--muted); font-size: 12px; display: block; max-width: 560p
 
 /* 权限弹窗 */
 .user-modal-body.scroll { max-height: 70vh; overflow-y: auto; }
-.perm-section { padding: 10px 0; border-bottom: 1px solid var(--border); }
+.perm-section { padding: 6px 0; border-bottom: 1px solid var(--border); }
 .perm-section:last-child { border-bottom: none; }
+.perm-section-head { display: flex; gap: 8px; align-items: center; margin-bottom: 4px; flex-wrap: wrap; }
 .perm-list {
-  display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
-  gap: 4px 16px; max-height: 260px; overflow-y: auto; padding: 8px 4px;
-  margin-top: 6px; border: 1px solid var(--border); border-radius: 8px;
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 1px 10px; max-height: 260px; overflow-y: auto; padding: 4px;
+  margin-top: 4px; border: 1px solid var(--border); border-radius: 8px;
   background: #fafbfc;
 }
 .perm-item {
-  font-size: 12.5px; padding: 2px 4px; cursor: pointer; display: flex;
-  align-items: center; gap: 6px; overflow: hidden; text-overflow: ellipsis;
-  white-space: nowrap;
+  font-size: 12px; padding: 1px 2px; cursor: pointer; display: flex;
+  align-items: center; gap: 4px; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; height: 22px;
 }
-.perm-item:hover { background: #f0f4ff; border-radius: 4px; }
+.perm-item:hover { background: #eef3ff; border-radius: 3px; }
 
 /* 批量操作条 */
 .batch-bar {

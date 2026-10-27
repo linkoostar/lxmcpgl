@@ -132,6 +132,82 @@ function collectShopRefs(args: Record<string, unknown>): string[] {
 
 const SCHEMA_STALE_RE = /工具参数定义已更新|"code"\s*:\s*102/;
 
+// ---------- 店铺结果过滤 ----------
+// 上游返回的 content[].text 通常是 JSON 字符串 {code, data:{list:[...],...}} 或直接 {list:[...]}
+// 递归识别数组中每个元素的店铺标识字段（sid / shop_id / profile_id / seller_id / id + country_code 等），
+// 把不在 allowedShops 里的条目过滤掉。返回一个新的 JSON 字符串；解析失败就原样返回。
+
+const SHOP_ID_KEYS = new Set([
+  'sid', 'shop_id', 'shop_ids', 'store_id', 'store_ids',
+  'profile_id', 'profile_ids', 'seller_id', 'seller_ids',
+  'shop_sids', 'seller_ids',
+]);
+
+/** 从一个对象里抽取所有店铺标识 */
+function extractShopIdsFromObj(obj: Record<string, unknown>): string[] {
+  const out: string[] = [];
+  for (const [k, v] of Object.entries(obj)) {
+    const key = k.toLowerCase();
+    if (SHOP_ID_KEYS.has(key) && v != null && v !== '') {
+      if (Array.isArray(v)) out.push(...v.map(String));
+      else out.push(String(v));
+    }
+    // 领星的 get_my_sids 返回里 id 字段也常是店铺 id（country_code + name 一起出现时判定）
+    if ((key === 'id' || key === 'shop_id') && typeof v !== 'object') {
+      // 保守：仅当对象里同时出现 name / country_code 时把 id 当作店铺标识
+      if ('name' in obj || 'country_code' in obj) out.push(String(v));
+    }
+  }
+  return out;
+}
+
+function filterShopListInNode(node: unknown, allowedShops: Set<string>): unknown {
+  if (Array.isArray(node)) {
+    // 先尝试把这个数组当作候选店铺列表 —— 如果首元素有店铺标识字段，就用 allowedShops 过滤
+    if (node.length > 0 && node[0] && typeof node[0] === 'object') {
+      const first = node[0] as Record<string, unknown>;
+      if (SHOP_ID_KEYS.has(
+        Object.keys(first).some((k) => SHOP_ID_KEYS.has(k.toLowerCase()))
+          ? Object.keys(first).find((k) => SHOP_ID_KEYS.has(k.toLowerCase()))!.toLowerCase()
+          : ''
+      ) || ('country_code' in first && 'name' in first)) {
+        return node.filter((item) => {
+          const ids = extractShopIdsFromObj(item as Record<string, unknown>);
+          // 任何一个标识命中白名单就通过（兼容一条数据含多个店铺 id 的情况）
+          if (ids.length === 0) return true; // 无店铺标识则不过滤（保险）
+          return ids.some((id) => allowedShops.has(id));
+        });
+      }
+    }
+    // 否则递归各元素
+    return node.map((x) => filterShopListInNode(x, allowedShops));
+  }
+  if (node && typeof node === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
+      out[k] = filterShopListInNode(v, allowedShops);
+    }
+    return out;
+  }
+  return node;
+}
+
+/** 对 MCP content 数组应用店铺白名单过滤。就地修改并返回新 content */
+function filterContentByShops(content: unknown, allowedShops: Set<string>): unknown {
+  if (!Array.isArray(content)) return content;
+  return content.map((part: any) => {
+    if (!part || typeof part !== 'object') return part;
+    if (typeof part.text !== 'string') return part;
+    try {
+      const parsed = JSON.parse(part.text);
+      const filtered = filterShopListInNode(parsed, allowedShops);
+      return { ...part, text: JSON.stringify(filtered) };
+    } catch {
+      return part; // 非 JSON 文本原样返回
+    }
+  });
+}
+
 function respText(resp: any): string {
   const content = resp?.result?.content;
   if (Array.isArray(content)) {
@@ -293,7 +369,16 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
       const content = resp?.result?.content;
       console.log(`[mcp] ${caller} ${name} ok ${duration}ms`);
       logOutcome(true, false);
-      if (Array.isArray(content)) return { content };
+
+      // 店铺结果过滤：运营用户 + 非全店铺权限时，把上游返回的店铺相关数组里不在白名单的条目砍掉
+      if (Array.isArray(content)) {
+        let filteredContent: unknown = content;
+        if (identity.kind === 'user' && !identity.all_shops) {
+          const allowedShops = new Set(getUserShopIds(identity.id));
+          filteredContent = filterContentByShops(content, allowedShops);
+        }
+        return { content: filteredContent as any[] };
+      }
       logOutcome(false, true, '上游返回为空');
       return errorResult('上游返回为空');
     } catch (e: any) {

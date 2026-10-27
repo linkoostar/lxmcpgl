@@ -122,9 +122,14 @@ async function loadTools() {
     td0.appendChild(chk);
 
     const td1 = document.createElement('td');
-    const code = document.createElement('code');
-    code.textContent = t.tool_id;
-    td1.appendChild(code);
+    td1.innerHTML = `<code>${escapeHtml(t.tool_id)}</code>`;
+    if (t.has_schema) {
+      const s = document.createElement('div');
+      s.className = 'muted';
+      s.style.fontSize = '11px';
+      s.textContent = 'Schema ✓';
+      td1.appendChild(s);
+    }
 
     const td2 = document.createElement('td');
     td2.innerHTML = `<b>${escapeHtml(t.name)}</b>`;
@@ -142,32 +147,32 @@ async function loadTools() {
     else td3.innerHTML = '<span class="muted">-</span>';
 
     const td4 = document.createElement('td');
-    td4.innerHTML = t.has_schema ? '<span class="tag ok">已拉取</span>' : '<span class="tag no">缺失</span>';
+    td4.innerHTML = t.enabled
+      ? '<span class="tag ok" title="已启用">● 启用</span>'
+      : '<span class="tag no" title="已停用">○ 停用</span>';
 
     const td5 = document.createElement('td');
     const toggle = document.createElement('button');
-    toggle.className = 'btn small';
-    toggle.textContent = t.enabled ? '启用' : '停用';
+    toggle.className = `btn small ${t.enabled ? 'ghost' : 'primary'}`;
+    toggle.textContent = t.enabled ? '停用' : '启用';
     toggle.onclick = async () => {
       try {
         await api(`/tools/${encodeURIComponent(t.tool_id)}/enabled`, { method: 'PUT', body: { enabled: !t.enabled } });
         loadTools();
       } catch (e) { toast(e.message); }
     };
-    td5.appendChild(toggle);
-
-    const td6 = document.createElement('td');
     const detail = document.createElement('button');
-    detail.className = 'btn small';
+    detail.className = 'btn small ghost';
     detail.textContent = '详情';
+    detail.style.marginLeft = '6px';
     detail.onclick = () => showToolDetail(t.tool_id);
-    td6.appendChild(detail);
+    td5.append(toggle, detail);
 
-    tr.append(td0, td1, td2, td3, td4, td5, td6);
+    tr.append(td0, td1, td2, td3, td4, td5);
     tbody.appendChild(tr);
   }
   if (!data.items.length) {
-    tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--muted);padding:30px">暂无数据，点击右上角「同步工具」从上游拉取</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--muted);padding:30px">暂无数据，点击右上角「同步工具」从上游拉取</td></tr>';
   }
   updateBatchBar();
 }
