@@ -1,0 +1,15 @@
+services:
+  lxmcpgl:
+    image: ghcr.io/linkoostar/lxmcpgl:latest
+    container_name: lxmcpgl
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      - ADMIN_USERNAME=admin
+      - ADMIN_PASSWORD=admin123        # 首次启动生效，之后请在网页后台修改
+      # 以下两项首次启动写入数据库，之后以网页后台配置为准
+      - LINGXING_MCP_URL=https://openmcp.lingxing.com/mcp-servers/lingxing-mcp
+      - LINGXING_MCP_KEY=你的领星X-Mcp-Key
+    volumes:
+      - ./data:/app/data

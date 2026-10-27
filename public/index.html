@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>领星 MCP 网关管理</title>
+  <link rel="stylesheet" href="/app.css" />
+</head>
+<body>
+  <!-- 登录 -->
+  <div id="view-login" class="login-wrap hidden">
+    <form id="login-form" class="login-card">
+      <h1>领星 MCP 网关</h1>
+      <p class="sub">管理后台登录</p>
+      <label>用户名
+        <input id="login-user" autocomplete="username" required />
+      </label>
+      <label>密码
+        <input id="login-pass" type="password" autocomplete="current-password" required />
+      </label>
+      <div id="login-error" class="error hidden"></div>
+      <button type="submit" class="btn primary block">登录</button>
+    </form>
+  </div>
+
+  <!-- 主界面 -->
+  <div id="view-app" class="hidden">
+    <header class="topbar">
+      <div class="brand">领星 MCP 网关</div>
+      <nav>
+        <button class="nav-btn" data-page="tools">工具列表</button>
+        <button class="nav-btn" data-page="settings">系统设置</button>
+      </nav>
+      <div class="spacer"></div>
+      <span id="me-name" class="muted"></span>
+      <button id="btn-logout" class="btn ghost small">退出</button>
+    </header>
+
+    <!-- 工具列表 -->
+    <main id="page-tools" class="page hidden">
+      <div class="toolbar">
+        <input id="tool-search" placeholder="搜索工具名 / 描述…" />
+        <button id="btn-search" class="btn">搜索</button>
+        <div class="spacer"></div>
+        <span id="sync-status" class="muted"></span>
+        <button id="btn-sync" class="btn primary">同步工具</button>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th style="width:220px">工具 ID</th>
+              <th>名称 / 描述</th>
+              <th style="width:90px">Schema</th>
+              <th style="width:80px">启用</th>
+              <th style="width:70px"></th>
+            </tr>
+          </thead>
+          <tbody id="tools-tbody"></tbody>
+        </table>
+      </div>
+      <div class="pager">
+        <button id="btn-prev" class="btn small">上一页</button>
+        <span id="page-info" class="muted"></span>
+        <button id="btn-next" class="btn small">下一页</button>
+      </div>
+    </main>
+
+    <!-- 设置 -->
+    <main id="page-settings" class="page hidden">
+      <div class="card">
+        <h2>上游配置</h2>
+        <p class="muted">真实密钥只保存在网关容器内，运营无法接触。</p>
+        <label>领星 MCP 地址
+          <input id="set-url" />
+        </label>
+        <label>领星 X-Mcp-Key <span id="key-masked" class="muted"></span>
+          <input id="set-key" type="password" placeholder="留空表示不修改" />
+        </label>
+        <div class="row">
+          <button id="btn-save-settings" class="btn primary">保存配置</button>
+          <button id="btn-test" class="btn">测试连通</button>
+          <span id="test-result" class="muted"></span>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>下游接入（运营配置）</h2>
+        <label>网关访问 Key
+          <div class="row">
+            <input id="down-key" readonly />
+            <button id="btn-copy-key" class="btn">复制</button>
+            <button id="btn-reset-key" class="btn danger">重置 Key</button>
+          </div>
+        </label>
+        <p class="muted">把下面配置发给运营即可（粘贴到 Trae 的 MCP 配置）：</p>
+        <pre id="mcp-snippet" class="code"></pre>
+        <button id="btn-copy-snippet" class="btn small">复制配置</button>
+      </div>
+
+      <div class="card">
+        <h2>管理员密码</h2>
+        <div class="row wrap">
+          <input id="old-pass" type="password" placeholder="原密码" />
+          <input id="new-pass" type="password" placeholder="新密码（至少 6 位）" />
+          <button id="btn-change-pass" class="btn">修改密码</button>
+        </div>
+        <span id="pass-result" class="muted"></span>
+      </div>
+    </main>
+  </div>
+
+  <!-- 工具详情弹窗 -->
+  <div id="modal-mask" class="modal-mask hidden">
+    <div class="modal">
+      <div class="modal-head">
+        <span id="modal-title"></span>
+        <button id="modal-close" class="btn ghost small">关闭</button>
+      </div>
+      <pre id="modal-body" class="code scroll"></pre>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+  <script src="/app.js"></script>
+</body>
+</html>
