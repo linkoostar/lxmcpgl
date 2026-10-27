@@ -140,6 +140,40 @@ class LingxingMetaAdapter implements UpstreamAdapter {
   }
 }
 
+/**
+ * 空壳检测：解析 content 里的 JSON，判断是否关键字段全 null 但 isError=false
+ * 返回警告字符串（null = 正常）
+ * 西柚等上游在参数合法但数据确实不存在时，返回 {asin:'xxx', title:null, price:null, ...}
+ * Agent 会误判为"该商品没数据"，我们加个 __gateway_warn 提示
+ */
+function detectEmptyShell(content: Array<{ type: string; text?: string }>, toolId: string): string | null {
+  try {
+    const text = content.find((c) => c.type === 'text')?.text;
+    if (!text) return null;
+    const parsed = JSON.parse(text);
+    const candidates: unknown[] = [];
+    if (parsed && typeof parsed === 'object') {
+      if (Array.isArray(parsed)) { if (parsed.length > 0) candidates.push(parsed[0]); }
+      else {
+        candidates.push(parsed);
+        if (parsed.data) candidates.push(parsed.data);
+        if (Array.isArray(parsed.data) && parsed.data.length > 0) candidates.push(parsed.data[0]);
+      }
+    }
+    for (const cand of candidates) {
+      if (!cand || typeof cand !== 'object' || Array.isArray(cand)) continue;
+      const obj = cand as Record<string, unknown>;
+      const keys = Object.keys(obj).filter((k) => !['asin', 'asins', 'sku', 'keyword', 'seller_id'].includes(k));
+      if (keys.length < 3) continue;
+      const nullCount = keys.filter((k) => obj[k] === null || obj[k] === undefined || obj[k] === '').length;
+      if (nullCount / keys.length >= 0.85) {
+        return `⚠️ 上游返回疑似空壳数据（${nullCount}/${keys.length} 字段为 null），工具: ${toolId}`;
+      }
+    }
+  } catch { /* 非 JSON */ }
+  return null;
+}
+
 // =====================================================
 // Adapter 2: FlatMcpAdapter — 标准扁平 MCP
 //   Sif / 西柚 / 卖家精灵 等直接暴露业务工具
@@ -172,7 +206,13 @@ class FlatMcpAdapter implements UpstreamAdapter {
     if (!resp?.result?.content) {
       return { content: [{ type: 'text', text: JSON.stringify({ error: resp?.error ?? '上游无响应' }) }], isError: true };
     }
-    return { content: resp.result.content, isError: resp.result.isError };
+    const content = resp.result.content;
+    // 空壳检测：某些上游返回 isError=false 但关键字段全 null
+    const warn = detectEmptyShell(content, toolId);
+    if (warn) {
+      content.push({ type: 'text', text: JSON.stringify({ __gateway_warn: warn }) });
+    }
+    return { content, isError: resp.result.isError };
   }
 
   extractShopRefs(args: Record<string, unknown>): string[] {
