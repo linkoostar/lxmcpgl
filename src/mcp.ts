@@ -17,6 +17,8 @@ import {
 } from './db.js';
 import { getUpstreamClient } from './upstream.js';
 import { refreshToolSchema } from './sync.js';
+import { createHash, randomUUID } from 'node:crypto';
+import { config } from './config.js';
 
 /**
  * 下游 MCP 端点（无状态 streamableHttp）：
@@ -90,8 +92,124 @@ function safeParseSchema(s: string | null): Record<string, unknown> {
   return { type: 'object', properties: {} };
 }
 
-function errorResult(message: string) {
-  return { content: [{ type: 'text' as const, text: message }], isError: true };
+/**
+ * 工具定义版本哈希：只依赖 active upstream 的 (upstream, tool_id, updated_at, schema)。
+ * 客户端缓存 tools/list 后，可通过该 hash 判断定义是否变化。
+ */
+function toolsHashOf(activeUpstreams: Array<{ id: string }>): string {
+  const ids = activeUpstreams.map((u) => u.id);
+  if (ids.length === 0) return '';
+  const ph = ids.map(() => '?').join(',');
+  const rows = db
+    .prepare(
+      `SELECT upstream, tool_id, updated_at, input_schema FROM tools
+       WHERE enabled = 1 AND upstream IN (${ph}) ORDER BY upstream, tool_id`
+    )
+    .all(...ids) as Array<{ upstream: string; tool_id: string; updated_at: string | null; input_schema: string | null }>;
+  return createHash('sha256')
+    .update(rows.map((r) => `${r.upstream}\u0000${r.tool_id}\u0000${r.updated_at ?? ''}\u0000${r.input_schema ?? ''}`).join('\u0001'))
+    .digest('hex')
+    .slice(0, 16);
+}
+
+function errorResult(message: string, extra: Record<string, unknown> = {}) {
+  // 统一错误信封：{ error: { code, type, message, upstream, tool, upstream_code, trace_id, field, expected, got } }
+  const body: Record<string, unknown> = {
+    code: extra.type === 'invalid_params' ? -32602 : -32000,
+    type: extra.type ?? 'gateway_error',
+    message,
+    ...extra,
+  };
+  for (const k of Object.keys(body)) if (body[k] === undefined) delete body[k];
+  return { content: [{ type: 'text' as const, text: JSON.stringify({ error: body }) }], isError: true };
+}
+
+// ---------- 参数预校验（按 tools/list 公示的 schema，保守策略） ----------
+
+interface ValidationIssue {
+  field: string;
+  expected: string;
+  got: string;
+  message: string;
+}
+
+/** ID 类字段：上游常见「字符串逗号分隔」与「数组」两种约定，不做类型拦截 */
+const FLEX_FIELD_RE =
+  /(^|_)(id|ids|sid|sids|asin|asins|sku|skus|fid|fids|pid|pids|seller_id|seller_ids|profile_id|profile_ids|account_id|account_ids|shop_id|shop_ids|store_id|store_ids|pvi_ids)($|_)/i;
+
+function jsonTypeName(v: unknown): string {
+  if (v === null) return 'null';
+  if (Array.isArray(v)) return 'array';
+  return typeof v;
+}
+
+function typeLabel(t: unknown): string {
+  if (Array.isArray(t)) return t.map(String).join('|');
+  return String(t ?? 'unknown');
+}
+
+function matchesSchemaType(v: unknown, t: string): boolean {
+  switch (t) {
+    case 'integer': return typeof v === 'number' && Number.isInteger(v);
+    case 'number': return typeof v === 'number';
+    case 'string': return typeof v === 'string';
+    case 'boolean': return typeof v === 'boolean';
+    case 'array': return Array.isArray(v);
+    case 'object': return v !== null && typeof v === 'object' && !Array.isArray(v);
+    case 'null': return v === null;
+    default: return true; // 未知类型不拦
+  }
+}
+
+/**
+ * 保守校验：必填 + 枚举 + 明确的基础类型。
+ * 故意不做 anyOf/oneOf/$ref/additionalProperties 校验，避免按上游错误的 schema 误拦。
+ */
+function validateArgs(schema: Record<string, unknown>, args: Record<string, unknown>): ValidationIssue | null {
+  const required = Array.isArray(schema.required) ? (schema.required as unknown[]).map(String) : [];
+  for (const f of required) {
+    if (!(f in args) || args[f] === undefined) {
+      return { field: f, expected: '必填', got: 'undefined', message: `缺少必填参数 ${f}` };
+    }
+  }
+  const props =
+    schema.properties && typeof schema.properties === 'object' && !Array.isArray(schema.properties)
+      ? (schema.properties as Record<string, any>)
+      : {};
+  for (const [k, v] of Object.entries(args)) {
+    if (v === undefined) continue;
+    const ps = props[k];
+    if (!ps || typeof ps !== 'object') continue;
+    // 复合 schema 无法可靠判断，跳过
+    if (ps.anyOf || ps.oneOf || ps.allOf || ps.$ref) continue;
+    if (Array.isArray(ps.enum) && ps.enum.length > 0) {
+      const hit = ps.enum.some((e: unknown) => JSON.stringify(e) === JSON.stringify(v));
+      if (!hit) {
+        return {
+          field: k,
+          expected: `枚举 ${ps.enum.map((x: unknown) => JSON.stringify(x)).join('|')}`,
+          got: `${jsonTypeName(v)} ${JSON.stringify(v)?.slice(0, 60)}`,
+          message: `参数 ${k} 取值不在允许范围`,
+        };
+      }
+    }
+    // ID 类字段放宽（string 与 array 都放行）
+    if (FLEX_FIELD_RE.test(k)) continue;
+    const t = ps.type;
+    if (!t) continue;
+    const ok = Array.isArray(t)
+      ? t.some((x: unknown) => matchesSchemaType(v, String(x)))
+      : matchesSchemaType(v, String(t));
+    if (!ok) {
+      return {
+        field: k,
+        expected: typeLabel(t),
+        got: jsonTypeName(v),
+        message: `参数 ${k} 类型应为 ${typeLabel(t)}，实际为 ${jsonTypeName(v)}`,
+      };
+    }
+  }
+  return null;
 }
 
 // ---------- 限流（每用户滑动窗口） ----------
@@ -296,16 +414,18 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
   const serverDesc = `方中 MCP 网关，聚合 ${upstreams.length} 个上游 · ${totalTools} 工具：${upstreamDesc}`;
 
   const server = new Server(
-    { name: 'fangzhong-mcp-gateway', version: '1.0.0', description: serverDesc },
+    { name: 'fangzhong-mcp-gateway', version: config.version, description: serverDesc },
     { capabilities: { tools: { listChanged: false } } }
   );
 
-  // 覆盖 SDK 默认的 initialize handler — 返回动态 serverInfo
+  // 覆盖 SDK 默认的 initialize handler — 返回动态 serverInfo + instructions
   server.setRequestHandler(InitializeRequestSchema, async () => ({
     protocolVersion: '2025-03-26',
     capabilities: { tools: { listChanged: false } },
-    serverInfo: { name: '方中 MCP 网关', version: '1.0.0' },
-    _meta: undefined,
+    serverInfo: { name: '方中 MCP 网关', version: config.version },
+    // MCP 标准字段：客户端会把这段说明带给模型，用于判断该网关能提供哪些数据域
+    instructions: serverDesc,
+    _meta: { tools_hash: toolsHashOf(upstreams) },
   }));
 
   server.setRequestHandler(ListToolsRequestSchema, async () => {
@@ -313,11 +433,11 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
     const activeUpIds = upstreams.map((u) => u.id);
     const upMap = new Map(upstreams.map((u) => [u.id, { name: u.name, notes: u.notes }]));
 
-    let rows: Array<{ upstream: string; tool_id: string; exposed_name: string; name: string; description: string; input_schema: string | null }>;
+    let rows: Array<{ upstream: string; tool_id: string; exposed_name: string; name: string; description: string; input_schema: string | null; updated_at: string | null }>;
     if (identity.kind === 'admin') {
       // admin 也只看「启用中且归属 active upstream」的工具，停用上游的历史工具不该被下游看到
       rows = db
-        .prepare(`SELECT t.upstream, t.tool_id, t.exposed_name, t.name, t.description, t.input_schema
+        .prepare(`SELECT t.upstream, t.tool_id, t.exposed_name, t.name, t.description, t.input_schema, t.updated_at
                   FROM tools t
                   JOIN upstreams u ON u.id = t.upstream
                   WHERE t.enabled = 1 AND u.active = 1
@@ -331,7 +451,7 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
       const placeholders = scope.ids.map(() => '?').join(',');
       const all = db
         .prepare(
-          `SELECT upstream, tool_id, exposed_name, name, description, input_schema FROM tools
+          `SELECT upstream, tool_id, exposed_name, name, description, input_schema, updated_at FROM tools
            WHERE enabled = 1 AND upstream IN (${placeholders}) ORDER BY upstream, tool_id`
         )
         .all(...scope.ids) as any[];
@@ -368,7 +488,14 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
           _upstream_desc: upstreamDesc,
         };
       }),
-    };
+      // 定义版本信息：客户端可据此判断缓存是否过期（listChanged=false 时不推送变更）
+      _meta: {
+        tools_hash: toolsHashOf(upstreams),
+        tools_count: rows.length,
+        synced_at: rows.reduce<string | null>((acc, r) => (r.updated_at && (!acc || r.updated_at > acc) ? r.updated_at : acc), null),
+        gateway_version: config.version,
+      },
+    } as any;
   });
 
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
@@ -426,7 +553,7 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
 
     // 只在调用者可见的 upstream 范围内按暴露名解析工具（防止跨上游越权）
     const tool = getToolByExposedName(name, scope.ids);
-    if (!tool || !tool.enabled) { logOutcome(false, true, '工具不存在或未启用'); return errorResult(`工具不存在或未启用: ${name}`); }
+    if (!tool || !tool.enabled) { logOutcome(false, true, '工具不存在或未启用'); return errorResult(`工具不存在或未启用: ${name}`, { type: 'tool_not_found', tool: name }); }
     logCtx.toolId = tool.tool_id;
     logCtx.toolType = tool.tool_type;
     logCtx.upstream = tool.upstream ?? ''; // 后续所有 logOutcome 都写正确的 upstream
@@ -436,14 +563,30 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
       const allowed = getUserToolIds(identity.id);
       if (!allowed.includes(tool.tool_id)) {
         logOutcome(false, true, '无权使用该工具');
-        return errorResult(`无权使用该工具: ${name}`);
+        return errorResult(`无权使用该工具: ${name}`, { type: 'permission_denied', upstream: tool.upstream, tool: name });
       }
     }
 
     // write 工具管控
     if (identity.kind === 'user' && tool.tool_type === 'write' && getSetting('block_write') === '1') {
       logOutcome(false, true, 'block_write 禁止写操作');
-      return errorResult(`该工具为写操作，已被网关禁用: ${name}`);
+      return errorResult(`该工具为写操作，已被网关禁用: ${name}`, { type: 'permission_denied', upstream: tool.upstream, tool: name });
+    }
+
+    // ---- 参数预校验 ----
+    // 上游（尤其领星）会把所有参数问题压缩成 code:102，调用方无法定位字段。
+    // 网关按 tools/list 公示的 schema 先做保守校验，直接返回字段路径。
+    const validationIssue = validateArgs(safeParseSchema(tool.input_schema), args);
+    if (validationIssue) {
+      logOutcome(false, true, `参数校验失败: ${validationIssue.message}`);
+      return errorResult(`参数校验失败: ${validationIssue.message}`, {
+        type: 'invalid_params',
+        upstream: tool.upstream,
+        tool: name,
+        field: validationIssue.field,
+        expected: validationIssue.expected,
+        got: validationIssue.got,
+      });
     }
 
     // 店铺级校验（仅对运营用户生效）
@@ -478,7 +621,13 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
       }
       if (denied.length > 0) {
         logOutcome(false, true, `无权访问店铺: ${denied.join(',')}`);
-        return errorResult(`无权访问以下店铺: ${denied.join(', ')}`);
+        return errorResult(`无权访问以下店铺: ${denied.join(', ')}`, {
+          type: 'permission_denied',
+          upstream: tool.upstream,
+          tool: name,
+          field: 'shop',
+          denied,
+        });
       }
     }
 
@@ -521,11 +670,46 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
         ).run(upId, identity.kind === 'user' ? identity.id : null, tool.exposed_name, tool.tool_id, cost, duration, new Date().toISOString());
       }
 
-      if (callResult.isError) {
-        const msg = callResult.content?.[0]?.text?.slice(0, 500) ?? '上游返回错误';
-        console.error(`[mcp] ${caller} ${name} 上游错误 (${duration}ms): ${msg.slice(0, 200)}`);
-        logOutcome(false, true, msg);
-        return errorResult(`上游错误: ${msg.slice(0, 200)}`);
+      // ---- 统一错误信封：保留上游原始 code / traceId，便于定位 ----
+      if (callResult.isError || callResult.upstreamError) {
+        const ue = callResult.upstreamError;
+        let parsed: any = null;
+        const text = callResult.content?.find((c) => c.type === 'text')?.text;
+        if (!ue && text) {
+          try {
+            parsed = JSON.parse(text);
+          } catch {
+            /* 非 JSON，保留原文 */
+          }
+        }
+        const rawCode = ue?.code ?? parsed?.code ?? parsed?.error?.code ?? null;
+        const traceId =
+          ue?.trace_id ??
+          parsed?.traceId ??
+          parsed?.trace_id ??
+          parsed?.data?.traceId ??
+          parsed?.data?.trace_id ??
+          parsed?.error?.data?.traceId ??
+          null;
+        const rawMsg =
+          ue?.message ??
+          parsed?.message ??
+          parsed?.error?.message ??
+          text ??
+          '上游返回错误';
+        const msg = String(rawMsg).slice(0, 500);
+        console.error(
+          `[mcp] ${caller} ${name} 上游错误 (${duration}ms) code=${String(rawCode)} trace=${String(traceId)}: ${msg.slice(0, 200)}`
+        );
+        logOutcome(false, true, `[${upId}] code=${String(rawCode)} ${msg}`.slice(0, 400));
+        return errorResult(`上游返回错误: ${msg}`, {
+          type: 'upstream_error',
+          upstream: upId,
+          tool: name,
+          upstream_code: rawCode,
+          trace_id: traceId,
+          raw: parsed?.data ?? undefined,
+        });
       }
       const content = callResult.content;
       console.log(`[mcp] ${caller} ${name} ok ${duration}ms upstream=${identity.upstream}`);
@@ -544,9 +728,14 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
       return errorResult('上游返回为空');
     } catch (e: any) {
       const msg = String(e?.message || e).slice(0, 500);
-      console.error(`[mcp] ${caller} ${name} 调用失败: ${msg.slice(0, 300)} upstream=${identity.upstream}`);
-      logOutcome(false, true, msg);
-      return errorResult(`调用失败: ${msg}`);
+      const timedOut = /timeout|timed out|aborted/i.test(msg);
+      console.error(`[mcp] ${caller} ${name} 调用失败: ${msg.slice(0, 300)} upstream=${upId}`);
+      logOutcome(false, true, `[${upId}] ${msg}`.slice(0, 400));
+      return errorResult(`调用上游失败: ${msg}`, {
+        type: timedOut ? 'upstream_timeout' : 'upstream_unavailable',
+        upstream: upId,
+        tool: name,
+      });
     }
   });
 

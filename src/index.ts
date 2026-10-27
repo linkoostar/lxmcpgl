@@ -4,6 +4,7 @@ import { config } from './config.js';
 import { initDb, getSetting, sha256, getUserByKeyHash, type UserRow } from './db.js';
 import { apiRouter, apiErrorHandler } from './web.js';
 import { handleMcpRequest, identityFromUser, type McpIdentity } from './mcp.js';
+import { buildHealth } from './health.js';
 import type { Request, Response, NextFunction } from 'express';
 
 // 代理环境支持（沙箱/内网出口场景），NAS 部署无代理时无副作用
@@ -76,6 +77,35 @@ async function main(): Promise<void> {
         res.status(500).json({ jsonrpc: '2.0', error: { code: -32603, message: 'Internal error' }, id: null });
       }
     });
+  });
+
+  // 真实健康检查 / 版本端点。
+  // 以前这些路径都落到下面的 SPA 兜底，返回 200 + HTML，无法判断更新是否生效。
+  app.get(['/health', '/healthz', '/readyz', '/status'], async (req, res) => {
+    const probe = String(req.query.probe ?? '') === '1';
+    const payload = await buildHealth({ probe });
+    const healthy = payload.ok && (req.path !== '/readyz' || payload.db.ok);
+    res.status(healthy ? 200 : 503).json(payload);
+  });
+
+  app.get('/livez', (_req, res) => {
+    res.json({ ok: true, uptime_s: Math.round(process.uptime()) });
+  });
+
+  app.get('/version', (_req, res) => {
+    res.json({
+      service: 'fangzhong-mcp-gateway',
+      version: config.version,
+      commit: config.commit || null,
+      build_time: config.buildTime || null,
+      started_at: new Date(Date.now() - Math.round(process.uptime() * 1000)).toISOString(),
+      uptime_s: Math.round(process.uptime()),
+    });
+  });
+
+  // 明确告知未实现，避免被 SPA 兜底成 200 HTML 造成误判
+  app.get('/metrics', (_req, res) => {
+    res.status(404).json({ error: 'not_implemented', hint: '请使用 /health 或 /api/health' });
   });
 
   app.use(express.static(config.publicDir));

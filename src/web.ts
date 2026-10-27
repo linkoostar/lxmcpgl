@@ -36,6 +36,7 @@ import { config, META_TOOLS } from './config.js';
 import { getUpstreamClient, resetUpstreamClient, UpstreamError } from './upstream.js';
 import { syncTools, syncUpstreamById, isSyncing, listTools, batchSetEnabled, syncAllUpstreams } from './sync.js';
 import { getAdapter } from './adapter.js';
+import { buildHealth } from './health.js';
 
 const COOKIE_NAME = 'lx_session';
 const SESSION_TTL_MS = 12 * 3600 * 1000;
@@ -111,9 +112,15 @@ function maskKey(key: string): string {
 
 export const apiRouter = express.Router();
 
-apiRouter.get('/health', (_req, res) => {
-  res.json({ ok: true, version: config.version });
-});
+apiRouter.get(
+  '/health',
+  wrap(async (req, res) => {
+    // probe=1 时才主动探活上游（结果缓存 60s），默认只读本地状态，保证 Docker HEALTHCHECK 足够快
+    const probe = String(req.query.probe ?? '') === '1';
+    const payload = await buildHealth({ probe });
+    res.status(payload.ok ? 200 : 503).json(payload);
+  })
+);
 
 apiRouter.post(
   '/login',

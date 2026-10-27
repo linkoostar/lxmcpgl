@@ -33,10 +33,19 @@ export interface StandardTool {
   tool_type?: 'read' | 'write' | 'other';
 }
 
+/** 上游返回的结构化错误（保留原始 code / traceId，供统一错误信封使用） */
+export interface UpstreamErrorInfo {
+  code?: number | string;
+  message: string;
+  trace_id?: string;
+  raw?: unknown;
+}
+
 /** MCP tools/call 的返回（标准化 content） */
 export interface McpCallResult {
   content: Array<{ type: string; text?: string }>;
   isError?: boolean;
+  upstreamError?: UpstreamErrorInfo;
 }
 
 /** Adapter 接口 — 所有上游必须实现 */
@@ -75,6 +84,16 @@ export interface UpstreamAdapter {
 
   /** 可选：同步 shop 列表（供 shops 表） */
   listShopIds?(config: UpstreamConfig): Promise<Array<{ sid: string; name?: string; country?: string; seller_id?: string }>>;
+
+  /** 可选：轻量探活（健康检查用），不抛错，返回是否连通 */
+  probe?(config: UpstreamConfig): Promise<boolean>;
+}
+
+/** 从上游错误对象里尽量挖出 traceId / requestId */
+function pickTraceId(obj: any): string | undefined {
+  if (!obj) return undefined;
+  const d = obj.data ?? obj;
+  return d?.traceId ?? d?.trace_id ?? d?.requestId ?? d?.request_id ?? obj?.traceId;
 }
 
 // =====================================================
@@ -114,10 +133,33 @@ class LingxingMetaAdapter implements UpstreamAdapter {
     const { getUpstreamClient } = await import('./upstream.js');
     const client = getUpstreamClient(config.url, config.api_key ?? '');
     const resp = await client.callTool('action', { toolId, params: args });
+    if (resp?.error) {
+      return {
+        content: [],
+        isError: true,
+        upstreamError: {
+          code: resp.error.code,
+          message: resp.error.message ?? '上游返回错误',
+          trace_id: pickTraceId(resp.error),
+          raw: resp.error,
+        },
+      };
+    }
     if (!resp?.result?.content) {
-      return { content: [{ type: 'text', text: JSON.stringify({ error: resp?.error ?? '上游无响应' }) }], isError: true };
+      return { content: [], isError: true, upstreamError: { message: '上游无响应' } };
     }
     return { content: resp.result.content, isError: resp.result.isError };
+  }
+
+  async probe(config: UpstreamConfig): Promise<boolean> {
+    try {
+      const { getUpstreamClient } = await import('./upstream.js');
+      const client = getUpstreamClient(config.url, config.api_key ?? '');
+      await client.ensureInit();
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   extractShopRefs(args: Record<string, unknown>): string[] {
@@ -203,8 +245,20 @@ class FlatMcpAdapter implements UpstreamAdapter {
     const client = this.getOrCreateClient(config);
     await client.initialize();
     const resp = await client.callTool(toolId, args);
+    if (resp?.error) {
+      return {
+        content: [],
+        isError: true,
+        upstreamError: {
+          code: resp.error.code,
+          message: resp.error.message ?? '上游返回错误',
+          trace_id: pickTraceId(resp.error),
+          raw: resp.error,
+        },
+      };
+    }
     if (!resp?.result?.content) {
-      return { content: [{ type: 'text', text: JSON.stringify({ error: resp?.error ?? '上游无响应' }) }], isError: true };
+      return { content: [], isError: true, upstreamError: { message: '上游无响应' } };
     }
     const content = resp.result.content;
     // 空壳检测：某些上游返回 isError=false 但关键字段全 null
@@ -213,6 +267,16 @@ class FlatMcpAdapter implements UpstreamAdapter {
       content.push({ type: 'text', text: JSON.stringify({ __gateway_warn: warn }) });
     }
     return { content, isError: resp.result.isError };
+  }
+
+  async probe(config: UpstreamConfig): Promise<boolean> {
+    try {
+      const client = this.getOrCreateClient(config);
+      await client.initialize();
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   extractShopRefs(args: Record<string, unknown>): string[] {
@@ -322,9 +386,8 @@ class FlatMcpClient {
   }
 
   async callTool(name: string, args: Record<string, unknown>): Promise<any> {
-    const resp = await this.rpc('tools/call', { name, arguments: args });
-    if (resp.error) throw new Error(`callTool error: ${resp.error.message}`);
-    return resp;
+    // 不在这里抛错：把 JSON-RPC error 原样返回，交给 adapter 归一化（保留 code/traceId）
+    return this.rpc('tools/call', { name, arguments: args });
   }
 }
 

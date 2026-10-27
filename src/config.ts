@@ -10,6 +10,9 @@ export const config = {
   upstreamUrlEnv: process.env.LINGXING_MCP_URL || '',
   upstreamKeyEnv: process.env.LINGXING_MCP_KEY || '',
   version: '1.0.0',
+  // 构建信息：由 CI/Docker build-arg 注入，用于确认「更新是否真正生效」
+  commit: process.env.GIT_SHA || '',
+  buildTime: process.env.BUILD_TIME || '',
 };
 
 export const DEFAULT_UPSTREAM_URL = 'https://openmcp.lingxing.com/mcp-servers/lingxing-mcp';

@@ -8,7 +8,9 @@ RUN npm run build && npm prune --omit=dev
 
 FROM node:22-bookworm-slim
 WORKDIR /app
-ENV NODE_ENV=production PORT=8080 DATA_DIR=/app/data
+ARG GIT_SHA=""
+ARG BUILD_TIME=""
+ENV NODE_ENV=production PORT=8080 DATA_DIR=/app/data GIT_SHA=${GIT_SHA} BUILD_TIME=${BUILD_TIME}
 COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/package.json ./package.json
