@@ -85,6 +85,7 @@ table { width: 100%; border-collapse: collapse; }
 .tool-table { table-layout: fixed; }
 .tool-table th:nth-child(3), .tool-table td:nth-child(3) { /* 名称/描述列占剩余空间 */ width: auto; }
 .tool-table td code { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 180px; }
+.tool-table td:last-child { white-space: nowrap; }
 th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
 th { font-size: 12px; color: var(--muted); font-weight: 600; background: #fafbfc; position: sticky; top: 0; }
 tbody tr:hover { background: #f8faff; }
@@ -130,8 +131,10 @@ td .desc { color: var(--muted); font-size: 12px; display: block;
 .perm-item {
   font-size: 12px; padding: 1px 2px; cursor: pointer; display: flex;
   align-items: center; gap: 4px; overflow: hidden; text-overflow: ellipsis;
-  white-space: nowrap; height: 22px;
+  white-space: nowrap; height: 22px; justify-content: flex-start;
 }
+.perm-item input[type="checkbox"] { flex-shrink: 0; margin: 0; }
+.perm-item label, .perm-item span.text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .perm-item:hover { background: #eef3ff; border-radius: 3px; }
 
 /* 批量操作条 */
