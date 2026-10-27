@@ -420,6 +420,7 @@ permState.updateSummary = updatePermSummary;
 async function openUserPerm(u) {
   const detail = await api('/users/' + u.id);
   permState.mode = 'user';
+  document.getElementById('perm-upstream-section').style.display = '';
   permState.userId = u.id;
   permState.allTools = detail.all_tools;
   permState.toolIds = new Set(detail.tool_ids);
@@ -439,6 +440,7 @@ async function openUserPerm(u) {
   document.querySelector('input[name="perm-tools"][value="custom"]').checked = !detail.all_tools;
   document.querySelector('input[name="perm-shops"][value="all"]').checked = detail.all_shops;
   document.querySelector('input[name="perm-shops"][value="custom"]').checked = !detail.all_shops;
+  $('#perm-upstream').value = detail.upstream || '';
 
   $('#user-modal-save').textContent = '保存权限';
   updatePermSummary();
@@ -448,6 +450,7 @@ async function openUserPerm(u) {
 async function openTemplateEditor() {
   const s = await api('/settings');
   permState.mode = 'template';
+  document.getElementById('perm-upstream-section').style.display = 'none';
   permState.userId = null;
   permState.allTools = !!s.default_tools_all;
   permState.toolIds = new Set(s.default_tools);
@@ -589,6 +592,7 @@ $('#user-modal-save').addEventListener('click', async () => {
       tool_ids: [...permState.toolIds],
       all_shops: document.querySelector('input[name="perm-shops"][value="all"]').checked,
       shop_ids: [...permState.shopIds],
+      upstream: $('#perm-upstream').value.trim(),
     };
     if (permState.mode === 'template') {
       await api('/settings', {
