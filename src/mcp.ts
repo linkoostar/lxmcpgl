@@ -302,7 +302,7 @@ const SHOP_ID_KEYS = new Set([
   'shop_sids',
 ]);
 
-/** 从一个对象里抽取所有店铺标识 */
+/** 从一个对象里抽取店铺标识（只认明确的店铺字段，避免把商品/活动自身的 id 误判成店铺） */
 function extractShopIdsFromObj(obj: Record<string, unknown>): string[] {
   const out: string[] = [];
   for (const [k, v] of Object.entries(obj)) {
@@ -311,58 +311,67 @@ function extractShopIdsFromObj(obj: Record<string, unknown>): string[] {
       if (Array.isArray(v)) out.push(...v.map(String));
       else out.push(String(v));
     }
-    // 领星的 get_my_sids 返回里 id 字段也常是店铺 id（country_code + name 一起出现时判定）
-    if ((key === 'id' || key === 'shop_id') && typeof v !== 'object') {
-      // 保守：仅当对象里同时出现 name / country_code 时把 id 当作店铺标识
-      if ('name' in obj || 'country_code' in obj) out.push(String(v));
+    // 领星的 get_my_sids 用 id 表示店铺 id：仅当同一对象里出现 country_code 时才认定
+    if (key === 'id' && typeof v !== 'object' && v !== null && 'country_code' in obj) {
+      out.push(String(v));
     }
   }
   return out;
 }
 
+/** 只有店铺维度上游（领星元工具模式）的响应才有「按店铺隔离」的语义 */
+function isShopScopedUpstream(upstreamId: string): boolean {
+  if (!upstreamId) return false;
+  const row = db.prepare('SELECT adapter FROM upstreams WHERE id = ?').get(upstreamId) as { adapter?: string } | undefined;
+  return row?.adapter === 'lingxing-meta';
+}
+
+interface ShopFilterStat {
+  removed: number;
+}
+
 /**
- * 店铺白名单过滤（fail-closed）。
- * - 数组元素若能提取到店铺标识（sid / shop_id / seller_id / country_code+name），命中白名单才放行
- * - 元素没有任何店铺标识 → 过滤掉（不确定归属，宁可漏也不越权）
- * - 整个数组所有元素都没有店铺标识 → 返回空数组（上游可能返回了非店铺维度/汇总数据）
+ * 店铺白名单裁剪：只删除「明确属于其他店铺」的行。
+ * - 行内带 sid / shop_id / store_id 等店铺标识且全部不在白名单 → 删除并计数
+ * - 行内没有任何店铺标识（汇总行、或无店铺维度的数据）→ 保留，不做猜测
+ *
+ * 历史教训：之前的 fail-closed 版本会把「整段没有店铺标识的主结果集」清空，
+ * 导致上游明明返回了数据，下游却看到空数组 + 总数正确，属于静默丢数据。
  */
-function filterShopListInNode(node: unknown, allowedShops: Set<string>, depth = 0): unknown {
+function filterShopListInNode(node: unknown, allowedShops: Set<string>, stat: ShopFilterStat): unknown {
   if (Array.isArray(node)) {
-    // 只对浅数组（depth<=2）应用店铺识别，深层数组如 seller 历史列表等交给上层判断
-    if (depth <= 2 && node.length > 0 && node[0] && typeof node[0] === 'object' && !Array.isArray(node[0])) {
-      let anyHasShops = false;
-      const filtered = node.filter((item) => {
+    const out: unknown[] = [];
+    for (const item of node) {
+      if (item && typeof item === 'object' && !Array.isArray(item)) {
         const ids = extractShopIdsFromObj(item as Record<string, unknown>);
-        if (ids.length === 0) return false; // fail-closed：无店铺标识则丢弃
-        anyHasShops = true;
-        return ids.some((id) => allowedShops.has(id));
-      });
-      // 如果整条数组没有任何元素含店铺标识，说明这可能是非店铺维度的汇总数据
-      // 也可能是工具本身不返回店铺字段（如 ABA 搜索词），两种情况都按空处理以避免越权
-      return anyHasShops ? filtered : [];
+        if (ids.length > 0 && !ids.some((id) => allowedShops.has(id))) {
+          stat.removed += 1;
+          continue; // 明确属于未授权店铺，剔除
+        }
+      }
+      out.push(filterShopListInNode(item, allowedShops, stat));
     }
-    // 深层数组或原始值数组（如字符串），递归各元素
-    return node.map((x) => filterShopListInNode(x, allowedShops, depth + 1));
+    return out;
   }
   if (node && typeof node === 'object') {
     const out: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
-      out[k] = filterShopListInNode(v, allowedShops, depth + 1);
+      out[k] = filterShopListInNode(v, allowedShops, stat);
     }
     return out;
   }
   return node;
 }
 
-/** 对 MCP content 数组应用店铺白名单过滤。就地修改并返回新 content */
-function filterContentByShops(content: unknown, allowedShops: Set<string>): unknown {
+/** 对 MCP content 数组应用店铺白名单裁剪，返回新 content 与裁剪统计 */
+function filterContentByShops(content: unknown, allowedShops: Set<string>, stat: ShopFilterStat): unknown {
   if (!Array.isArray(content)) return content;
   return content.map((part: any) => {
     if (!part || typeof part !== 'object') return part;
     if (typeof part.text !== 'string') return part;
     try {
       const parsed = JSON.parse(part.text);
-      const filtered = filterShopListInNode(parsed, allowedShops);
+      const filtered = filterShopListInNode(parsed, allowedShops, stat);
       return { ...part, text: JSON.stringify(filtered) };
     } catch {
       return part; // 非 JSON 文本原样返回
@@ -589,10 +598,9 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
       });
     }
 
-    // 店铺级校验（仅对运营用户生效）
-    // shop sid 白名单（sid / store_id / shop_id）—— 直接比对
-    // seller_id 校验 —— 查 shops 表：这个 seller_id 关联的 shop sid 是否在白名单里
-    if (identity.kind === 'user' && !identity.all_shops && shopRefs.length > 0) {
+    // 店铺级校验（仅对运营用户 + 店铺维度上游生效）
+    // 非店铺维度上游（西柚/NocoDB 等）的参数里即使出现 seller_id 之类字段，也与 shops 白名单无关
+    if (identity.kind === 'user' && !identity.all_shops && shopRefs.length > 0 && isShopScopedUpstream(tool.upstream ?? '')) {
       const allowedShopIds = new Set(getUserShopIds(identity.id));
       // 上游所有 seller_id → shop sid 映射（缓存到 handler 内）
       const sellerToSids = new Map<string, Set<string>>();
@@ -715,14 +723,28 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
       console.log(`[mcp] ${caller} ${name} ok ${duration}ms upstream=${identity.upstream}`);
       logOutcome(true, false);
 
-      // 店铺结果过滤
+      // 店铺结果裁剪
+      // 只对「店铺维度上游」生效：西柚/NocoDB 等上游没有店铺维度，结果必须原样返回
       if (Array.isArray(content)) {
-        let filteredContent: unknown = content;
-        if (identity.kind === 'user' && !identity.all_shops) {
+        let filteredContent = content as any[];
+        if (identity.kind === 'user' && !identity.all_shops && isShopScopedUpstream(upId)) {
           const allowedShops = new Set(getUserShopIds(identity.id));
-          filteredContent = filterContentByShops(content, allowedShops);
+          const stat: ShopFilterStat = { removed: 0 };
+          filteredContent = filterContentByShops(content, allowedShops, stat) as any[];
+          if (stat.removed > 0) {
+            console.log(`[mcp] ${caller} ${name} 店铺裁剪 ${stat.removed} 行（allowed=${allowedShops.size}）`);
+            filteredContent = [
+              ...filteredContent,
+              {
+                type: 'text' as const,
+                text: JSON.stringify({
+                  __gateway_warn: `已按店铺权限过滤 ${stat.removed} 行不属于授权店铺的数据；上游的总数字段（total/recordsFiltered）不会随之变化，不能据其判断明细是否完整`,
+                }),
+              },
+            ];
+          }
         }
-        return { content: filteredContent as any[] };
+        return { content: filteredContent };
       }
       logOutcome(false, true, '上游返回为空');
       return errorResult('上游返回为空');
