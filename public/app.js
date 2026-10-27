@@ -295,6 +295,12 @@ async function loadUsers() {
     const td3 = document.createElement('td');
     td3.innerHTML = u.enabled ? '<span class="tag ok">启用</span>' : '<span class="tag no">停用</span>';
 
+    const td3b = document.createElement('td');
+    const upVal = u.upstream || '';
+    td3b.innerHTML = upVal
+      ? `<code style="font-size:12px">${escapeHtml(upVal)}</code>`
+      : `<span class="muted" style="font-size:12px;color:#16a34a">全部上游</span>`;
+
     const td4 = document.createElement('td');
     td4.textContent = u.all_tools ? '全部工具' : `白名单 ${u.tool_count} 个`;
 
@@ -341,11 +347,11 @@ async function loadUsers() {
       }, 'btn small danger')
     );
 
-    tr.append(td1, td2, td3, td4, td5, td6, td7, td8);
+    tr.append(td1, td2, td3, td3b, td4, td5, td6, td7, td8);
     tbody.appendChild(tr);
   }
   if (!data.items.length) {
-    tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--muted);padding:30px">还没有运营用户，右上角添加</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;color:var(--muted);padding:30px">还没有运营用户，右上角添加</td></tr>';
   }
 }
 
@@ -372,12 +378,14 @@ $('#btn-dismiss-new-key').addEventListener('click', () => $('#new-key-tip').clas
 $('#btn-add-user').addEventListener('click', async () => {
   const username = $('#new-user-name').value.trim();
   const rate = parseInt($('#new-user-rate').value, 10) || 0;
+  const upstream = $('#new-user-upstream').value.trim();
   if (!username) { toast('请填写用户名'); return; }
   try {
-    const r = await api('/users', { method: 'POST', body: { username, rate_limit: rate } });
+    const r = await api('/users', { method: 'POST', body: { username, rate_limit: rate, upstream } });
     showNewKey(r.downstream_key, username);
     $('#new-user-name').value = '';
     $('#new-user-rate').value = '';
+    $('#new-user-upstream').value = '';
     await loadUsers();
     // 自动弹权限弹窗，使用新用户的 id
     await ensureToolsCache();

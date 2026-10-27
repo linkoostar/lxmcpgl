@@ -35,12 +35,34 @@ export type McpIdentity =
       all_shops: number;
     };
 
+/** 把 users.upstream 解析成用户可访问的 upstream id 数组
+ *  - '' / NULL / '*' → 空数组表示「全部 active upstream」
+ *  - 'lingxing,xiyou' → ['lingxing', 'xiyou']
+ *  - 'lingxing' → ['lingxing']（旧行为兼容）
+ */
+export function resolveUserUpstreams(raw: string | undefined | null, activeIds: string[]): string[] {
+  const val = (raw ?? '').trim();
+  if (!val || val === '*') return activeIds;
+  const list = val
+    .split(/[,\s]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  // 过滤掉已经不存在或停用的 upstream
+  return list.filter((id) => activeIds.includes(id));
+}
+
+/** 判断 tool.upstream 是否在用户可访问范围里（空范围 = 全部） */
+export function canUseUpstream(userScope: string[], toolUpstream: string): boolean {
+  if (!userScope.length) return true; // 空范围 = 全部
+  return userScope.includes(toolUpstream);
+}
+
 export function identityFromUser(u: UserRow): McpIdentity {
   return {
     kind: 'user',
     id: u.id,
     username: u.username,
-    upstream: u.upstream ?? 'lingxing',
+    upstream: u.upstream ?? '',
     rate_limit: u.rate_limit,
     all_tools: u.all_tools,
     all_shops: u.all_shops,
@@ -275,7 +297,8 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
   }));
 
   server.setRequestHandler(ListToolsRequestSchema, async () => {
-    // 先查 active upstream 列表，用于给每个工具打 tag
+    // 先查 active upstream 列表，用于给每个工具打 tag + 解析用户 upstream 范围
+    const activeUpIds = upstreams.map((u) => u.id);
     const upMap = new Map(upstreams.map((u) => [u.id, { name: u.name, notes: u.notes }]));
 
     let rows: Array<{ upstream: string; exposed_name: string; name: string; description: string; input_schema: string | null }>;
@@ -284,17 +307,22 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
         .prepare('SELECT upstream, exposed_name, name, description, input_schema FROM tools WHERE enabled = 1 ORDER BY upstream, tool_id')
         .all() as any[];
     } else {
-      const up = identity.upstream;
+      // 用户 upstream 范围：空/NULL/'*' = 全部 active，逗号分隔 = 指定子集
+      const userScope = resolveUserUpstreams(identity.upstream, activeUpIds);
+      // 用 IN 查询跨 upstream 拉取
+      const placeholders = userScope.length ? userScope.map(() => '?').join(',') : null;
+      const sqlBase =
+        'SELECT upstream, tool_id, exposed_name, name, description, input_schema FROM tools WHERE enabled = 1';
+      const sql = placeholders ? `${sqlBase} AND upstream IN (${placeholders}) ORDER BY upstream, tool_id`
+                               : `${sqlBase} ORDER BY upstream, tool_id`;
+      const args = placeholders ? userScope : [];
+      const all = db.prepare(sql).all(...args) as any[];
+
       if (!identity.all_tools) {
         const allowed = new Set(getUserToolIds(identity.id));
-        const all = db
-          .prepare('SELECT upstream, tool_id, exposed_name, name, description, input_schema FROM tools WHERE enabled = 1 AND upstream = ? ORDER BY tool_id')
-          .all(up) as any[];
         rows = all.filter((r) => allowed.has(r.tool_id));
       } else {
-        rows = db
-          .prepare('SELECT upstream, exposed_name, name, description, input_schema FROM tools WHERE enabled = 1 AND upstream = ? ORDER BY tool_id')
-          .all(up) as any[];
+        rows = all;
       }
     }
     return {
@@ -425,9 +453,17 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
 
     // ---- 调用上游（按 adapter 路由）----
     const caller = logCtx.caller;
-    // admin 是网关管理员，可调任何 upstream 的工具（按 tool.upstream 路由）
-    // 运营用户只能调自己 upstream 下的工具
-    const upId = identity.kind === 'admin' ? (tool.upstream ?? identity.upstream) : identity.upstream;
+    // 不管 admin 还是运营用户，都按 tool.upstream 路由（list 里已经过滤过权限了）
+    const upId = tool.upstream ?? identity.upstream;
+    // 额外校验：运营用户必须有这个 upstream 权限（防止 tools/call 被绕过）
+    if (identity.kind === 'user') {
+      const activeUpIds = upstreams.map((u) => u.id);
+      const userScope = resolveUserUpstreams(identity.upstream, activeUpIds);
+      if (!canUseUpstream(userScope, upId)) {
+        logOutcome(false, true, `上游 ${upId} 不在用户权限范围`);
+        return errorResult(`无权访问上游 ${upId}`);
+      }
+    }
     const upConfig = db.prepare('SELECT * FROM upstreams WHERE id = ?').get(upId) as any;
     if (!upConfig || !upConfig.active) {
       logOutcome(false, true, `上游 ${upId} 未启用`);

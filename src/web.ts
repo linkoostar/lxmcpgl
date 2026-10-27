@@ -633,6 +633,7 @@ apiRouter.get(
         tool_count: u.all_tools ? null : getUserToolIds(u.id).length,
         all_shops: !!u.all_shops,
         shop_count: u.all_shops ? null : getUserShopIds(u.id).length,
+        upstream: u.upstream ?? '',
         created_at: u.created_at,
         last_used_at: u.last_used_at,
       })),
@@ -663,11 +664,14 @@ apiRouter.post(
       ? (req.body.all_shops ? 1 : 0)
       : (getSetting('default_shops_all') === '1' ? 1 : 0);
 
+    // upstream：逗号分隔，留空 = 全部 active upstream（Agent 常用）
+    const upstream = String(req.body?.upstream ?? '').trim();
+
     const info = db
       .prepare(
-        'INSERT INTO users (username, key_hash, key_prefix, enabled, rate_limit, all_tools, all_shops, created_at, last_used_at) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?)'
+        'INSERT INTO users (username, key_hash, key_prefix, enabled, rate_limit, all_tools, all_shops, upstream, created_at, last_used_at) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?)'
       )
-      .run(username, sha256(key), key.slice(0, 8), rateLimit, toolsAll, shopsAll, new Date().toISOString(), '');
+      .run(username, sha256(key), key.slice(0, 8), rateLimit, toolsAll, shopsAll, upstream, new Date().toISOString(), '');
 
     const newUserId = Number(info.lastInsertRowid);
     // 非全量时设置白名单
@@ -710,6 +714,7 @@ apiRouter.get(
       tool_ids: getUserToolIds(u.id),
       all_shops: !!u.all_shops,
       shop_ids: getUserShopIds(u.id),
+      upstream: u.upstream ?? '',
     });
   })
 );
@@ -748,12 +753,14 @@ apiRouter.put(
         db.prepare('DELETE FROM user_shops WHERE user_id = ?').run(u.id);
       }
     }
-    // tool_ids / shop_ids 显式传了就同步：即使 all_tools=1，允许前端顺带清空也行
     if (Array.isArray(b.tool_ids)) {
       setUserTools(u.id, b.tool_ids.map(String));
     }
     if (Array.isArray(b.shop_ids)) {
       setUserShops(u.id, b.shop_ids.map(String));
+    }
+    if (b.upstream !== undefined) {
+      db.prepare('UPDATE users SET upstream = ? WHERE id = ?').run(String(b.upstream ?? '').trim(), u.id);
     }
     res.json({ ok: true });
   })
