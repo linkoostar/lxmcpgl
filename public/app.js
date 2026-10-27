@@ -483,7 +483,10 @@ function renderPermTools() {
       if (chk.checked) permState.toolIds.add(t.tool_id);
       else permState.toolIds.delete(t.tool_id);
     });
-    label.append(chk, document.createTextNode(`${t.tool_id}（${t.name || ''}）`));
+    const text = document.createElement('span');
+    text.className = 'text';
+    text.textContent = `${t.tool_id}（${t.name || ''}）`;
+    label.append(chk, text);
     list.appendChild(label);
   }
   if (!tools.length) list.innerHTML = '<span class="muted">请先在工具列表页同步工具</span>';
@@ -522,7 +525,10 @@ function renderPermShops() {
       if (chk.checked) permState.shopIds.add(s.sid);
       else permState.shopIds.delete(s.sid);
     });
-    label.append(chk, document.createTextNode(`${s.sid} ${s.name}（${s.country}）`));
+    const st = document.createElement('span');
+    st.className = 'text';
+    st.textContent = `${s.sid} ${s.name}（${s.country}）`;
+    label.append(chk, st);
     list.appendChild(label);
   }
   if (!shops.length) list.innerHTML = '<span class="muted">请先在「系统设置」同步店铺</span>';
