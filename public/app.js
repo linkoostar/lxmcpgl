@@ -459,10 +459,9 @@ async function openUserPerm(u) {
   $('#user-modal-title').textContent = `权限设置：${u.username}`;
   $('#user-modal-tip').textContent = '';
 
-  if (!permState.shopsCache) {
-    const s = await api('/shops');
-    permState.shopsCache = s.items;
-  }
+  // 每次都拉最新 shops（同步店铺后需要刷新缓存）
+  const s = await api('/shops');
+  permState.shopsCache = s.items;
   renderPermTools();
   renderPermShops();
 
@@ -489,10 +488,9 @@ async function openTemplateEditor() {
   $('#user-modal-title').textContent = '默认权限模板（新建运营用户自动继承）';
   $('#user-modal-tip').textContent = '';
 
-  if (!permState.shopsCache) {
-    const shops = await api('/shops');
-    permState.shopsCache = shops.items;
-  }
+  // 每次都拉最新 shops（同步店铺后需要刷新缓存）
+  const shops = await api('/shops');
+  permState.shopsCache = shops.items;
   renderPermTools();
   renderPermShops();
 
@@ -854,7 +852,7 @@ $('#btn-sync-all-up').addEventListener('click', async () => {
   try {
     const r = await api('/upstreams/sync-all', { method: 'POST' });
     const parts = Object.entries(r.results).map(([k, v]) => `${k}: ${v.synced}/${v.total_listed}`);
-    el.textContent = `✅ 共 ${r.totalSynced} 工具（${parts.join(' · ')}）`;
+    el.textContent = `✅ 共 ${r.synced} 工具（${parts.join(' · ')}）`;
     loadSettings().catch(() => {});
   } catch (e) { el.textContent = '❌ ' + e.message; }
 });

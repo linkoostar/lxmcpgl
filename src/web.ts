@@ -665,10 +665,12 @@ apiRouter.post(
           const storeId = s?.store_id ?? s?.storeId;
           const sid = s?.id ?? s?.sid;
           const profileId = s?.profile_id ?? s?.profileId;
+          // ad_auth_shops 返回的店铺名字段是 alias（不是 shop_name / name）
+          const shopName = String(s?.alias ?? s?.shop_name ?? s?.name ?? '');
           if (sid) {
             upsertShop({
               sid: String(sid),
-              name: String(s?.shop_name ?? s?.name ?? ''),
+              name: shopName,
               country: String(s?.country_code ?? s?.country ?? ''),
               seller_id: String(s?.seller_string_id ?? s?.seller_id ?? ''),
               store_id: String(storeId ?? ''),
@@ -677,7 +679,7 @@ apiRouter.post(
           } else if (storeId) {
             upsertShopByStoreId({
               store_id: String(storeId),
-              name: String(s?.shop_name ?? s?.name ?? ''),
+              name: shopName,
               country: String(s?.country_code ?? s?.country ?? ''),
               seller_id: String(s?.seller_string_id ?? s?.seller_id ?? ''),
               profile_id: String(profileId ?? ''),
