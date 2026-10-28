@@ -710,9 +710,24 @@ apiRouter.post(
       if (toolIds.length > 0) setUserTools(newUserId, toolIds);
     }
     if (!shopsAll) {
-      const shopIds = Array.isArray(req.body?.shop_ids)
+      let shopIds = Array.isArray(req.body?.shop_ids)
         ? req.body.shop_ids.map(String)
         : getSettingJSON<string[]>('default_shops', []);
+      // 安全兜底：如果 shopIds 还是空（default_shops 模板也没配），
+      // 自动把 shops 表里已同步的所有店铺塞进去，避免运营账号一上来就全 deny
+      if (shopIds.length === 0) {
+        const allKnown = listShops().map((s) => s.sid);
+        if (allKnown.length > 0) {
+          shopIds = allKnown;
+          console.warn(
+            `[admin] 创建运营用户 ${username} 未指定店铺白名单，自动继承 shops 表 ${allKnown.length} 个店铺`
+          );
+        } else {
+          console.warn(
+            `[admin] 创建运营用户 ${username} 未指定店铺白名单，且 shops 表为空——请先跑 /api/shops/sync 再手动补充 user_shops`
+          );
+        }
+      }
       if (shopIds.length > 0) setUserShops(newUserId, shopIds);
     }
 

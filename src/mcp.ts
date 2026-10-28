@@ -653,7 +653,18 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
     // 店铺级校验（仅对运营用户 + 店铺维度上游生效）
     // 非店铺维度上游（西柚/NocoDB 等）的参数里即使出现 seller_id 之类字段，也与 shops 白名单无关
     if (identity.kind === 'user' && !identity.all_shops && shopRefs.length > 0 && isShopScopedUpstream(tool.upstream ?? '')) {
-      const allowedShopIds = new Set(getUserShopIds(identity.id));
+      let allowedShopIds = new Set(getUserShopIds(identity.id));
+      // 安全兜底：如果 user_shops 表为空（说明创建时既没 all_shops 也没 shop_ids），
+      // 退化到 shops 表里所有已同步的店铺——宁可多放行，不要全 deny
+      if (allowedShopIds.size === 0) {
+        const fallback = db.prepare('SELECT sid FROM shops').all() as Array<{ sid: string }>;
+        allowedShopIds = new Set(fallback.map((r) => r.sid));
+        if (allowedShopIds.size === 0) {
+          console.warn(`[mcp] ${identity.username} user_shops 为空且 shops 表也空——跳过店铺校验`);
+        } else {
+          console.warn(`[mcp] ${identity.username} user_shops 为空，降级放行 shops 表 ${allowedShopIds.size} 个店铺`);
+        }
+      }
       // 上游所有 seller_id → shop sid 映射（缓存到 handler 内）
       const sellerToSids = new Map<string, Set<string>>();
       const sellerRows = db.prepare('SELECT seller_id, sid FROM shops').all() as Array<{ seller_id: string; sid: string }>;
@@ -833,7 +844,11 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
       if (Array.isArray(content)) {
         let filteredContent = content as any[];
         if (identity.kind === 'user' && !identity.all_shops && isShopScopedUpstream(upId)) {
-          const allowedShops = new Set(getUserShopIds(identity.id));
+          let allowedShops = new Set(getUserShopIds(identity.id));
+          if (allowedShops.size === 0) {
+            const fb = db.prepare('SELECT sid FROM shops').all() as Array<{ sid: string }>;
+            allowedShops = new Set(fb.map((r) => r.sid));
+          }
           const stat: ShopFilterStat = { removed: 0 };
           filteredContent = filterContentByShops(content, allowedShops, stat) as any[];
           if (stat.removed > 0) {
