@@ -340,10 +340,10 @@ function seed(): void {
     last_sync_at: '',
     block_write: '0',
     // 默认权限模板 —— 新增运营用户时自动继承
-    // 安全起步：先 all_tools=0 + all_shops=1。工具白名单在 syncTools 首次完成后自动填 read 类。
-    // 管理员随时可以在「系统设置」页改模板。
+    // 安全起步：先 all_tools=0 + all_shops=0（锁死工具和店铺，白名单逐步开放）。
+    // 之前是 default_shops_all=1（全店铺），sync 后运营静默拿到所有店铺数据，严重越权。
     default_tools_all: '0',
-    default_shops_all: '1',
+    default_shops_all: '0',
     default_tools: '[]',
     default_shops: '[]',
   };

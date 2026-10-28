@@ -728,51 +728,77 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
 
     // 店铺级校验（仅对运营用户 + 店铺维度上游生效）
     // 非店铺维度上游（西柚/NocoDB 等）的参数里即使出现 seller_id 之类字段，也与 shops 白名单无关
-    if (identity.kind === 'user' && !identity.all_shops && shopRefs.length > 0 && isShopScopedUpstream(tool.upstream ?? '')) {
-      const allowedShopIds = new Set(getUserShopIds(identity.id));
-      // fail-closed：user_shops 为空 → 配置缺失，明确拒绝调用
-      // （之前的 fail-open 兜底在 sync 灌入全表后会静默放行所有店铺，这是严重安全漏洞）
-      if (allowedShopIds.size === 0) {
-        logOutcome(false, true, '未配置店铺白名单');
+    const isShopScoped = isShopScopedUpstream(tool.upstream ?? '');
+    // 判断 schema 是否要求店铺参数必填
+    // 店铺参数名（和 SHOP_KEYS 对齐，但这里看 schema.required 里有没有出现）
+    const SHOP_SCHEMA_KEYS = ['sid', 'sids', 'shop_id', 'shop_ids', 'store_id', 'store_ids', 'seller_id', 'seller_ids', 'profile_id', 'profile_ids', 'account_id', 'account_ids'];
+    let shopRequired = false;
+    try {
+      const schema = tool.input_schema ? JSON.parse(tool.input_schema) : null;
+      const required = schema?.required;
+      if (Array.isArray(required) && required.some((k: string) => SHOP_SCHEMA_KEYS.includes(k))) {
+        shopRequired = true;
+      }
+    } catch { /* schema 坏了就当非必填 */ }
+
+    if (identity.kind === 'user' && !identity.all_shops && isShopScoped) {
+      // 店铺参数必填但没传 → 直接拒绝（fail-closed，比跳过校验然后拿到全店数据安全）
+      if (shopRequired && shopRefs.length === 0) {
+        logOutcome(false, true, '工具要求店铺参数但未提供');
         return errorResult(
-          `密钥未配置店铺白名单，无法调用店铺维度工具。请在管理后台 "运营用户 → 店铺权限" 补配，或设为全部店铺。`,
-          { type: 'permission_denied', upstream: tool.upstream, tool: name, reason: 'no_shop_whitelist' }
+          `该工具需要店铺参数（如 sid/sids/profile_ids 等），但请求中未找到。请在参数里指定要查询的店铺。`,
+          { type: 'invalid_params', upstream: tool.upstream, tool: name, reason: 'missing_required_shop_param' }
         );
       }
-      // 上游所有 seller_id → shop sid 映射（缓存到 handler 内）
-      const sellerToSids = new Map<string, Set<string>>();
-      const sellerRows = db.prepare('SELECT seller_id, sid FROM shops').all() as Array<{ seller_id: string; sid: string }>;
-      for (const row of sellerRows) {
-        if (!row.seller_id) continue; // 过滤空值
-        let set = sellerToSids.get(row.seller_id);
-        if (!set) { set = new Set(); sellerToSids.set(row.seller_id, set); }
-        set.add(row.sid);
-      }
-
-      const denied: string[] = [];
-      for (const ref of shopRefs) {
-        // 如果 ref 是 seller_id 格式（Amazon seller_id 通常 14-22 字符大写字母+数字）
-        const isSellerId = sellerToSids.has(ref) || /^[A-Z0-9]{10,30}$/.test(ref);
-        if (isSellerId) {
-          // seller_id：映射到 shop sid 再比对
-          const mapped = sellerToSids.get(ref);
-          if (!mapped || ![...mapped].some((s) => allowedShopIds.has(s))) {
-            denied.push(ref);
-          }
-        } else {
-          // 默认当作 shop sid 直接比对
-          if (!allowedShopIds.has(ref)) denied.push(ref);
+      // shopRefs 为空 + 非必填 → 跳过参数级校验，走响应裁剪兜底
+      if (shopRefs.length === 0) {
+        console.warn(`[mcp] ${identity.username} ${name} shopRefs=0，跳过参数级店铺校验（走响应裁剪兜底）`);
+      } else {
+        const allowedShopIds = new Set(getUserShopIds(identity.id));
+        // fail-closed：user_shops 为空 → 配置缺失，明确拒绝调用
+        // （之前的 fail-open 兜底在 sync 灌入全表后会静默放行所有店铺，这是严重安全漏洞）
+        if (allowedShopIds.size === 0) {
+          logOutcome(false, true, '未配置店铺白名单');
+          return errorResult(
+            `密钥未配置店铺白名单，无法调用店铺维度工具。请在管理后台 "运营用户 → 店铺权限" 补配，或设为全部店铺。`,
+            { type: 'permission_denied', upstream: tool.upstream, tool: name, reason: 'no_shop_whitelist' }
+          );
         }
-      }
-      if (denied.length > 0) {
-        logOutcome(false, true, `无权访问店铺: ${denied.join(',')}`);
-        return errorResult(`无权访问以下店铺: ${denied.join(', ')}`, {
-          type: 'permission_denied',
-          upstream: tool.upstream,
-          tool: name,
-          field: 'shop',
-          denied,
-        });
+        // 上游所有 seller_id → shop sid 映射（缓存到 handler 内）
+        const sellerToSids = new Map<string, Set<string>>();
+        const sellerRows = db.prepare('SELECT seller_id, sid FROM shops').all() as Array<{ seller_id: string; sid: string }>;
+        for (const row of sellerRows) {
+          if (!row.seller_id) continue; // 过滤空值
+          let set = sellerToSids.get(row.seller_id);
+          if (!set) { set = new Set(); sellerToSids.set(row.seller_id, set); }
+          set.add(row.sid);
+        }
+
+        const denied: string[] = [];
+        for (const ref of shopRefs) {
+          // 如果 ref 是 seller_id 格式（Amazon seller_id 通常 14-22 字符大写字母+数字）
+          const isSellerId = sellerToSids.has(ref) || /^[A-Z0-9]{10,30}$/.test(ref);
+          if (isSellerId) {
+            // seller_id：映射到 shop sid 再比对
+            const mapped = sellerToSids.get(ref);
+            if (!mapped || ![...mapped].some((s) => allowedShopIds.has(s))) {
+              denied.push(ref);
+            }
+          } else {
+            // 默认当作 shop sid 直接比对
+            if (!allowedShopIds.has(ref)) denied.push(ref);
+          }
+        }
+        if (denied.length > 0) {
+          logOutcome(false, true, `无权访问店铺: ${denied.join(',')}`);
+          return errorResult(`无权访问以下店铺: ${denied.join(', ')}`, {
+            type: 'permission_denied',
+            upstream: tool.upstream,
+            tool: name,
+            field: 'shop',
+            denied,
+          });
+        }
       }
     }
 
