@@ -124,16 +124,7 @@ function minimizeSchema(schema: any): any {
   // 顶层 type
   if (schema.type !== undefined) out.type = schema.type;
   if (schema.required) out.required = schema.required;
-  if (schema.enum) {
-    // enum 截断：>20 项截前 20 项 + 加标记。完整校验交给上游，agent 看到不完整标记会更谨慎
-    const MAX_ENUM = 20;
-    if (schema.enum.length > MAX_ENUM) {
-      out.enum = schema.enum.slice(0, MAX_ENUM);
-      out._enum_truncated = true;
-    } else {
-      out.enum = schema.enum;
-    }
-  }
+  if (schema.enum) out.enum = schema.enum;
   if (schema.default !== undefined) out.default = schema.default;
   if (schema.properties && typeof schema.properties === 'object') {
     const props: Record<string, any> = {};
@@ -141,15 +132,7 @@ function minimizeSchema(schema: any): any {
       if (v && typeof v === 'object') {
         const p: Record<string, any> = {};
         if ((v as any).type !== undefined) p.type = (v as any).type;
-        if ((v as any).enum) {
-          const MAX_ENUM = 20;
-          if ((v as any).enum.length > MAX_ENUM) {
-            p.enum = (v as any).enum.slice(0, MAX_ENUM);
-            p._enum_truncated = true;
-          } else {
-            p.enum = (v as any).enum;
-          }
-        }
+        if ((v as any).enum) p.enum = (v as any).enum;
         if ((v as any).default !== undefined) p.default = (v as any).default;
         // 嵌套对象递归
         if ((v as any).properties) p.properties = minimizeSchema((v as any).properties);
