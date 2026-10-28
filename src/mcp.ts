@@ -707,9 +707,17 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
     }
 
     // write 工具管控
-    if (identity.kind === 'user' && tool.tool_type === 'write' && getSetting('block_write') === '1') {
-      logOutcome(false, true, 'block_write 禁止写操作');
-      return errorResult(`该工具为写操作，已被网关禁用: ${name}`, { type: 'permission_denied', upstream: tool.upstream, tool: name });
+    // block_write=1 时默认禁止所有 write 工具，但管理员可手动在运营用户的 tool_ids 里
+    // 分配特定 write 工具作为例外（比如只开放"确认发货"不给"改价"）。
+    // all_tools=1 的运营用户视为完全信任，不受 block_write 限制。
+    if (identity.kind === 'user' && tool.tool_type === 'write' && getSetting('block_write') === '1' && !identity.all_tools) {
+      const allowedTools = getUserToolIds(identity.id);
+      if (!allowedTools.includes(tool.tool_id)) {
+        logOutcome(false, true, 'block_write 禁止写操作');
+        return errorResult(`该工具为写操作，已被网关禁用: ${name}（如需开放请在运营用户权限里手动勾选，或关闭全局禁止写操作）`, { type: 'permission_denied', upstream: tool.upstream, tool: name });
+      }
+      // 管理员手动分配的 write 工具 → 放行（block_write 只作为默认禁，例外由管理员决定）
+      console.log(`[mcp] ${identity.username} write 工具 ${name} 已在白名单 → 放行（block_write 例外）`);
     }
 
     // ---- 参数预校验（降级为 warning 日志，不拦截）----
