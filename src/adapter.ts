@@ -289,7 +289,11 @@ class LingxingMetaAdapter implements UpstreamAdapter {
         upstreamError: bizErr,
       };
     }
-    return { content: resp.result.content, isError: resp.result.isError, emptyShell: detectEmptyShell(resp.result.content) };
+    // 先跑 detectEmptyShell（基于原始 content，不受后续加标记影响）
+    const emptyShell = detectEmptyShell(resp.result.content);
+    // 给占位行加 is_placeholder_row 标记
+    const markedContent = markPlaceholderRows(resp.result.content);
+    return { content: markedContent, isError: resp.result.isError, emptyShell };
   }
 
   async probe(config: UpstreamConfig): Promise<boolean> {
@@ -375,6 +379,62 @@ export function detectEmptyShell(
   return { warn: null, isEmpty: false, effectiveRows };
 }
 
+/**
+ * 给响应里 Amazon 内部占位 SKU（amzn.gr.* / amzn.gp.* / amzn.mw.*）所在的行加 is_placeholder_row 标记。
+ *
+ * 这些是 Amazon 自己创建的占位 FNSKU，不是卖家真实库存，但会混入 FBA 库存表/订单表/广告报表等——
+ * Agent 经常把它们当成真实数据来算，导致结论偏差。
+ *
+ * 只加标记，不改任何原字段值，不改排序。
+ * 匹配规则：对象任意 string 属性值以 amzn.gr. / amzn.gp. / amzn.mw. 开头 → 该行标记。
+ */
+export function markPlaceholderRows(
+  content: Array<{ type: string; text?: string }>
+): Array<{ type: string; text?: string }> {
+  const PLACEHOLDER_RE = /^amzn\.(gr|gp|mw)\./i;
+
+  return content.map((part) => {
+    if (part.type !== 'text' || typeof part.text !== 'string') return part;
+    let parsed: unknown;
+    try { parsed = JSON.parse(part.text); } catch { return part; }
+
+    let marked = false;
+    const visit = (node: unknown): unknown => {
+      if (Array.isArray(node)) return node.map(visit);
+      if (node && typeof node === 'object') {
+        const obj = node as Record<string, unknown>;
+
+        // 检测是否是占位行：任意 string 字段匹配 amzn.*. 前缀
+        let isPlaceholder = false;
+        for (const val of Object.values(obj)) {
+          if (typeof val === 'string' && PLACEHOLDER_RE.test(val)) {
+            isPlaceholder = true;
+            break;
+          }
+        }
+
+        if (isPlaceholder && !('is_placeholder_row' in obj)) {
+          obj.is_placeholder_row = true;
+          marked = true;
+        }
+
+        // 递归嵌套对象
+        for (const [k, v] of Object.entries(obj)) {
+          if (v && typeof v === 'object') obj[k] = visit(v);
+        }
+        return obj;
+      }
+      return node;
+    };
+
+    const result = visit(parsed);
+    if (marked) {
+      return { ...part, text: JSON.stringify(result) };
+    }
+    return part;
+  });
+}
+
 // =====================================================
 // Adapter 2: FlatMcpAdapter — 标准扁平 MCP
 //   Sif / 西柚 / 卖家精灵 等直接暴露业务工具
@@ -426,12 +486,14 @@ class FlatMcpAdapter implements UpstreamAdapter {
     if (bizErr) {
       return { content: resp.result.content, isError: true, upstreamError: bizErr };
     }
-    const content = resp.result.content;
+    const rawContent = resp.result.content;
     // 空壳检测：某些上游返回 isError=false 但关键字段全 null
-    const shell = detectEmptyShell(content);
+    const shell = detectEmptyShell(rawContent);
+    // 占位行标记
+    let content = markPlaceholderRows(rawContent);
     if (shell.warn) {
       // __gateway_warn 插到 content 第一个位置
-      content.unshift({ type: 'text', text: JSON.stringify({ __gateway_warn: shell.warn }) });
+      content = [{ type: 'text', text: JSON.stringify({ __gateway_warn: shell.warn }) }, ...content];
     }
     return { content, isError: resp.result.isError, emptyShell: shell };
   }
