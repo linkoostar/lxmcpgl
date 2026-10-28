@@ -193,7 +193,7 @@ apiRouter.get(
       upstream_url: getSetting('upstream_url'),
       upstream_key_set: !!upstreamKey,
       upstream_key_masked: maskKey(upstreamKey),
-      downstream_key: getSetting('downstream_key'),
+      downstream_key_masked: maskKey(getSetting('downstream_key')),
       last_sync_at: getSetting('last_sync_at'),
       tool_count: toolCount,
       tool_type_count: typeCount,
@@ -579,6 +579,16 @@ apiRouter.put(
       return;
     }
     res.json({ ok: true });
+  })
+);
+
+apiRouter.get(
+  '/settings/downstream-key',
+  requireAuth,
+  wrap(async (_req, res) => {
+    // 管理员通用 Key 默认在 /settings 返回 masked，此处需主动点"显示"才拿明文
+    const key = getSetting('downstream_key');
+    res.json({ ok: true, downstream_key: key });
   })
 );
 

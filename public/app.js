@@ -690,11 +690,13 @@ $('#user-modal-save').addEventListener('click', async () => {
 
 async function loadSettings() {
   const s = await api('/settings');
-  $('#down-key').value = s.downstream_key || '';
+  // 默认显示 masked，点击"显示"才拿明文
+  $('#down-key').value = s.downstream_key_masked || '';
+  $('#down-key').dataset.masked = '1';
   $('#sync-status').textContent = s.last_sync_at ? `上次同步：${new Date(s.last_sync_at).toLocaleString()} · 已缓存 ${s.tool_count} 个工具` : `尚未同步 · 已缓存 ${s.tool_count} 个工具`;
   $('#shop-count').textContent = s.shop_count > 0 ? `已同步 ${s.shop_count} 店` : '未同步';
   $('#chk-block-write').checked = !!s.block_write;
-  renderSnippet(s.downstream_key);
+  renderSnippet(s.downstream_key_masked);
 
   // 默认权限模板摘要
   const tc = s.tool_type_count || { read: 0, write: 0, other: 0 };
@@ -962,8 +964,29 @@ $('#btn-reset-key').addEventListener('click', async () => {
   try {
     const r = await api('/downstream-key/reset', { method: 'POST' });
     $('#down-key').value = r.downstream_key;
+    $('#down-key').dataset.masked = '0';
     renderSnippet(r.downstream_key);
-    toast('已重置');
+    toast('已重置，请复制新 Key');
+  } catch (e) { toast(e.message); }
+});
+
+$('#btn-show-key').addEventListener('click', async () => {
+  const input = $('#down-key');
+  if (input.dataset.masked === '0') {
+    // 已是明文 → 切回 masked
+    const s = await api('/settings');
+    input.value = s.downstream_key_masked || '';
+    input.dataset.masked = '1';
+    $('#btn-show-key').textContent = '👁 显示';
+    renderSnippet(s.downstream_key_masked);
+    return;
+  }
+  try {
+    const r = await api('/settings/downstream-key');
+    input.value = r.downstream_key;
+    input.dataset.masked = '0';
+    $('#btn-show-key').textContent = '🙈 隐藏';
+    renderSnippet(r.downstream_key);
   } catch (e) { toast(e.message); }
 });
 
