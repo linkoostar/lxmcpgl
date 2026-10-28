@@ -133,14 +133,13 @@ class LingxingMetaAdapter implements UpstreamAdapter {
     const { getUpstreamClient } = await import('./upstream.js');
     const client = getUpstreamClient(config.url, config.api_key ?? '');
 
-    // ===== 参数格式：扁平展开，和 sync.ts 一致 =====
-    // 真实领星 upstream 的 meta 工具（help/search/action）都期望 arguments 扁平：
-    //   action({ toolId: 'xxx', report_date: '...', page: 1, length: 20 })
-    // 不是嵌套在 params 里：
-    //   action({ toolId: 'xxx', params: { report_date: '...', page: 1, length: 20 } })
-    // 后者会导致上游看不到业务参数（page/length 全被忽略），表现为翻页无效、返回默认条数
-    const flatArgs = { toolId, ...args };
-    const resp = await client.callTool('action', flatArgs);
+    // ===== 参数格式：嵌套 params，这是领星 upstream action 工具的 inputSchema 约定 =====
+    // 领星元工具模式下，action 是一个 MCP 工具，它的 inputSchema 定义的是：
+    //   { toolId: string, params: object }
+    // help/search 是扁平（各自 inputSchema 简单），但 action 是嵌套的——
+    // 因为 action 要转发到不定数量的业务工具，业务工具参数统一塞在 params 里。
+    // 之前错误地改成扁平 { toolId, ...args }，导致 upstream 报 102 Schema 过期（参数结构不匹配）。
+    const resp = await client.callTool('action', { toolId, params: args });
 
     // ===== 诊断日志：打印上游原始响应结构（开发/排查用，不影响逻辑） =====
     try {
