@@ -136,6 +136,11 @@ function minimizeSchema(schema: any): any {
         if ((v as any).default !== undefined) p.default = (v as any).default;
         // 嵌套对象递归
         if ((v as any).properties) p.properties = minimizeSchema((v as any).properties);
+        // 数组元素 schema 递归（ads: {type:"array", items:{properties:{adType:{...}}}}）
+        if ((v as any).items) p.items = minimizeSchema((v as any).items);
+        // oneOf / anyOf（联合类型，agent 只需要知道每个选项的 type/enum 即可）
+        if ((v as any).oneOf) p.oneOf = (v as any).oneOf.map(minimizeSchema);
+        if ((v as any).anyOf) p.anyOf = (v as any).anyOf.map(minimizeSchema);
         props[k] = p;
       } else {
         props[k] = v;
