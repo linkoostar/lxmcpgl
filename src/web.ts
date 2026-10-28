@@ -32,6 +32,7 @@ import {
   deleteUpstream,
   getUpstreamToolCounts,
   maskUpstreamKey,
+  setToolShopScope,
 } from './db.js';
 import { config, META_TOOLS } from './config.js';
 import { getUpstreamClient, resetUpstreamClient, UpstreamError } from './upstream.js';
@@ -514,6 +515,27 @@ apiRouter.get(
     let enabled: number | undefined = undefined;
     if (req.query.enabled !== undefined && req.query.enabled !== '') enabled = String(req.query.enabled) === '1' ? 1 : 0;
     res.json(listTools(q, page, pageSize, toolType, enabled, upstream));
+  })
+);
+
+// PATCH /api/tools/:upstream/:tool_id —— 修改工具 shop_scope（管理员审核标记）
+apiRouter.patch(
+  '/tools/:upstream/:tool_id',
+  requireAuth,
+  wrap(async (req, res) => {
+    const { upstream, tool_id } = req.params;
+    const { shop_scope } = req.body ?? {};
+    const valid = ['unreviewed', 'shop_scoped', 'global_safe'] as const;
+    if (!valid.includes(shop_scope)) {
+      res.status(400).json({ error: `shop_scope 必须是 ${valid.join(' / ')}` });
+      return;
+    }
+    const ok = setToolShopScope(upstream, tool_id, shop_scope);
+    if (!ok) {
+      res.status(404).json({ error: `工具不存在: ${upstream}.${tool_id}` });
+      return;
+    }
+    res.json({ ok: true, upstream, tool_id, shop_scope });
   })
 );
 

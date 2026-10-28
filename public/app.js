@@ -167,6 +167,42 @@ async function loadTools() {
     else if (t.tool_type === 'read') td3.innerHTML = '<span class="tag ok">read</span>';
     else td3.innerHTML = '<span class="muted">-</span>';
 
+    const tdScope = document.createElement('td');
+    const sel = document.createElement('select');
+    sel.style.width = '100px';
+    sel.style.fontSize = '12px';
+    sel.title = '店铺隔离范围。unreviewed=未审核，shop_scoped=必须带店铺参数，global_safe=全 ERP 级';
+    const scopeLabels = {
+      unreviewed: { text: '未审核', color: '#d97706' },
+      shop_scoped: { text: '店铺隔离', color: '#2563eb' },
+      global_safe: { text: '全局安全', color: '#059669' },
+    };
+    for (const [val, lbl] of Object.entries(scopeLabels)) {
+      const opt = document.createElement('option');
+      opt.value = val; opt.textContent = lbl.text;
+      if ((t.shop_scope || 'unreviewed') === val) opt.selected = true;
+      sel.appendChild(opt);
+    }
+    sel.addEventListener('change', async () => {
+      try {
+        await api(`/tools/${encodeURIComponent(t.upstream)}/${encodeURIComponent(t.tool_id)}`, {
+          method: 'PATCH',
+          body: { shop_scope: sel.value },
+        });
+        toast(`已标记为「${scopeLabels[sel.value].text}」`);
+      } catch (e) { toast(e.message); sel.value = t.shop_scope || 'unreviewed'; }
+    });
+    tdScope.appendChild(sel);
+    // 如果有建议值（sync 自动生成的），在 select 下方显示提示
+    if (t.shop_scope_suggest && t.shop_scope_suggest !== (t.shop_scope || 'unreviewed')) {
+      const hint = document.createElement('div');
+      hint.style.fontSize = '10px'; hint.style.marginTop = '2px';
+      hint.style.color = '#d97706'; hint.textContent = `建议: ${scopeLabels[t.shop_scope_suggest]?.text || t.shop_scope_suggest}`;
+      hint.onclick = () => { sel.value = t.shop_scope_suggest; sel.dispatchEvent(new Event('change')); };
+      hint.style.cursor = 'pointer';
+      tdScope.appendChild(hint);
+    }
+
     const td4 = document.createElement('td');
     td4.innerHTML = t.enabled
       ? '<span class="tag ok" title="已启用">● 启用</span>'
@@ -192,11 +228,11 @@ async function loadTools() {
     detail.onclick = () => showToolDetail(t.upstream, t.tool_id);
     td5.append(toggle, detail);
 
-    tr.append(td0, td1, td2, td3, td4, td5);
+    tr.append(td0, td1, td2, td3, tdScope, td4, td5);
     tbody.appendChild(tr);
   }
   if (!data.items.length) {
-    tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--muted);padding:30px">暂无数据，点击右上角「同步工具」从上游拉取</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--muted);padding:30px">暂无数据，点击右上角「同步工具」从上游拉取</td></tr>';
   }
   updateBatchBar();
 }

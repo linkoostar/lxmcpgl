@@ -12,6 +12,7 @@ import {
   insertCallLog,
   listUpstreams,
   parseUpstreamHeaders,
+  SHOP_PARAM_KEYS,
   type UserRow,
 } from './db.js';
 import { getUpstreamClient } from './upstream.js';
@@ -228,18 +229,7 @@ function checkRateLimit(userId: number, limitPerMin: number): boolean {
 }
 
 // ---------- 店铺参数校验 ----------
-// 统一的店铺参数字段集合（校验侧 + 提取侧共用，避免口径漂移）
-// 包含：shop sid / store_id / seller_id / profile_id / account_id
-// profile_id 之前注释说"暂不参与校验"，但 shops 表已有 profile_id 列和映射，必须纳入！
-const SHOP_PARAM_KEYS = new Set([
-  'sid', 'sids',
-  'store_id', 'store_ids',
-  'shop_id', 'shop_ids',
-  'seller_id', 'seller_ids',
-  'profile_id', 'profile_ids',
-  'account_id', 'account_ids',
-  'pvi_ids',
-]);
+// 统一用 db.SHOP_PARAM_KEYS（全项目共用一份，避免口径漂移）
 
 /**
  * 递归提取请求参数里的所有店铺引用。
@@ -736,80 +726,68 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
 
     if (identity.kind === 'user' && !identity.all_shops && isShopScoped) {
       // === 工具分类拦截（shop_scope 机制）===
-      // unreviewed = 默认值，受限运营不可调用。管理员需手动审核或等 sync 自动标记后确认。
-      // global_safe = 管理员确认该工具不返回跨店数据（全 ERP 级，如订单汇总）
-      // shop_scoped = 管理员确认该工具按店铺参数隔离（需要店铺参数）
-      // 这个机制解决"网关无法自动判断工具是否返回全店数据"的问题：
-      // 判断由人做、存数据库、网关强制执行
-      const shopScope = (tool as any).shop_scope ?? 'unreviewed';
-      if (shopScope === 'unreviewed') {
-        logOutcome(false, true, '工具未审核店铺隔离范围');
-        return errorResult(
-          `工具「${name}」未审核店铺隔离范围（shop_scope=unreviewed），受限运营不可调用。请联系管理员在工具列表里审核标记为 shop_scoped 或 global_safe。`,
-          { type: 'shop_unreviewed', upstream: tool.upstream, tool: name, reason: 'unreviewed_shop_scope' }
-        );
-      }
+      // 分支穷尽：不是 shop_scoped / global_safe 就一律拒绝
+      // （空字符串、拼写错误、null 都按 unreviewed 处理，拒绝调用）
+      const shopScope = ((tool as any).shop_scope ?? 'unreviewed') as string;
+
       if (shopScope === 'global_safe') {
         // 管理员确认安全的全 ERP 级工具，不需要店铺参数，跳过后续所有店铺校验
         console.log(`[mcp] ${identity.username} ${name} shop_scope=global_safe → 放行`);
-      }
-
-      // === shop_scoped：参数级店铺校验 ===
-      if (shopScope === 'shop_scoped') {
-        // schema 存在店铺字段但 shopRefs 为空 → 直接拒绝（fail-closed）
-        if (schemaHasShopField && shopRefs.length === 0) {
-          logOutcome(false, true, '工具含店铺参数但请求未提供');
+      } else if (shopScope === 'shop_scoped') {
+        // shop_scoped 的定义就是"必须带店铺参数"——不再看 schemaHasShopField
+        // 评审指出：一个因为嵌套字段被标为 shop_scoped 的工具，
+        // 调用时若不带店铺参数，之前会走到 "shop_scoped 但无店铺字段 → 放行" 的漏洞
+        if (shopRefs.length === 0) {
+          logOutcome(false, true, 'shop_scoped 工具未提供店铺参数');
           return errorResult(
-            `该工具的参数里包含店铺字段（如 sid/sids/store_id/seller_id/profile_ids 等），
-但请求中未找到。请在参数里指定要查询的店铺。`,
+            `工具「${name}」标记为 shop_scoped（需要店铺参数），但请求中未找到任何店铺引用。请在参数里指定要查询的店铺（如 sid/sids/store_id/seller_id/profile_ids 等）。`,
             { type: 'invalid_params', upstream: tool.upstream, tool: name, reason: 'missing_shop_param' }
           );
         }
-        // shopRefs 为空 → 放行（schema 也没店铺字段，依赖响应裁剪兜底）
-        if (shopRefs.length === 0) {
-          console.log(`[mcp] ${identity.username} ${name} shopRefs=0 → 放行（shop_scoped 但无店铺字段）`);
-        } else {
-          const allowedShopIds = new Set(getUserShopIds(identity.id));
-          // fail-closed：user_shops 为空 → 配置缺失，明确拒绝调用
-          if (allowedShopIds.size === 0) {
-            logOutcome(false, true, '未配置店铺白名单');
-            return errorResult(
-              `密钥未配置店铺白名单，无法调用店铺维度工具。请在管理后台 "运营用户 → 店铺权限" 补配，或设为全部店铺。`,
-              { type: 'permission_denied', upstream: tool.upstream, tool: name, reason: 'no_shop_whitelist' }
-            );
-          }
-          const idMap = buildShopIdMapping();
+        // === shop_scoped + shopRefs 非空：参数级店铺校验 ===
+        const allowedShopIds = new Set(getUserShopIds(identity.id));
+        // fail-closed：user_shops 为空 → 配置缺失，明确拒绝调用
+        if (allowedShopIds.size === 0) {
+          logOutcome(false, true, '未配置店铺白名单');
+          return errorResult(
+            `密钥未配置店铺白名单，无法调用店铺维度工具。请在管理后台 "运营用户 → 店铺权限" 补配，或设为全部店铺。`,
+            { type: 'permission_denied', upstream: tool.upstream, tool: name, reason: 'no_shop_whitelist' }
+          );
+        }
+        const idMap = buildShopIdMapping();
 
-          const denied: string[] = [];
-          for (const ref of shopRefs) {
-            const mapped = idMap.get(ref);
-            if (mapped) {
-              // ref 是映射里的某个 ID（store_id / seller_id / profile_id / sid 本身）
-              // 评审意见改用 every 不用 some：同一个 seller_id 可能跨多个站点（US/CA/MX 各是一个 sid），
-              // 只授权 US 的用户传这个 seller_id → some 会让它通过但返回所有站点数据
-              // every 的代价是：同 seller_id 被授权多个站点（这是正常情况，管理员应该授权全部相关站点）
-              if (![...mapped].every((s) => allowedShopIds.has(s))) {
-                denied.push(ref + '→' + [...mapped].join(','));
-              }
-            } else {
-              // 未映射 → fail-closed 拒绝
-              // 三种可能：① ref 不是任何店铺 ID（不该被提取到）② shops 表空还没 sync 过
-              //          ③ 字段名不在 SHOP_PARAM_KEYS 里（如 sid_list）
-              // ①③ 是 collector 漏检，② 是运维未配置，全部拒绝而不是当 sid 放行
-              denied.push(ref + '(未映射)');
+        const denied: string[] = [];
+        for (const ref of shopRefs) {
+          const mapped = idMap.get(ref);
+          if (mapped) {
+            // ref 是映射里的某个 ID（store_id / seller_id / profile_id / sid 本身）
+            // 评审意见改用 every 不用 some：同一个 seller_id 可能跨多个站点，
+            // 只授权 US 的用户传这个 seller_id → some 会让它通过但返回所有站点数据
+            if (![...mapped].every((s) => allowedShopIds.has(s))) {
+              denied.push(ref + '→' + [...mapped].join(','));
             }
-          }
-          if (denied.length > 0) {
-            logOutcome(false, true, `无权访问店铺: ${denied.join(',')}`);
-            return errorResult(`无权访问以下店铺: ${denied.join(', ')}`, {
-              type: 'permission_denied',
-              upstream: tool.upstream,
-              tool: name,
-              field: 'shop',
-              denied,
-            });
+          } else {
+            // 未映射 → fail-closed 拒绝
+            denied.push(ref + '(未映射)');
           }
         }
+        if (denied.length > 0) {
+          logOutcome(false, true, `无权访问店铺: ${denied.join(',')}`);
+          return errorResult(`无权访问以下店铺: ${denied.join(', ')}`, {
+            type: 'permission_denied',
+            upstream: tool.upstream,
+            tool: name,
+            field: 'shop',
+            denied,
+          });
+        }
+      } else {
+        // unreviewed + 任何未知值（拼写错误、空字符串等）→ 一律拒绝
+        logOutcome(false, true, '工具未审核店铺隔离范围');
+        return errorResult(
+          `工具「${name}」未审核店铺隔离范围（shop_scope=${shopScope || '未设置'}），受限运营不可调用。请联系管理员在工具列表里审核标记为 shop_scoped 或 global_safe。`,
+          { type: 'shop_unreviewed', upstream: tool.upstream, tool: name, reason: 'unreviewed_shop_scope' }
+        );
       }
     }
 

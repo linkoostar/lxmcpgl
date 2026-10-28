@@ -1,4 +1,4 @@
-import { db, getSetting, setSetting, setSettingJSON, getReadToolIds, upsertTool, getUpstream, type ToolRow } from './db.js';
+import { db, getSetting, setSetting, setSettingJSON, getReadToolIds, upsertTool, getUpstream, SHOP_PARAM_KEYS, type ToolRow } from './db.js';
 import { META_TOOLS } from './config.js';
 import { getUpstreamClient, type UpstreamClient } from './upstream.js';
 
@@ -8,23 +8,15 @@ import { getUpstreamClient, type UpstreamClient } from './upstream.js';
  *
  * 评审指出的网关缺口：之前只扫顶层 properties，嵌套在 items/anyOf 里的店铺字段检测不到。
  * 改为深度优先遍历，覆盖所有嵌套层级。
+ * 字段集合统一用 db.SHOP_PARAM_KEYS（全项目共用一份，避免口径漂移）。
  */
-const SHOP_SCHEMA_KEYS = new Set([
-  'sid', 'sids',
-  'store_id', 'store_ids',
-  'shop_id', 'shop_ids',
-  'seller_id', 'seller_ids',
-  'profile_id', 'profile_ids',
-  'account_id', 'account_ids',
-  'pvi_ids',
-]);
 
 function schemaHasShopField(schema: any, depth = 0): boolean {
   if (depth > 8 || !schema || typeof schema !== 'object') return false;
   // properties：对象类型的参数定义
   if (schema.properties && typeof schema.properties === 'object') {
     for (const k of Object.keys(schema.properties)) {
-      if (SHOP_SCHEMA_KEYS.has(k.toLowerCase())) return true;
+      if (SHOP_PARAM_KEYS.has(k.toLowerCase())) return true;
       if (schemaHasShopField(schema.properties[k], depth + 1)) return true;
     }
   }
@@ -48,32 +40,31 @@ function schemaHasShopField(schema: any, depth = 0): boolean {
 }
 
 /**
- * 同步后自动标记 shop_scope：
- * - unreviewed + schema 有店铺字段 → shop_scoped（建议值，管理员可改）
- * - unreviewed + schema 无店铺字段 → global_safe（建议值）
- * - 已被管理员手动标记的（不是 unreviewed）→ 不覆盖
- * 上游改了工具 schema → 下次 sync 时如果 tool hash 变了，
- * 管理员会看到并手动重新审核（当前版本还没 hash 自动退回 unreviewed，后续加）
+ * 同步后生成 shop_scope 建议值 —— 只写 shop_scope_suggest，不碰 shop_scope 生效值。
+ *
+ * 评审意见（严重）：原实现同步完自动把所有工具升级成 global_safe / shop_scoped，
+ * 导致 unreviewed 状态实际不存在，受限运营可以绕过。现在：
+ * - 建议值写 shop_scope_suggest 字段
+ * - 生效值 shop_scope 保持 unreviewed，直到管理员手动确认
+ * - 已被管理员手动标记的（shop_scope !== unreviewed）→ 不覆盖生效值，只更新建议值
  */
-export function backfillShopScopes(): { shop_scoped: number; global_safe: number; skipped: number } {
-  const tools = db.prepare('SELECT tool_id, upstream, input_schema, shop_scope FROM tools').all() as Array<{
-    tool_id: string; upstream: string; input_schema: string | null; shop_scope: string;
+export function backfillShopScopes(): { shop_scoped_suggest: number; global_safe_suggest: number } {
+  const tools = db.prepare('SELECT tool_id, upstream, input_schema FROM tools').all() as Array<{
+    tool_id: string; upstream: string; input_schema: string | null;
   }>;
-  let shop_scoped = 0, global_safe = 0, skipped = 0;
+  let shop_scoped = 0, global_safe = 0;
   for (const t of tools) {
-    // 只处理 unreviewed 的，已被管理员标记的不覆盖
-    if (t.shop_scope && t.shop_scope !== 'unreviewed') { skipped++; continue; }
-    if (!t.input_schema) { skipped++; continue; }
+    if (!t.input_schema) continue;
     try {
       const schema = JSON.parse(t.input_schema);
       const hasShop = schemaHasShopField(schema);
-      const newScope = hasShop ? 'shop_scoped' : 'global_safe';
-      db.prepare('UPDATE tools SET shop_scope = ? WHERE upstream = ? AND tool_id = ?').run(newScope, t.upstream, t.tool_id);
-      if (newScope === 'shop_scoped') shop_scoped++; else global_safe++;
-    } catch { skipped++; }
+      const suggest = hasShop ? 'shop_scoped' : 'global_safe';
+      db.prepare('UPDATE tools SET shop_scope_suggest = ? WHERE upstream = ? AND tool_id = ?').run(suggest, t.upstream, t.tool_id);
+      if (suggest === 'shop_scoped') shop_scoped++; else global_safe++;
+    } catch { /* schema 坏了就跳过 */ }
   }
-  console.log(`[sync] shop_scope 自动标记: shop_scoped=${shop_scoped} global_safe=${global_safe} skipped=${skipped}`);
-  return { shop_scoped, global_safe, skipped };
+  console.log(`[sync] shop_scope 建议值: shop_scoped_suggest=${shop_scoped} global_safe_suggest=${global_safe}`);
+  return { shop_scoped_suggest: shop_scoped, global_safe_suggest: global_safe };
 }
 
 
@@ -358,7 +349,7 @@ export function listTools(q: string, page: number, pageSize: number, toolType?: 
   const total = (db.prepare(`SELECT COUNT(*) AS c FROM tools ${where}`).all(...params) as { c: number }[])[0].c;
   const rows = db
     .prepare(
-      `SELECT tool_id, exposed_name, name, description, input_schema, tool_type, upstream, enabled, updated_at
+      `SELECT tool_id, exposed_name, name, description, input_schema, tool_type, upstream, enabled, updated_at, shop_scope, shop_scope_suggest
        FROM tools ${where} ORDER BY upstream, tool_id LIMIT ? OFFSET ?`
     )
     .all(...params, pageSize, (page - 1) * pageSize) as Array<ToolRow & { input_schema: string | null }>;
@@ -373,6 +364,8 @@ export function listTools(q: string, page: number, pageSize: number, toolType?: 
       upstream: r.upstream || 'lingxing',
       has_schema: !!r.input_schema,
       enabled: !!r.enabled,
+      shop_scope: (r as any).shop_scope || 'unreviewed',
+      shop_scope_suggest: (r as any).shop_scope_suggest || '',
       updated_at: r.updated_at,
     })),
   };

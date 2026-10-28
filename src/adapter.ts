@@ -8,6 +8,7 @@
  */
 
 import type { UpstreamClient } from './upstream.js';
+import { SHOP_PARAM_KEYS } from './db.js';
 
 /** upstream 配置行（从 upstreams 表读） */
 export interface UpstreamConfig {
@@ -330,7 +331,6 @@ class LingxingMetaAdapter implements UpstreamAdapter {
     }
   }
   extractShopRefs(args: Record<string, unknown>): string[] {
-    const SHOP_KEYS = new Set(['sid', 'sids', 'shop_id', 'shop_ids', 'store_id', 'seller_id', 'profile_id', 'pvi_ids']);
     const out: string[] = [];
     // 递归遍历，解决审计发现的四种漏掉场景：
     // - 数组内对象（items:[{sid:"9999"}]）
@@ -345,7 +345,7 @@ class LingxingMetaAdapter implements UpstreamAdapter {
       if (typeof node === 'object') {
         const obj = node as Record<string, unknown>;
         for (const [k, v] of Object.entries(obj)) {
-          if (SHOP_KEYS.has(k)) {
+          if (SHOP_PARAM_KEYS.has(k)) {
             if (typeof v === 'string') {
               v.split(',').map((s) => s.trim()).filter(Boolean).forEach((s) => out.push(s));
             } else if (Array.isArray(v)) {
@@ -494,8 +494,7 @@ class FlatMcpAdapter implements UpstreamAdapter {
   }
 
   extractShopRefs(args: Record<string, unknown>): string[] {
-    // 扁平 MCP 也用同样的 SHOP_KEYS + 递归逻辑，统一口径
-    const SHOP_KEYS = new Set(['sid', 'sids', 'shop_id', 'shop_ids', 'store_id', 'seller_id', 'profile_id', 'account_id']);
+    // 扁平 MCP 也用 db.SHOP_PARAM_KEYS + 递归逻辑，统一口径
     const out: string[] = [];
     const visit = (node: unknown, depth = 0) => {
       if (depth > 5 || node === null || node === undefined) return;
@@ -506,7 +505,7 @@ class FlatMcpAdapter implements UpstreamAdapter {
       if (typeof node === 'object') {
         const obj = node as Record<string, unknown>;
         for (const [k, v] of Object.entries(obj)) {
-          if (SHOP_KEYS.has(k)) {
+          if (SHOP_PARAM_KEYS.has(k)) {
             if (typeof v === 'string') {
               v.split(',').map((s) => s.trim()).filter(Boolean).forEach((s) => out.push(s));
             } else if (Array.isArray(v)) {

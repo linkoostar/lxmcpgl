@@ -4,6 +4,27 @@ import path from 'node:path';
 import { randomBytes, scryptSync, timingSafeEqual, createHash } from 'node:crypto';
 import { config, DEFAULT_UPSTREAM_URL } from './config.js';
 
+/**
+ * 店铺 ID 字段名常量 —— 全项目共用一份，避免口径漂移。
+ * mcp.ts 的 collectShopRefs、sync.ts 的 schemaHasShopField、adapter.ts 的 extractShopRefs 都用这份。
+ */
+export const SHOP_PARAM_KEYS = new Set<string>([
+  // sid 本身及其复数
+  'sid', 'sids',
+  // 亚马逊 Store ID（纯数字，如 3894542930）
+  'store_id', 'store_ids',
+  // shop 别名（部分上游用 shop_id 代替 sid）
+  'shop_id', 'shop_ids',
+  // Amazon Seller ID（marketplace token，如 A1P8NM96COGRQG）
+  'seller_id', 'seller_ids',
+  // 广告 Profile ID（广告类工具，如 ad_campaign_report）
+  'profile_id', 'profile_ids',
+  // 部分上游用 account_id 等同 shop 维度
+  'account_id', 'account_ids',
+  // Amazon PVI ID（广告类工具的另一种 ID 形式）
+  'pvi_ids',
+]);
+
 export let db: Database.Database;
 
 export function initDb(): void {
@@ -226,6 +247,17 @@ function migrate(): void {
     db.exec(`ALTER TABLE tools ADD COLUMN shop_scope TEXT DEFAULT 'unreviewed'`);
     console.log('[db] tools 已补 shop_scope 列（默认 unreviewed）');
   }
+  // shop_scope_suggest = 同步时自动生成的建议值，不自动生效，需管理员确认
+  if (!toolCols.includes('shop_scope_suggest')) {
+    db.exec(`ALTER TABLE tools ADD COLUMN shop_scope_suggest TEXT DEFAULT ''`);
+    console.log('[db] tools 已补 shop_scope_suggest 列');
+  }
+  // schema_hash = 上次 sync 时 input_schema 的 SHA256。
+  // 上游改了 schema → hash 变化 → shop_scope 自动退回 unreviewed（人工审核过时了）
+  if (!toolCols.includes('schema_hash')) {
+    db.exec(`ALTER TABLE tools ADD COLUMN schema_hash TEXT DEFAULT ''`);
+    console.log('[db] tools 已补 schema_hash 列');
+  }
 
   // 工具分类兜底
   backfillToolTypes();
@@ -375,6 +407,8 @@ export interface ToolRow {
   enabled: number;
   updated_at: string;
   shop_scope?: string; // unreviewed / shop_scoped / global_safe
+  shop_scope_suggest?: string; // 自动生成的建议值
+  schema_hash?: string; // 上次 sync 时的 input_schema hash
 }
 
 export function upsertTool(t: {
@@ -387,9 +421,21 @@ export function upsertTool(t: {
   tool_type: string;
   upstream?: string;
 }): void {
+  // 计算 input_schema 的 hash，用于检测上游 schema 变更
+  const newHash = t.input_schema ? createHash('sha256').update(t.input_schema).digest('hex').slice(0, 16) : '';
+  const upstream = t.upstream ?? 'lingxing';
+  const existing = db.prepare('SELECT shop_scope, schema_hash FROM tools WHERE upstream=? AND tool_id=?').get(upstream, t.tool_id) as { shop_scope: string; schema_hash: string } | undefined;
+
+  let shopScope = existing?.shop_scope ?? 'unreviewed';
+  // 上游改了 schema → 人工审核过时，自动退回 unreviewed
+  if (existing?.shop_scope && existing.shop_scope !== 'unreviewed' && existing.schema_hash && existing.schema_hash !== newHash) {
+    console.log(`[db] tool ${upstream}.${t.tool_id} schema 变更 (${existing.schema_hash.slice(0,6)}→${newHash.slice(0,6)})，shop_scope=${existing.shop_scope} 退回 unreviewed`);
+    shopScope = 'unreviewed';
+  }
+
   db.prepare(
-    `INSERT INTO tools (tool_id, upstream, exposed_name, name, description, input_schema, raw, tool_type, enabled, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+    `INSERT INTO tools (tool_id, upstream, exposed_name, name, description, input_schema, raw, tool_type, enabled, updated_at, shop_scope, schema_hash)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
      ON CONFLICT(upstream, tool_id) DO UPDATE SET
        exposed_name = excluded.exposed_name,
        name = excluded.name,
@@ -397,8 +443,21 @@ export function upsertTool(t: {
        input_schema = COALESCE(excluded.input_schema, input_schema),
        raw = excluded.raw,
        tool_type = excluded.tool_type,
-       updated_at = excluded.updated_at`
-  ).run(t.tool_id, t.upstream ?? 'lingxing', t.exposed_name, t.name, t.description, t.input_schema, t.raw ?? null, t.tool_type, new Date().toISOString());
+       updated_at = excluded.updated_at,
+       shop_scope = excluded.shop_scope,
+       schema_hash = excluded.schema_hash`
+  ).run(t.tool_id, upstream, t.exposed_name, t.name, t.description, t.input_schema, t.raw ?? null, t.tool_type, new Date().toISOString(), shopScope, newHash);
+}
+
+/**
+ * 管理员手动设置 shop_scope —— 写入生效值，清空建议值（管理员确认了就不需要建议了）。
+ * 同时更新 schema_hash 以当前最新值，避免后续 sync 把已审核的工具又退回 unreviewed。
+ */
+export function setToolShopScope(upstream: string, toolId: string, scope: 'unreviewed' | 'shop_scoped' | 'global_safe'): boolean {
+  const tool = db.prepare('SELECT input_schema FROM tools WHERE upstream=? AND tool_id=?').get(upstream, toolId) as { input_schema: string | null } | undefined;
+  const hash = tool?.input_schema ? createHash('sha256').update(tool.input_schema).digest('hex').slice(0, 16) : '';
+  const result = db.prepare('UPDATE tools SET shop_scope=?, shop_scope_suggest=?, schema_hash=? WHERE upstream=? AND tool_id=?').run(scope, '', hash, upstream, toolId);
+  return result.changes > 0;
 }
 
 /**
