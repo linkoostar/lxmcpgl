@@ -228,62 +228,55 @@ function checkRateLimit(userId: number, limitPerMin: number): boolean {
 }
 
 // ---------- 店铺参数校验 ----------
-// 注意：profile_id / profile_ids 是 Amazon 广告体系的 profile ID，和领星 shop sid 完全不同！
-// 不能和 shop sid 混在一个白名单比对里 —— profile_id 暂不参与 shop 级校验（shops 表无映射）。
-
-const SHOP_SID_KEYS = new Set([
-  'sid',
-  'sids',
-  'store_id',
-  'store_ids',
-  'shop_id',
-  'shop_ids',
+// 统一的店铺参数字段集合（校验侧 + 提取侧共用，避免口径漂移）
+// 包含：shop sid / store_id / seller_id / profile_id / account_id
+// profile_id 之前注释说"暂不参与校验"，但 shops 表已有 profile_id 列和映射，必须纳入！
+const SHOP_PARAM_KEYS = new Set([
+  'sid', 'sids',
+  'store_id', 'store_ids',
+  'shop_id', 'shop_ids',
+  'seller_id', 'seller_ids',
+  'profile_id', 'profile_ids',
+  'account_id', 'account_ids',
+  'pvi_ids',
 ]);
 
-const SELLER_ID_KEYS = new Set([
-  'seller_id',
-  'seller_ids',
-]);
-
-const SHOP_PARAM_KEYS = new Set([...SHOP_SID_KEYS, ...SELLER_ID_KEYS]);
-
-function extractShopValues(value: unknown, out: string[], depth = 0): void {
-  if (depth > 3 || value === null || value === undefined) return;
-  if (typeof value === 'string') {
-    for (const part of value.split(',')) {
-      const s = part.trim();
-      if (s) out.push(s);
-    }
-    return;
-  }
-  if (typeof value === 'number' || typeof value === 'boolean') {
-    out.push(String(value));
-    return;
-  }
-  if (Array.isArray(value)) {
-    for (const v of value) extractShopValues(v, out, depth + 1);
-    return;
-  }
-  if (typeof value === 'object') {
-    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-      if (SHOP_PARAM_KEYS.has(k.toLowerCase())) extractShopValues(v, out, depth + 1);
-      else extractShopValues(v, out, depth + 1);
-    }
-  }
-}
-
+/**
+ * 递归提取请求参数里的所有店铺引用。
+ *
+ * 审计复现：旧版 collectShopRefs 只扫顶层 + 一层嵌套对象，不扫数组内对象
+ * → {items:[{sid:"9999"}]}、{a:{b:{sid:"9999"}}} 全部漏掉 → shopRefs=0 →
+ * shopRequired 判断错误 → 校验被绕过。
+ *
+ * 新版：深度 6，遍历所有层级所有数组元素。
+ */
 function collectShopRefs(args: Record<string, unknown>): string[] {
   const out: string[] = [];
-  // 仅扫描顶层与一层嵌套对象的店铺字段，避免误伤列表内容
-  for (const [k, v] of Object.entries(args)) {
-    if (SHOP_PARAM_KEYS.has(k.toLowerCase())) {
-      extractShopValues(v, out, 0);
-    } else if (v && typeof v === 'object' && !Array.isArray(v)) {
-      for (const [k2, v2] of Object.entries(v as Record<string, unknown>)) {
-        if (SHOP_PARAM_KEYS.has(k2.toLowerCase())) extractShopValues(v2, out, 0);
+  const visit = (node: unknown, depth = 0) => {
+    if (depth > 6 || node === null || node === undefined) return;
+    if (Array.isArray(node)) {
+      for (const item of node) visit(item, depth + 1);
+      return;
+    }
+    if (typeof node === 'object') {
+      for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
+        const key = k.toLowerCase();
+        if (SHOP_PARAM_KEYS.has(key)) {
+          // 店铺字段 → 提取值
+          if (typeof v === 'string') {
+            v.split(',').map((s) => s.trim()).filter(Boolean).forEach((s) => out.push(s));
+          } else if (Array.isArray(v)) {
+            v.map((x) => String(x)).filter(Boolean).forEach((x) => out.push(x));
+          } else if (typeof v === 'number' || typeof v === 'bigint') {
+            out.push(String(v));
+          }
+        }
+        // 无论是不是店铺字段，都递归子节点
+        if (v && typeof v === 'object') visit(v, depth + 1);
       }
     }
-  }
+  };
+  visit(args);
   return [...new Set(out)];
 }
 
@@ -729,30 +722,31 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
     // 店铺级校验（仅对运营用户 + 店铺维度上游生效）
     // 非店铺维度上游（西柚/NocoDB 等）的参数里即使出现 seller_id 之类字段，也与 shops 白名单无关
     const isShopScoped = isShopScopedUpstream(tool.upstream ?? '');
-    // 判断 schema 是否要求店铺参数必填
-    // 店铺参数名（和 SHOP_KEYS 对齐，但这里看 schema.required 里有没有出现）
-    const SHOP_SCHEMA_KEYS = ['sid', 'sids', 'shop_id', 'shop_ids', 'store_id', 'store_ids', 'seller_id', 'seller_ids', 'profile_id', 'profile_ids', 'account_id', 'account_ids'];
-    let shopRequired = false;
+    // 判断 schema 里是否存在任意店铺类字段（不论 required 与否）
+    // 审计兜底：只要 schema.properties 里有店铺字段，受限用户不传就拒绝。
+    // 理由：依赖"响应裁剪兜底"是不安全的（汇总行、无店铺标识的行漏出）。
+    let schemaHasShopField = false;
     try {
       const schema = tool.input_schema ? JSON.parse(tool.input_schema) : null;
-      const required = schema?.required;
-      if (Array.isArray(required) && required.some((k: string) => SHOP_SCHEMA_KEYS.includes(k))) {
-        shopRequired = true;
+      const props = schema?.properties;
+      if (props && typeof props === 'object') {
+        schemaHasShopField = Object.keys(props).some((k) => SHOP_PARAM_KEYS.has(k.toLowerCase()));
       }
-    } catch { /* schema 坏了就当非必填 */ }
+    } catch { /* schema 坏了就当无 */ }
 
     if (identity.kind === 'user' && !identity.all_shops && isShopScoped) {
-      // 店铺参数必填但没传 → 直接拒绝（fail-closed，比跳过校验然后拿到全店数据安全）
-      if (shopRequired && shopRefs.length === 0) {
-        logOutcome(false, true, '工具要求店铺参数但未提供');
+      // schema 存在店铺字段但 shopRefs 为空 → 直接拒绝（fail-closed）
+      if (schemaHasShopField && shopRefs.length === 0) {
+        logOutcome(false, true, '工具含店铺参数但请求未提供');
         return errorResult(
-          `该工具需要店铺参数（如 sid/sids/profile_ids 等），但请求中未找到。请在参数里指定要查询的店铺。`,
-          { type: 'invalid_params', upstream: tool.upstream, tool: name, reason: 'missing_required_shop_param' }
+          `该工具的参数里包含店铺字段（如 sid/sids/store_id/seller_id/profile_ids 等），
+但请求中未找到。请在参数里指定要查询的店铺，或改用明确店铺范围的工具。`,
+          { type: 'invalid_params', upstream: tool.upstream, tool: name, reason: 'missing_shop_param' }
         );
       }
-      // shopRefs 为空 + 非必填 → 跳过参数级校验，走响应裁剪兜底
+      // shopRefs 为空 + schema 也没店铺字段 → 这是全 ERP 级工具，确实不需要店铺参数，放行
       if (shopRefs.length === 0) {
-        console.warn(`[mcp] ${identity.username} ${name} shopRefs=0，跳过参数级店铺校验（走响应裁剪兜底）`);
+        console.log(`[mcp] ${identity.username} ${name} shopRefs=0，schema 无店铺字段 → 放行（全 ERP 级工具）`);
       } else {
         const allowedShopIds = new Set(getUserShopIds(identity.id));
         // fail-closed：user_shops 为空 → 配置缺失，明确拒绝调用
