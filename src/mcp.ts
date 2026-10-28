@@ -483,24 +483,39 @@ function stripInternalUrlsInNode(node: unknown, stat: { removed: number }): unkn
 }
 
 /** 清理 MCP content 里 JSON 文本中的内网 URL 字段 */
+/**
+ * 清理 MCP content 里 JSON 文本中的内网 URL 字段（仅对 NocoDB 等需要）。
+ *
+ * 评审（严重）：原实现无条件 JSON.parse → JSON.stringify，
+ * 每次成功响应都走，导致 2^53 以上整数 ID 丢精度（9007199254740993 → 9007199254740992）、
+ * 格式被规整（1.0 → 1）。修复：只有 stat.removed > 0（真删了东西）才重写文本，
+ * 否则原样返回，不碰上游原始字节。
+ */
 function stripInternalUrlsInContent(content: unknown, stat: { removed: number }): unknown {
   if (!Array.isArray(content)) return content;
   return content.map((part: any) => {
     if (!part || typeof part !== 'object' || typeof part.text !== 'string') return part;
     try {
       const parsed = JSON.parse(part.text);
-      return { ...part, text: JSON.stringify(stripInternalUrlsInNode(parsed, stat)) };
+      const before = stat.removed;
+      const cleaned = stripInternalUrlsInNode(parsed, stat);
+      if (stat.removed > before) {
+        // 真删了东西才重写
+        return { ...part, text: JSON.stringify(cleaned) };
+      }
+      // 没变，原样返回，避免 parse→stringify 丢精度
+      return part;
     } catch {
       return part;
     }
   });
 }
 
-/** 上游已知问题标注：让 Agent 在 tools/list 阶段就知道这些工具当前不可靠 */
-const TOOL_CAVEATS: Record<string, string> = {
-  'lingxing:platform_store_report_list': '⚠️ 上游已知问题：该接口常返回空/不可用数据，不要据此判断店铺业绩。',
-  'lingxing:platform_walmart_bill_statement_list': '⚠️ 前置条件：需先在领星完成沃尔玛店铺授权与账期同步，否则返回空列表。',
-};
+/**
+ * 上游已知问题标注 — 已废弃。
+ * 评审：硬编码上游事实，上游修好后需手动删，和"上游修好网关不该跟着改"原则冲突。
+ * 上游工具的可靠性问题应由运维通过实际调用观测，不需要网关在描述里插警告。
+ */
 
 // ---------- 主处理 ----------
 
@@ -587,10 +602,9 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
         // 在 description 开头注入「来源」，LLM 一眼就能按域分组
         const descPrefix = upstreamDesc ? `[来自 ${upstreamName} · ${upstreamDesc}] ` : `[来自 ${upstreamName}] `;
         const rawDesc = r.description || r.name || r.exposed_name;
-        const caveat = TOOL_CAVEATS[`${r.upstream}:${r.tool_id}`];
         return {
           name: exposedNameOf(r),
-          description: descPrefix + (caveat ? `${caveat} ` : '') + rawDesc,
+          description: descPrefix + rawDesc,
           inputSchema: safeParseSchema(r.input_schema),
           // 非标准扩展字段，Agent/客户端如果认 MCP tools 里的自定义字段可以直接用
           _upstream: r.upstream,
@@ -693,20 +707,15 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
       return errorResult(`该工具为写操作，已被网关禁用: ${name}`, { type: 'permission_denied', upstream: tool.upstream, tool: name });
     }
 
-    // ---- 参数预校验 ----
-    // 上游（尤其领星）会把所有参数问题压缩成 code:102，调用方无法定位字段。
-    // 网关按 tools/list 公示的 schema 先做保守校验，直接返回字段路径。
+    // ---- 参数预校验（降级为 warning 日志，不拦截）----
+    // 评审指出：用本地缓存 schema 拦截请求，上游改了 schema 网关没 sync 时会误拒。
+    // 和"上游修好后网关不该跟着改"原则冲突。
+    // 降级为：校验失败只记日志，请求照常转发，由上游判断真正的参数错误。
+    // 好处：上游返回的 code:102 会被 detectBizErrorInContent 捕获并转成 MCP 错误，
+    // 网关仍然会返回清晰的错误，但不会自己拦。
     const validationIssue = validateArgs(safeParseSchema(tool.input_schema), args);
     if (validationIssue) {
-      logOutcome(false, true, `参数校验失败: ${validationIssue.message}`);
-      return errorResult(`参数校验失败: ${validationIssue.message}`, {
-        type: 'invalid_params',
-        upstream: tool.upstream,
-        tool: name,
-        field: validationIssue.field,
-        expected: validationIssue.expected,
-        got: validationIssue.got,
-      });
+      console.warn(`[mcp] 参数预校验 warning (${name}): ${validationIssue.message} (field=${validationIssue.field})，放行由上游判断`);
     }
 
     // 店铺级校验（仅对运营用户 + 店铺维度上游生效）
@@ -983,7 +992,10 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
         if (scrubStat.removed > 0) {
           console.log(`[mcp] ${caller} ${name} 已移除 ${scrubStat.removed} 个内网 URL 字段`);
         }
-        return { content: filteredContent };
+        // 返回：透传 structuredContent（部分上游如 NocoDB 返回结构化 JSON）
+        const ret: any = { content: filteredContent };
+        if ((callResult as any).structuredContent !== undefined) ret.structuredContent = (callResult as any).structuredContent;
+        return ret;
       }
       logOutcome(false, true, '上游返回为空');
       return errorResult('上游返回为空');

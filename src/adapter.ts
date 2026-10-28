@@ -49,6 +49,8 @@ export interface McpCallResult {
   upstreamError?: UpstreamErrorInfo;
   /** 空壳数据标记（detectEmptyShell 的结果透传） */
   emptyShell?: { isEmpty: boolean; effectiveRows: number; warn: string | null };
+  /** structuredContent（标准 MCP 字段，部分上游返回结构化 JSON 而非文本） */
+  structuredContent?: unknown;
 }
 
 /** Adapter 接口 — 所有上游必须实现 */
@@ -475,12 +477,13 @@ class FlatMcpAdapter implements UpstreamAdapter {
     }
     const content = resp.result.content;
     // 空壳检测：某些上游返回 isError=false 但关键字段全 null
+    // 只写日志，不往响应里插 __gateway_warn —— 评审指出：
+    // 这是网关对上游数据的解读，不属于透传职责；空壳日志已在 call_logs 里记录
     const shell = detectEmptyShell(content);
     if (shell.warn) {
-      // __gateway_warn 插到 content 第一个位置
-      content.unshift({ type: 'text', text: JSON.stringify({ __gateway_warn: shell.warn }) });
+      console.warn(`[adapter] ${config.id} call 返回疑似空壳: ${shell.warn}`);
     }
-    return { content, isError: resp.result.isError, emptyShell: shell };
+    return { content, isError: resp.result.isError, emptyShell: shell, structuredContent: resp.result.structuredContent };
   }
 
   async probe(config: UpstreamConfig): Promise<boolean> {
