@@ -1,6 +1,8 @@
 # lxmcpgl — 方中 MCP 网关
 
-多上游 MCP 聚合中转网关：领星 ERP（元工具模式 `help → search → action`，289+ 业务工具）、西柚、NocoDB 等统一接入，对外以标准 MCP streamable HTTP 暴露。
+多上游 MCP 聚合中转网关：领星 ERP（元工具模式 `help → search → action`，289+ 业务工具）、西柚（广告/ABA 分析）、SIF（市场/流量）、NocoDB（数据层）等统一接入，对外以标准 MCP streamable HTTP 暴露。
+
+**v1.2.0** — 正式生产就绪版本。核心安全加固 + 透传原则收尾 + token 优化。
 
 ## 设计原则（重要）
 
@@ -23,13 +25,30 @@
 
 上游给什么就透传什么，只在协议层做正确的错误转换。
 
-- **真实密钥不出容器**：上游 API Key 只保存在网关数据库中，运营仅接触网关发放的下游 Key
-- **多上游聚合**：adapter 路由，领星元工具模式（`lingxing-meta`）和标准扁平 MCP（`flat-mcp`）统一适配；`tools/list` 自动给工具加 `[来自 XX]` 前缀 + 同名冲突加 `upstream__` 前缀
-- **业务错误全链路可见**：领星等上游用 HTTP 200 包装业务错误（外层 `success:true code:1`，内层才藏 `success:false code:0 msg:"参数非法"`），网关在协议层把内层错误挖到 MCP `isError:true` + 标准错误信封，带 `upstream_code`（原始码）、`trace_id`（全链路追踪）；工具定义版本 hash 自动感知变更
-- **定期同步**：`PERIODIC_SYNC_INTERVAL_MS` 驱动定时全量 sync + hash 对比，上游悄悄改工具定义提前到位，不等 102 触发才兜底
-- **Credits 消耗可追溯**：调用记录表格和 CSV 导出直接带 `Credits` 列，和 `cost_logs` 双写对账
-- **Web 管理后台**：上游配置、连通测试、工具同步与启停、下游 Key 管理、调用记录浏览与 CSV 导出
-- **已适配细节**：领星 `help` 分页参数为 `offset/limit`；业务调用统一经 `action(toolId, params)`；JSON / SSE 双响应兼容；cookie 名带部署后缀（`LX_COOKIE_SUFFIX`），同域名多实例互不干扰
+## 核心能力一览
+
+| 能力 | 说明 |
+|------|------|
+| **协议转换** | 领星元工具模式嵌套 `{toolId, params}` 自动处理；flat-mcp（西柚/SIF/NocoDB）直接透传；URL query 认证（如 SIF `?secret-key=`）、API Key header、自定义 headers 三种认证方式自动识别 |
+| **错误通道归一** | 领星双层响应（外层 `success:true code:1` 掩盖内层 `success:false code:0`）→ 挖到 MCP `isError:true`；西柚等 HTTP 风格 `status≥400 + error:true` → 同样归一，带 `upstream_code` / `trace_id` |
+| **只读裁剪** | write 工具对运营默认拦截（block_write=1），需管理员手动例外才能放行 |
+| **店铺隔离（仅领星）** | `adapter=lingxing-meta` 强制 shop_scoped — 递归提取所有层级/数组内的店铺字段（`sid / sids / store_id / profile_id / seller_id` 等），四种 ID 映射到 sid 后 every 校验，fail-closed 拒绝非白名单店铺调用 + 响应裁剪 |
+| **Token 优化** | schema 最小化（丢 description/title/pattern/additionalProperties/$defs，保留 type/enum/required/items 递归）+ description 截断 300 chars → tools/list 从 ~80K tokens 降到 ~69K tokens（-14%） |
+| **可观测性** | `upstream_code` 回填上游原始码、`trace_id` 贯通全链路、调用日志入库 + CSV 导出 + Credits 追溯 |
+| **安全** | 下游 Key 随机生成 + SHA-256 存储 + 每次请求查库；管理员 Key 设置页默认 masked 显示 + 👁 按需明文；店铺校验 fail-closed 兜底；SQLite 用预编译语句 |
+| **Web 管理后台** | 上游配置 + 连通测试 + 工具同步启停；下游 Key 管理 + 店铺同步；工具列表筛选 + 批量启停 + 批量 write 分配；调用日志浏览 + CSV 导出 |
+| **定期同步** | `PERIODIC_SYNC_INTERVAL_MS` 驱动定时全量 sync + schema hash（canonicalize 后 SHA-256 前 16 位）对比；领星 code=102 自动刷新 schema 重试 |
+
+## 多上游接入
+
+| 上游 | adapter | 工具数 | 认证方式 | 店铺隔离 |
+|------|---------|--------|----------|----------|
+| 领星 fangzhong-mcp | `lingxing-meta` | 289（212 read + 87 write） | API Key header | ✅ 强制 shop_scoped |
+| 西柚 | `flat-mcp` | 58 | API Key header | ❌ 跳过（公共数据源） |
+| SIF | `flat-mcp` | 34 | URL query `?secret-key=` | ❌ 跳过（公共数据源） |
+| NocoDB | `flat-mcp` | 按需 | 自定义 headers | ❌ 跳过 |
+
+> flat-mcp 上游的接入：在 Web 后台「上游配置」新增，选 adapter=flat-mcp，填 URL。URL query 里有 `key/token/secret/auth/access/api_key` 等关键词时自动识别为 URL 认证（api_key 字段留空即可）。
 
 ## 快速开始（群晖等 Docker 环境）
 
@@ -64,11 +83,11 @@ mkdir -p data && docker compose up -d
 
 「运营用户」页可创建多个运营账号，每个账号独立 Bearer Key（数据库只存 SHA-256 哈希）、可单独停用 / 重置 / 删除、限速（次/分钟）。点「权限」可为每个账号配置：
 
-- **工具白名单**：全部工具 或 自定义勾选（支持搜索、全选、清空）；白名单外的工具在 `tools/list` 中不可见，调用也会被拒
-- **店铺白名单**：全部店铺 或 自定义勾选（先在「系统设置」→「同步店铺」拉取领星店铺）；调用参数中的 `sid / sids / store_id / store_ids / shop_id / shop_ids / profile_id / profile_ids` 逐一校验，未授权店铺直接拒绝
-- **写操作管控**：「系统设置」→「禁止运营用户调用 write 类工具」开启后，write 类工具对运营全部拦截（工具读写类型来自上游标记，缺失时按工具名动词自动归类，可在工具列表查看每行的类型标签）
+- **工具白名单**：全部工具（需注意：`admin123` 默认模板只填 read 类）或自定义勾选（支持搜索、全选、清空）；白名单外的工具在 `tools/list` 中不可见，调用也会被拒
+- **店铺白名单**：全部店铺 或 自定义勾选（先在「系统设置」→「同步店铺」拉取领星店铺，从 `get_my_sids` + `ad_auth_shops` 双接口补全 `sid / seller_id / store_id / profile_id` 四值域）；调用时递归提取所有层级/数组内的店铺字段，映射到 sid 后 every 校验，未授权店铺直接拒绝
+- **写操作管控**：全局默认开启（`block_write=1`），运营不能调用任何 write 类工具。需开放某一个时，在工具权限里**手动勾选**即可放行（不影响其他 write 工具）。write 类型来自上游标记，缺失时按工具名动词归类，可在工具列表查看每行的类型标签
 
-管理员通用 Key（系统设置页）拥有全部工具与店铺权限，不受白名单和写管控限制。
+管理员通用 Key（系统设置页）拥有全部工具与店铺权限，不受白名单和写管控限制。**设置页默认 masked 显示，点击 👁 才显示明文**。
 
 ## 工具列表批量操作
 
@@ -130,10 +149,25 @@ npm start
 
 > 首次发布后，ghcr 包默认 **private**：到 GitHub 仓库 → Packages → 该包 → Package settings → 改为 Public（或拉取方 `docker login ghcr.io`）。
 
+## 生产部署安全 Checklist
+
+| # | 项 | 严重度 | 说明 |
+|---|------|--------|------|
+| 1 | 改 admin 密码 | 🔴 必改 | docker-compose 默认 `admin123` |
+| 2 | HTTPS 反代 | 🔴 必加 | Cookie 无 Secure，Bearer key 明文传输 |
+| 3 | 数据目录权限 | 🔴 必锁 | `chmod 600 ./data/*.db`；明文 SQLite 含所有上游 Key + 下游 Key 哈希 |
+| 4 | ghcr.io 换本地 build | 🟡 建议 | 别用 `pull_policy: always` + `:latest`，改成本地 `docker build` 固定 tag |
+| 5 | LX_COOKIE_SUFFIX | 🟡 多实例必须 | 同域名多实例**必须设不同值**，否则 session 互相踢下线 |
+| 6 | PERIODIC_SYNC_INTERVAL_MS | 🟡 建议 | 设 `600000`（10 分钟）定期同步上游工具定义 |
+| 7 | 上游 api_key | 🟡 注意 | URL query 认证的上游（如 SIF）api_key 字段留空，否则自动加 Authorization header 可能触发 401 |
+| 8 | 备份加密 | 🟢 建议 | SQLite 数据目录定期备份 + 加密存储 |
+| 9 | /health /version 暴露 | 🟢 可选 | 如需隐藏，加 Bearer Key 校验或只绑内部端口 |
+
 ## 路线图
 
 - [x] **阶段 1**：中转 + Web 管理
-- [x] **阶段 2**：多运营用户（独立 Key / 停用 / 重置 / 限流）、工具白名单、店铺级权限（同步 `get_my_sids` + `ad_auth_shops` 双接口补全 `sid/seller_id/store_id/profile_id` 四值域桥接 + fail-closed 兜底）、write 类管控、工具批量启停、上游 Schema 过期（code 102）自动刷新重试
-- [x] **阶段 3**：多上游聚合（`lingxing-meta` / `flat-mcp` adapter 路由）、调用日志入库 + 筛选 + CSV 导出、Credits 消耗追溯、**双层响应内层业务错误检测**（外层 `success:true code:1` 掩盖的内层 `success:false code:0`，挖到 MCP 错误通道）、定期同步 + hash 对比、cookie 部署后缀隔离
-- [ ] **阶段 4**：write 操作审批、用量看板、告警、`detectEmptyShell` 降级为纯日志（不拦截）
+- [x] **阶段 2**：多运营用户（独立 Key / 停用 / 重置 / 限流）、工具白名单、店铺级权限（四值域桥接 + fail-closed）、write 类管控、工具批量启停、上游 Schema 过期（code 102）自动刷新重试
+- [x] **阶段 3**：多上游聚合（`lingxing-meta` / `flat-mcp` adapter 路由）、调用日志入库 + 筛选 + CSV 导出、Credits 追溯、双层响应内层业务错误检测、西柚 HTTP 风格 `status≥400 + error:true` 检测、定期同步 + canonicalize hash 对比
+- [x] **阶段 4（v1.2.0）**：透传原则收尾（删掉响应数据语义标记、删掉本地 enum 校验、删掉 _upstream* 冗余字段）、schema 最小化 + description 截断 token 优化、block_write 默认禁 + 手动例外、管理员 Key masked、URL query 认证自动识别
+- [ ] **阶段 5**：write 操作审批、用量看板、告警、调用记录审计日志
 - ~~响应数据语义标记~~（is_placeholder_row / _formulas / 本地 enum 校验等）— **已关闭**，不符合网关设计原则
