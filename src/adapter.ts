@@ -157,6 +157,13 @@ function detectBizErrorInContent(content: Array<{ type: string; text?: string }>
         return buildUpstreamError({ ...parsed, ...inner, code: inner.code });
       }
     }
+
+    // ⑤ HTTP 风格 status >= 400 → 业务错误（西柚/NoCoDB 等 flat-mcp 上游风格）
+    //    西柚 DownstreamError: {status:504, data:{status:504, error:true, message:"..."}}
+    if ((typeof parsed.status === 'number' && parsed.status >= 400) ||
+        (typeof parsed.data?.status === 'number' && parsed.data.status >= 400)) {
+      return buildUpstreamError(parsed);
+    }
   }
   return null;
 }
