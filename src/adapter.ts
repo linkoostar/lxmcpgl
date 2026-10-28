@@ -96,6 +96,44 @@ function pickTraceId(obj: any): string | undefined {
   return d?.traceId ?? d?.trace_id ?? d?.requestId ?? d?.request_id ?? obj?.traceId;
 }
 
+/**
+ * 领星等上游**从不返回 JSON-RPC error**——所有业务错误（102 Schema 过期、403 权限等）
+ * 都包在 result.content[].text 里：{"code":403,"msg":"...","success":false}
+ * 解析 content text JSON，检测 code !== 1（或 code !== 0 视上游而定）或 success === false。
+ * 返回 UpstreamErrorInfo；没有业务错误返回 null。
+ */
+function detectBizErrorInContent(content: Array<{ type: string; text?: string }>): UpstreamErrorInfo | null {
+  if (!Array.isArray(content)) return null;
+  for (const part of content) {
+    if (!part || part.type !== 'text' || typeof part.text !== 'string') continue;
+    let parsed: any;
+    try { parsed = JSON.parse(part.text); } catch { continue; }
+    if (!parsed || typeof parsed !== 'object') continue;
+
+    // success: false 是最可靠的"上游明确说这次调用没成功"信号
+    if (parsed.success === false) {
+      return {
+        code: parsed.code,
+        message: String(parsed.msg ?? parsed.message ?? '上游返回业务错误').slice(0, 500),
+        trace_id: pickTraceId(parsed),
+        raw: parsed,
+      };
+    }
+    // code 不是成功码：领星成功是 code=1；其他上游可能用 code=0，保守起见只拦明确"看起来像错误"的值
+    if (typeof parsed.code === 'number') {
+      if (parsed.code !== 1 && parsed.code !== 0 && parsed.code > 100) {
+        return {
+          code: parsed.code,
+          message: String(parsed.msg ?? parsed.message ?? '上游返回业务错误').slice(0, 500),
+          trace_id: pickTraceId(parsed),
+          raw: parsed,
+        };
+      }
+    }
+  }
+  return null;
+}
+
 // =====================================================
 // 注册中心 — 根据 config.adapter 字段路由到对应实现
 // =====================================================
@@ -207,6 +245,18 @@ class LingxingMetaAdapter implements UpstreamAdapter {
     }
     if (!resp?.result?.content) {
       return { content: [], isError: true, upstreamError: { message: '上游无响应' } };
+    }
+    // ===== 业务错误检测 =====
+    // 领星 upstream **从不返回 JSON-RPC error**——所有业务错误（102 Schema 过期、403 权限、空数据）
+    // 都包在 result.content[].text 里，isError 永远是 false。
+    // 这里必须额外解析 content text JSON，检测 code !== 1 或 success === false。
+    const bizErr = detectBizErrorInContent(resp.result.content);
+    if (bizErr) {
+      return {
+        content: resp.result.content,
+        isError: true,
+        upstreamError: bizErr,
+      };
     }
     return { content: resp.result.content, isError: resp.result.isError };
   }
@@ -321,6 +371,11 @@ class FlatMcpAdapter implements UpstreamAdapter {
     }
     if (!resp?.result?.content) {
       return { content: [], isError: true, upstreamError: { message: '上游无响应' } };
+    }
+    // 扁平 MCP 上游也可能把业务错误包在 content 里（和领星同样风格）
+    const bizErr = detectBizErrorInContent(resp.result.content);
+    if (bizErr) {
+      return { content: resp.result.content, isError: true, upstreamError: bizErr };
     }
     const content = resp.result.content;
     // 空壳检测：某些上游返回 isError=false 但关键字段全 null

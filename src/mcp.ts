@@ -718,7 +718,25 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
       // 延迟 import 避免循环依赖
       const { getAdapter } = await import('./adapter.js');
       const adapter = getAdapter(upConfig);
-      const callResult = await adapter.callTool(upConfig, tool.tool_id, args);
+      let callResult = await adapter.callTool(upConfig, tool.tool_id, args);
+
+      // ===== code=102 自动刷新 Schema + 重试一次 =====
+      // 领星上游工具定义更新后旧 schema 会过期，返回 code=102（业务错误，包在 content 里）。
+      // adapter 层的 detectBizErrorInContent 已经把它转成 upstreamError.code=102。
+      // 这里检测到 102 就调用 refreshToolSchema 拉新 schema，再调一次。
+      const bizCode = callResult.upstreamError?.code;
+      const bizMsg = String(callResult.upstreamError?.message ?? callResult.content?.[0]?.text ?? '');
+      if (bizCode === 102 || SCHEMA_STALE_RE.test(bizMsg)) {
+        console.log(`[mcp] ${caller} ${name} 触发 schema 刷新（code=${bizCode}）`);
+        try {
+          await refreshToolSchema(getUpstreamClient(upConfig.url, upConfig.api_key ?? ''), tool.tool_id, upId);
+          callResult = await adapter.callTool(upConfig, tool.tool_id, args);
+          console.log(`[mcp] ${caller} ${name} 刷新 schema 后重试完成`);
+        } catch (refreshErr: any) {
+          console.warn(`[mcp] ${caller} ${name} schema 刷新异常: ${String(refreshErr?.message ?? refreshErr).slice(0, 200)}`);
+        }
+      }
+
       const duration = Date.now() - logCtx.started;
 
       // cost_logs 写入（上游付费分摊）
