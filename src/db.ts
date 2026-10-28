@@ -422,15 +422,23 @@ export function upsertTool(t: {
   upstream?: string;
 }): void {
   // 计算 input_schema 的 hash，用于检测上游 schema 变更
-  const newHash = t.input_schema ? createHash('sha256').update(t.input_schema).digest('hex').slice(0, 16) : '';
   const upstream = t.upstream ?? 'lingxing';
   const existing = db.prepare('SELECT shop_scope, schema_hash FROM tools WHERE upstream=? AND tool_id=?').get(upstream, t.tool_id) as { shop_scope: string; schema_hash: string } | undefined;
 
   let shopScope = existing?.shop_scope ?? 'unreviewed';
-  // 上游改了 schema → 人工审核过时，自动退回 unreviewed
-  if (existing?.shop_scope && existing.shop_scope !== 'unreviewed' && existing.schema_hash && existing.schema_hash !== newHash) {
-    console.log(`[db] tool ${upstream}.${t.tool_id} schema 变更 (${existing.schema_hash.slice(0,6)}→${newHash.slice(0,6)})，shop_scope=${existing.shop_scope} 退回 unreviewed`);
-    shopScope = 'unreviewed';
+  let newHash: string;
+  if (t.input_schema) {
+    newHash = createHash('sha256').update(t.input_schema).digest('hex').slice(0, 16);
+    // 上游改了 schema → 人工审核过时，自动退回 unreviewed
+    if (existing?.shop_scope && existing.shop_scope !== 'unreviewed' && existing.schema_hash && existing.schema_hash !== newHash) {
+      console.log(`[db] tool ${upstream}.${t.tool_id} schema 变更 (${existing.schema_hash.slice(0,6)}→${newHash.slice(0,6)})，shop_scope=${existing.shop_scope} 退回 unreviewed`);
+      shopScope = 'unreviewed';
+    }
+  } else {
+    // sync 拉不到 schema（search 超时/上游抖动）→ 保留旧 hash + 旧 shop_scope
+    // 因为 input_schema 本身会被 COALESCE 保留旧值，hash 也不应该被空值覆盖
+    newHash = existing?.schema_hash ?? '';
+    console.warn(`[db] tool ${upstream}.${t.tool_id} input_schema 为空，保留旧 hash=${newHash.slice(0,6) || '(空)'}`);
   }
 
   db.prepare(

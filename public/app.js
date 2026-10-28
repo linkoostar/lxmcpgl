@@ -193,13 +193,15 @@ async function loadTools() {
       } catch (e) { toast(e.message); sel.value = t.shop_scope || 'unreviewed'; }
     });
     tdScope.appendChild(sel);
-    // 如果有建议值（sync 自动生成的），在 select 下方显示提示
+    // 建议值（sync 自动生成的）：只提示，不允许点击自动采纳
+    // 评审指出：global_safe 的建议只表示"schema 里没认出店铺字段"，
+    // 不能证明工具不返回跨店数据（sid_list 类工具就是这种情况）。
+    // 管理员必须自己判断后手动选择。
     if (t.shop_scope_suggest && t.shop_scope_suggest !== (t.shop_scope || 'unreviewed')) {
       const hint = document.createElement('div');
       hint.style.fontSize = '10px'; hint.style.marginTop = '2px';
-      hint.style.color = '#d97706'; hint.textContent = `建议: ${scopeLabels[t.shop_scope_suggest]?.text || t.shop_scope_suggest}`;
-      hint.onclick = () => { sel.value = t.shop_scope_suggest; sel.dispatchEvent(new Event('change')); };
-      hint.style.cursor = 'pointer';
+      hint.style.color = '#d97706';
+      hint.textContent = `建议: ${scopeLabels[t.shop_scope_suggest]?.text || t.shop_scope_suggest}（需手动确认）`;
       tdScope.appendChild(hint);
     }
 

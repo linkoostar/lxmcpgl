@@ -420,8 +420,13 @@ function filterContentByShops(
     if (typeof part.text !== 'string') return part;
     try {
       const parsed = JSON.parse(part.text);
+      const before = stat.removed;
       const filtered = filterShopListInNode(parsed, allowedShops, stat, idMap);
-      return { ...part, text: JSON.stringify(filtered) };
+      if (stat.removed > before) {
+        return { ...part, text: JSON.stringify(filtered) };
+      }
+      // 这块没裁掉任何行 → 原样返回，避免 parse→stringify 丢精度
+      return part;
     } catch {
       return part; // 非 JSON 文本原样返回
     }
@@ -992,9 +997,17 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
         if (scrubStat.removed > 0) {
           console.log(`[mcp] ${caller} ${name} 已移除 ${scrubStat.removed} 个内网 URL 字段`);
         }
-        // 返回：透传 structuredContent（部分上游如 NocoDB 返回结构化 JSON）
+        // 返回：透传 structuredContent 仅对不受限用户（admin / all_shops）
+        // 评审：structuredContent 绕过了店铺裁剪 + 内网 URL 清理，
+        // 一旦上游开始返回它，受限运营会拿到未过滤的全店数据
         const ret: any = { content: filteredContent };
-        if ((callResult as any).structuredContent !== undefined) ret.structuredContent = (callResult as any).structuredContent;
+        const hasStructured = (callResult as any).structuredContent !== undefined;
+        const isRestricted = identity.kind === 'user' && !identity.all_shops;
+        if (hasStructured && !isRestricted) {
+          ret.structuredContent = (callResult as any).structuredContent;
+        } else if (hasStructured && isRestricted) {
+          console.warn(`[mcp] ${caller} ${name} 受限用户，不透传 structuredContent（绕过店铺裁剪）`);
+        }
         return ret;
       }
       logOutcome(false, true, '上游返回为空');
