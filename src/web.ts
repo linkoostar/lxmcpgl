@@ -514,7 +514,8 @@ apiRouter.get(
     const upstream = String(req.query.upstream ?? '').trim() || undefined;
     let enabled: number | undefined = undefined;
     if (req.query.enabled !== undefined && req.query.enabled !== '') enabled = String(req.query.enabled) === '1' ? 1 : 0;
-    res.json(listTools(q, page, pageSize, toolType, enabled, upstream));
+    const shopScope = String(req.query.shop_scope ?? '').trim() || undefined;
+    res.json(listTools(q, page, pageSize, toolType, enabled, upstream, shopScope));
   })
 );
 
@@ -536,6 +537,33 @@ apiRouter.patch(
       return;
     }
     res.json({ ok: true, upstream, tool_id, shop_scope });
+  })
+);
+
+// POST /api/tools/batch-shop-scope —— 批量审核 shop_scope
+// body: { shop_scope: 'shop_scoped'|'global_safe'|'unreviewed', items: [{upstream, tool_id}] }
+apiRouter.post(
+  '/tools/batch-shop-scope',
+  requireAuth,
+  wrap(async (req, res) => {
+    const { shop_scope, items } = req.body ?? {};
+    const valid = ['unreviewed', 'shop_scoped', 'global_safe'] as const;
+    if (!valid.includes(shop_scope)) {
+      res.status(400).json({ error: `shop_scope 必须是 ${valid.join(' / ')}` });
+      return;
+    }
+    if (!Array.isArray(items) || items.length === 0) {
+      res.status(400).json({ error: 'items 不能为空数组' });
+      return;
+    }
+    let okCount = 0, failCount = 0;
+    for (const it of items) {
+      try {
+        if (setToolShopScope(it.upstream, it.tool_id, shop_scope)) okCount++;
+        else failCount++;
+      } catch { failCount++; }
+    }
+    res.json({ ok: true, shop_scope, ok_count: okCount, fail_count: failCount, total: items.length });
   })
 );
 

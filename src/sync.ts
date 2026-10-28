@@ -334,7 +334,7 @@ export async function syncTools(): Promise<SyncResult> {
   }
 }
 
-export function listTools(q: string, page: number, pageSize: number, toolType?: string, enabled?: number, upstream?: string): { total: number; items: Array<Record<string, unknown>> } {
+export function listTools(q: string, page: number, pageSize: number, toolType?: string, enabled?: number, upstream?: string, shopScope?: string): { total: number; items: Array<Record<string, unknown>> } {
   const conds: string[] = [];
   const params: unknown[] = [];
   if (q) {
@@ -345,6 +345,7 @@ export function listTools(q: string, page: number, pageSize: number, toolType?: 
   if (upstream) { conds.push('upstream = ?'); params.push(upstream); }
   if (toolType) { conds.push('tool_type = ?'); params.push(toolType); }
   if (enabled !== undefined && enabled !== null) { conds.push('enabled = ?'); params.push(enabled); }
+  if (shopScope) { conds.push(`COALESCE(shop_scope, 'unreviewed') = ?`); params.push(shopScope); }
   const where = conds.length > 0 ? `WHERE ${conds.join(' AND ')}` : '';
   const total = (db.prepare(`SELECT COUNT(*) AS c FROM tools ${where}`).all(...params) as { c: number }[])[0].c;
   const rows = db

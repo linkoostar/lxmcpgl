@@ -82,7 +82,7 @@ document.querySelectorAll('.nav-btn').forEach((b) => b.addEventListener('click',
 
 /* ---------- 工具列表（含批量选择） ---------- */
 
-const toolState = { q: '', page: 1, pageSize: 50, toolType: '', upstream: '', total: 0, selected: new Set(), selectFiltered: false };
+const toolState = { q: '', page: 1, pageSize: 50, toolType: '', upstream: '', shopScope: '', total: 0, selected: new Set(), selectFiltered: false };
 
 /** 工具列表页切到时，把后端 upstream 列表灌进筛选 select（带工具数） */
 async function populateUpstreamFilter() {
@@ -116,6 +116,7 @@ async function loadTools() {
   const params = new URLSearchParams({ q: toolState.q, page: toolState.page, page_size: toolState.pageSize });
   if (toolState.toolType) params.set('tool_type', toolState.toolType);
   if (toolState.upstream) params.set('upstream', toolState.upstream);
+  if (toolState.shopScope) params.set('shop_scope', toolState.shopScope);
   const data = await api('/tools?' + params);
   toolState.total = data.total;
   $('#page-info').textContent = `共 ${data.total} 个工具 · 第 ${toolState.page} / ${Math.max(1, Math.ceil(data.total / toolState.pageSize))} 页`;
@@ -243,6 +244,7 @@ $('#btn-search').addEventListener('click', () => {
   toolState.q = $('#tool-search').value.trim();
   toolState.toolType = $('#tool-type-filter').value;
   toolState.upstream = $('#tool-upstream-filter').value;
+  toolState.shopScope = $('#tool-shop-scope-filter').value;
   toolState.page = 1;
   toolState.selected.clear(); toolState.selectFiltered = false; updateBatchBar();
   loadTools().catch((e) => toast(e.message));
@@ -250,6 +252,7 @@ $('#btn-search').addEventListener('click', () => {
 $('#tool-search').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('#btn-search').click(); });
 $('#tool-type-filter').addEventListener('change', () => $('#btn-search').click());
 $('#tool-upstream-filter').addEventListener('change', () => $('#btn-search').click());
+$('#tool-shop-scope-filter').addEventListener('change', () => $('#btn-search').click());
 $('#btn-prev').addEventListener('click', () => {
   if (toolState.page > 1) { toolState.page--; loadTools().catch((e) => toast(e.message)); }
 });
@@ -313,6 +316,45 @@ async function batchApply(enabled) {
 }
 $('#btn-batch-enable').addEventListener('click', () => batchApply(true));
 $('#btn-batch-disable').addEventListener('click', () => batchApply(false));
+
+$('#batch-shop-scope').addEventListener('change', async () => {
+  const sel = $('#batch-shop-scope');
+  const scope = sel.value;
+  if (!scope) return;
+  // 如果选了"选中全部搜索结果"，selected 里可能只有当前页，
+  // 需要用搜索条件重新拉全量 tool_id 列表再批量提交
+  let items;
+  if (toolState.selectFiltered) {
+    // 用 search 条件拉全部 tool_ids（只取 upstream + tool_id 两列）
+    const params = new URLSearchParams({ q: toolState.q, page: '1', page_size: '500' });
+    if (toolState.toolType) params.set('tool_type', toolState.toolType);
+    if (toolState.upstream) params.set('upstream', toolState.upstream);
+    if (toolState.shopScope) params.set('shop_scope', toolState.shopScope);
+    const r = await api('/tools?' + params);
+    items = r.items.map((t) => ({ upstream: t.upstream, tool_id: t.tool_id }));
+    // 如果还有更多页，提示手动处理
+    if (r.total > toolState.pageSize) {
+      toast(`共 ${r.total} 个，一次性处理前 ${toolState.pageSize} 个。建议缩小搜索条件分批处理。`);
+    }
+  } else {
+    items = [...toolState.selected].map((key) => {
+      const [upstream, tool_id] = key.split('::');
+      return { upstream, tool_id };
+    });
+  }
+  if (items.length === 0) { toast('请先勾选工具'); sel.value = ''; return; }
+  const scopeLabels = { unreviewed: '未审核', shop_scoped: '店铺隔离', global_safe: '全局安全' };
+  if (!confirm(`确定把 ${items.length} 个工具统一标记为「${scopeLabels[scope]}」？`)) { sel.value = ''; return; }
+  try {
+    const r = await api('/tools/batch-shop-scope', { method: 'POST', body: { shop_scope: scope, items } });
+    toast(`批量审核完成：${r.ok_count} 成功 / ${r.fail_count} 失败`);
+    sel.value = '';
+    toolState.selected.clear();
+    toolState.selectFiltered = false;
+    updateBatchBar();
+    loadTools();
+  } catch (e) { toast(e.message); }
+});
 
 $('#btn-sync').addEventListener('click', async () => {
   const btn = $('#btn-sync');

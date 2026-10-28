@@ -51,6 +51,12 @@
           <option value="read">read（只读）</option>
           <option value="write">write（写操作）</option>
         </select>
+        <select id="tool-shop-scope-filter" style="padding:7px 8px;border-radius:8px;border:1px solid var(--border)" title="店铺隔离审核状态筛选">
+          <option value="">全部审核状态</option>
+          <option value="unreviewed">🔴 未审核</option>
+          <option value="shop_scoped">🔵 店铺隔离</option>
+          <option value="global_safe">🟢 全局安全</option>
+        </select>
         <button id="btn-search" class="btn">搜索</button>
         <div class="spacer"></div>
         <span id="sync-status" class="muted"></span>
@@ -60,6 +66,12 @@
         <span id="batch-info" class="muted"></span>
         <button id="btn-batch-enable" class="btn small primary">启用选中</button>
         <button id="btn-batch-disable" class="btn small danger">停用选中</button>
+        <select id="batch-shop-scope" style="padding:5px 8px;border-radius:6px;border:1px solid var(--border);font-size:12px" title="批量设置店铺隔离审核状态">
+          <option value="">批量审核…</option>
+          <option value="shop_scoped">→ 店铺隔离（🔵 必须带店铺参数）</option>
+          <option value="global_safe">→ 全局安全（🟢 无店铺维度）</option>
+          <option value="unreviewed">→ 退回未审核（🔴 拒绝受限运营调用）</option>
+        </select>
         <button id="btn-select-filtered" class="btn small">选中全部搜索结果</button>
         <button id="btn-clear-select" class="btn small ghost">取消选择</button>
       </div>
