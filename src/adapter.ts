@@ -104,6 +104,16 @@ function pickTraceId(obj: any): string | undefined {
  * 解析 content text JSON，检测 code !== 1（或 code !== 0 视上游而定）或 success === false。
  * 返回 UpstreamErrorInfo；没有业务错误返回 null。
  */
+/**
+ * 领星等上游的业务响应都是**双层结构**：
+ *   外层: {"success":true, "code":1, "msg":"操作成功", "data":{...}}
+ *   内层: {"success":false, "code":0, "msg":"页条数必须在20,50...范围内", "data":null}
+ * 外层几乎永远是 success=true code=1（不管业务成功与否），
+ * 真正的业务错误藏在内层 data 里！
+ *
+ * 历史 bug：只查外层 → 参数校验失败、权限不够等业务错误被静默放行 →
+ * Agent 拿空 data.list 继续算 → 出错误结论（成本>售价等）。
+ */
 function detectBizErrorInContent(content: Array<{ type: string; text?: string }>): UpstreamErrorInfo | null {
   if (!Array.isArray(content)) return null;
   for (const part of content) {
@@ -112,28 +122,47 @@ function detectBizErrorInContent(content: Array<{ type: string; text?: string }>
     try { parsed = JSON.parse(part.text); } catch { continue; }
     if (!parsed || typeof parsed !== 'object') continue;
 
-    // success: false 是最可靠的"上游明确说这次调用没成功"信号
+    // ① 外层 success=false → 直接业务错误
     if (parsed.success === false) {
-      return {
-        code: parsed.code,
-        message: String(parsed.msg ?? parsed.message ?? '上游返回业务错误').slice(0, 500),
-        trace_id: pickTraceId(parsed),
-        raw: parsed,
-      };
+      return buildUpstreamError(parsed);
     }
-    // code 不是成功码：领星成功是 code=1；其他上游可能用 code=0，保守起见只拦明确"看起来像错误"的值
-    if (typeof parsed.code === 'number') {
-      if (parsed.code !== 1 && parsed.code !== 0 && parsed.code > 100) {
-        return {
-          code: parsed.code,
-          message: String(parsed.msg ?? parsed.message ?? '上游返回业务错误').slice(0, 500),
-          trace_id: pickTraceId(parsed),
-          raw: parsed,
-        };
+    // ② 外层 code > 100 → 明确业务错误（领星 102/403/...）
+    if (typeof parsed.code === 'number' && parsed.code !== 1 && parsed.code !== 0 && parsed.code > 100) {
+      return buildUpstreamError(parsed);
+    }
+
+    // ====== 内层 data 检测（历史盲区！）======
+    const inner = parsed.data;
+    if (inner && typeof inner === 'object' && !Array.isArray(inner)) {
+      // ③ 内层 success=false → 业务错误（最常见的"假成功"信号）
+      if (inner.success === false) {
+        return buildUpstreamError({ ...parsed, ...inner, code: inner.code ?? parsed.code });
+      }
+      // ④ 内层 code 存在且 !== 1 → 业务错误（领星内层成功码也是 1，0 表示有问题）
+      if (typeof inner.code === 'number' && inner.code !== 1) {
+        return buildUpstreamError({ ...parsed, ...inner, code: inner.code });
+      }
+      // ⑤ 内层 msg 非空 + 内层 data 为 null/undefined → 大概率有问题
+      //    典型：参数非法被拒，内层 data.msg="页条数必须..." 但 data.data=null
+      if (
+        typeof inner.msg === 'string' && inner.msg.length > 0 &&
+        (inner.data === null || inner.data === undefined)
+      ) {
+        return buildUpstreamError({ ...parsed, ...inner, code: inner.code ?? parsed.code });
       }
     }
   }
   return null;
+}
+
+/** 从内层+外层混合构造 UpstreamErrorInfo（内层字段优先） */
+function buildUpstreamError(merged: any): UpstreamErrorInfo {
+  return {
+    code: merged.code,
+    message: String(merged.msg ?? merged.message ?? '上游返回业务错误').slice(0, 500),
+    trace_id: pickTraceId(merged),
+    raw: merged,
+  };
 }
 
 // =====================================================
