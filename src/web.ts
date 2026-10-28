@@ -38,7 +38,9 @@ import { syncTools, syncUpstreamById, isSyncing, listTools, batchSetEnabled, syn
 import { getAdapter } from './adapter.js';
 import { buildHealth } from './health.js';
 
-const COOKIE_NAME = 'lx_session';
+// cookie 名带端口后缀，同域名多实例（比如 8085 老网关 + 8086 新网关）互不干扰
+// 浏览器 cookie 不按端口隔离，必须靠名字区分
+const COOKIE_NAME = `lx_session_${config.port}`;
 const SESSION_TTL_MS = 12 * 3600 * 1000;
 
 // ---------- 会话（HMAC 签名 token，重启不失效） ----------
