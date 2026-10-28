@@ -799,7 +799,33 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
         });
       }
       const content = callResult.content;
-      console.log(`[mcp] ${caller} ${name} ok ${duration}ms upstream=${identity.upstream}`);
+      // 成功日志加 content 字节数 + 数组长度摘要（一眼看出有没有截断）
+      const contentText = content?.find((c) => c.type === 'text')?.text ?? '';
+      const contentBytes = Buffer.byteLength(contentText, 'utf-8');
+      // 递归摘要：找出所有数组的 path→length，如 "data.data→6" / "data.data.list→255"
+      const arrLens: string[] = [];
+      try {
+        const parsed = contentText ? JSON.parse(contentText) : null;
+        const walk = (node: unknown, path: string, depth = 0) => {
+          if (depth > 6 || !node) return;
+          if (Array.isArray(node)) {
+            // 只记录顶层 3 层的数组，避免日志太长
+            if (depth <= 4) arrLens.push(`${path || 'root'}→${node.length}`);
+            node.slice(0, 2).forEach((it, idx) => walk(it, `${path || ''}[${idx}]`, depth + 1));
+          } else if (typeof node === 'object') {
+            for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
+              walk(v, path ? `${path}.${k}` : k, depth + 1);
+            }
+          }
+        };
+        if (parsed) walk(parsed, '');
+      } catch {
+        /* 非 JSON */
+      }
+      const arrSummary = arrLens.length > 0 ? ` arrays[${arrLens.join(';')}]` : '';
+      console.log(
+        `[mcp] ${caller} ${name} ok ${duration}ms upstream=${upId} content=${contentBytes}B${arrSummary}`
+      );
       logOutcome(true, false, undefined, cost);
 
       // 店铺结果裁剪
