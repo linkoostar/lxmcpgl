@@ -1,9 +1,10 @@
 import express from 'express';
 import path from 'node:path';
 import { config } from './config.js';
-import { initDb, getSetting, sha256, getUserByKeyHash, type UserRow } from './db.js';
+import { initDb, getSetting, sha256, getUserByKeyHash, listUpstreams, type UserRow } from './db.js';
 import { apiRouter, apiErrorHandler } from './web.js';
-import { handleMcpRequest, identityFromUser, type McpIdentity } from './mcp.js';
+import { handleMcpRequest, identityFromUser, type McpIdentity, toolsHashOf } from './mcp.js';
+import { syncAllUpstreams } from './sync.js';
 import { buildHealth } from './health.js';
 import type { Request, Response, NextFunction } from 'express';
 
@@ -118,6 +119,36 @@ async function main(): Promise<void> {
     console.log(`[lxmcpgl] MCP 端点: /mcp | 管理后台: /`);
     console.log(`[lxmcpgl] 数据目录: ${config.dataDir}`);
   });
+
+  // ===== 定期同步 + hash 对比（建议 B） =====
+  // 领星等上游不定期改工具定义，等调用失败才刷新（102 触发）为时已晚。
+  // 定期全量 sync + toolsHashOf 对比，变了就自动刷新，提前到位。
+  // 环境变量 PERIODIC_SYNC_INTERVAL_MS 控制间隔（毫秒），默认 0 = 关闭。
+  // 例：PERIODIC_SYNC_INTERVAL_MS=600000 即每 10 分钟同步一次。
+  const intervalMs = parseInt(process.env.PERIODIC_SYNC_INTERVAL_MS ?? '0', 10);
+  if (intervalMs > 0) {
+    setInterval(async () => {
+      try {
+        const activeUp = listUpstreams().filter((u) => u.active);
+        if (activeUp.length === 0) return;
+        const before = toolsHashOf(activeUp);
+        const started = Date.now();
+        const r = await syncAllUpstreams();
+        const after = toolsHashOf(activeUp);
+        if (before !== after) {
+          console.log(
+            `[gw] 定期同步发现工具定义变化：hash ${before} → ${after}，` +
+            `共 ${r.synced}/${r.total_listed} 工具，耗时 ${Date.now() - started}ms`
+          );
+        } else {
+          console.log(`[gw] 定期同步完成：${r.synced}/${r.total_listed} 工具，hash 无变化（${Date.now() - started}ms）`);
+        }
+      } catch (e: any) {
+        console.warn(`[gw] 定期同步异常: ${String(e?.message ?? e).slice(0, 200)}`);
+      }
+    }, intervalMs);
+    console.log(`[lxmcpgl] 定期同步已启用: 每 ${Math.round(intervalMs / 60000)} 分钟`);
+  }
 }
 
 main().catch((e) => {

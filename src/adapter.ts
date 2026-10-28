@@ -191,12 +191,15 @@ class LingxingMetaAdapter implements UpstreamAdapter {
     }
 
     if (resp?.error) {
+      // 领星把业务错误码（如 102）包在 error.data.code 里，顶层 error.code 是 JSON-RPC 层的 -32000
+      // 优先取 data.code，让排查时直接看到上游原始码
+      const errData = resp.error.data as Record<string, unknown> | undefined;
       return {
         content: [],
         isError: true,
         upstreamError: {
-          code: resp.error.code,
-          message: resp.error.message ?? '上游返回错误',
+          code: (errData?.code as number | undefined) ?? resp.error.code,
+          message: resp.error.message ?? (errData?.message as string | undefined) ?? '上游返回错误',
           trace_id: pickTraceId(resp.error),
           raw: resp.error,
         },
@@ -303,12 +306,14 @@ class FlatMcpAdapter implements UpstreamAdapter {
     await client.initialize();
     const resp = await client.callTool(toolId, args);
     if (resp?.error) {
+      // 同样优先挖 error.data.code（部分扁平 MCP 上游也会把业务码包在 data 里）
+      const errData = resp.error.data as Record<string, unknown> | undefined;
       return {
         content: [],
         isError: true,
         upstreamError: {
-          code: resp.error.code,
-          message: resp.error.message ?? '上游返回错误',
+          code: (errData?.code as number | undefined) ?? resp.error.code,
+          message: resp.error.message ?? (errData?.message as string | undefined) ?? '上游返回错误',
           trace_id: pickTraceId(resp.error),
           raw: resp.error,
         },

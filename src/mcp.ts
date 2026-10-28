@@ -95,7 +95,7 @@ function safeParseSchema(s: string | null): Record<string, unknown> {
  * 工具定义版本哈希：只依赖 active upstream 的 (upstream, tool_id, updated_at, schema)。
  * 客户端缓存 tools/list 后，可通过该 hash 判断定义是否变化。
  */
-function toolsHashOf(activeUpstreams: Array<{ id: string }>): string {
+export function toolsHashOf(activeUpstreams: Array<{ id: string }>): string {
   const ids = activeUpstreams.map((u) => u.id);
   if (ids.length === 0) return '';
   const ph = ids.map(() => '?').join(',');
@@ -741,7 +741,16 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
             /* 非 JSON，保留原文 */
           }
         }
-        const rawCode = ue?.code ?? parsed?.code ?? parsed?.error?.code ?? null;
+        // rawCode 多级 fallback：领星把业务码（如 102）包在 error.data.code 或 data.code 里
+        // adapter 层已经优先挖 error.data.code 写入 ue.code，这里再覆盖 content 解析路径的多级嵌套
+        const rawCode =
+          ue?.code ??
+          parsed?.data?.code ??
+          parsed?.data?.data?.code ??
+          parsed?.code ??
+          parsed?.error?.data?.code ??
+          parsed?.error?.code ??
+          null;
         const traceId =
           ue?.trace_id ??
           parsed?.traceId ??
