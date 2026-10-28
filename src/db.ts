@@ -453,8 +453,17 @@ export function upsertTool(t: {
     newHash = hashSchema(t.input_schema);
     // 上游改了 schema → 人工审核过时，自动退回 unreviewed
     if (existing?.shop_scope && existing.shop_scope !== 'unreviewed' && existing.schema_hash && existing.schema_hash !== newHash) {
-      console.log(`[db] tool ${upstream}.${t.tool_id} schema 变更 (${existing.schema_hash.slice(0,6)}→${newHash.slice(0,6)})，shop_scope=${existing.shop_scope} 退回 unreviewed`);
-      shopScope = 'unreviewed';
+      // 区分两种 hash 不一致：
+      //   ① 算法切换：旧版用原始字符串哈希，新版用 canonicalize 后哈希
+      //      → 用旧算法再算一次，如果和 existing 匹配，说明只是算法变了，不退回
+      //   ② 上游 schema 真变了 → 用旧算法也算不出来，退回
+      const oldAlgorithmHash = sha256(t.input_schema).slice(0, 16);
+      if (oldAlgorithmHash === existing.schema_hash) {
+        console.log(`[db] tool ${upstream}.${t.tool_id} hash 算法切换（旧原始→新规范化），shop_scope=${existing.shop_scope} 保持不变`);
+      } else {
+        console.log(`[db] tool ${upstream}.${t.tool_id} schema 变更 (${existing.schema_hash.slice(0,6)}→${newHash.slice(0,6)})，shop_scope=${existing.shop_scope} 退回 unreviewed`);
+        shopScope = 'unreviewed';
+      }
     }
   } else {
     // sync 拉不到 schema（search 超时/上游抖动）→ 保留旧 hash + 旧 shop_scope
