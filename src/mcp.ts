@@ -648,9 +648,14 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
         // 在 description 开头注入「来源」，LLM 一眼就能按域分组
         const descPrefix = upstreamDesc ? `[来自 ${upstreamName} · ${upstreamDesc}] ` : `[来自 ${upstreamName}] `;
         const rawDesc = r.description || r.name || r.exposed_name;
+        // description 截断：领星给的短描述（avg 34）不截；SIF/西柚/ABA 等 flat-mcp 上游会塞 1000+ 字说明
+        // 截到 300 chars 前 200 字足够 agent 判断工具用途（"市场竞争度评估"），不影响 tool discovery 准确性
+        const MAX_DESC_LEN = 300;
+        const fullDesc = descPrefix + rawDesc;
+        const truncated = fullDesc.length > MAX_DESC_LEN ? fullDesc.slice(0, MAX_DESC_LEN) + '…' : fullDesc;
         return {
           name: exposedNameOf(r),
-          description: descPrefix + rawDesc,
+          description: truncated,
           inputSchema: minimizeSchema(safeParseSchema(r.input_schema)),
           // 非标准扩展字段，Agent/客户端如果认 MCP tools 里的自定义字段可以直接用
           _upstream: r.upstream,
