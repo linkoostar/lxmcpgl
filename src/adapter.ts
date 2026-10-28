@@ -131,24 +131,27 @@ function detectBizErrorInContent(content: Array<{ type: string; text?: string }>
       return buildUpstreamError(parsed);
     }
 
-    // ====== 内层 data 检测（历史盲区！）======
+    // ====== 内层 data 检测（领星双层响应的真正业务状态藏这里）======
+    //
+    // 领星双层结构：
+    //   外层: {"success":true, "code":1, "msg":"操作成功", "data":{内层}}
+    //   内层成功: {"code":1, "msg":"成功", "list":[...]}  ← 数据直接塞内层，没有 nested data
+    //   内层失败: {"success":false, "code":0, "msg":"参数非法", "data":null}
+    //
+    // 之前条件⑤（msg非空 + inner.data=null/undefined）过度触发：
+    // 内层成功时也会有 msg="成功" 且 inner.data=undefined（因为数据直接塞 inner）→ 成功被误判为错误。
+    // 删掉条件⑤，领星失败一定有 success=false 或 code!==1，③④ 足够。
     const inner = parsed.data;
     if (inner && typeof inner === 'object' && !Array.isArray(inner)) {
       // ③ 内层 success=false → 业务错误（最常见的"假成功"信号）
       if (inner.success === false) {
         return buildUpstreamError({ ...parsed, ...inner, code: inner.code ?? parsed.code });
       }
-      // ④ 内层 code 存在且 !== 1 → 业务错误（领星内层成功码也是 1，0 表示有问题）
+      // ④ 内层 code !== 1 → 业务错误（领星成功码是 1，0 表示失败）
+      //    注意：只有 inner.code 确实存在（不是 undefined）时才检查，
+      //    扁平成功响应（内层就是 {code:1, list:[...]}）会被正确放行
       if (typeof inner.code === 'number' && inner.code !== 1) {
         return buildUpstreamError({ ...parsed, ...inner, code: inner.code });
-      }
-      // ⑤ 内层 msg 非空 + 内层 data 为 null/undefined → 大概率有问题
-      //    典型：参数非法被拒，内层 data.msg="页条数必须..." 但 data.data=null
-      if (
-        typeof inner.msg === 'string' && inner.msg.length > 0 &&
-        (inner.data === null || inner.data === undefined)
-      ) {
-        return buildUpstreamError({ ...parsed, ...inner, code: inner.code ?? parsed.code });
       }
     }
   }
@@ -386,12 +389,20 @@ export function detectEmptyShell(
  * Agent 经常把它们当成真实数据来算，导致结论偏差。
  *
  * 只加标记，不改任何原字段值，不改排序。
- * 匹配规则：对象任意 string 属性值以 amzn.gr. / amzn.gp. / amzn.mw. 开头 → 该行标记。
+ *
+ * 匹配规则（收紧）：只在**商品标识字段**（fnsku/sku/asin/msku/seller_sku 等）匹配
+ * amzn.gr./amzn.gp./amzn.mw. 前缀时才标记该行。避免误把 price_list 等数组里
+ * 非商品字段的 amzn 前缀值当成占位行。
  */
 export function markPlaceholderRows(
   content: Array<{ type: string; text?: string }>
 ): Array<{ type: string; text?: string }> {
   const PLACEHOLDER_RE = /^amzn\.(gr|gp|mw)\./i;
+  // 商品标识字段名（这些字段的值以 amzn.* 开头才意味着是占位行）
+  const ID_FIELDS = new Set([
+    'fnsku', 'fns_ku', 'seller_sku', 'sku', 'msku', 'asin',
+    'parent_asin', 'sku_id', 'local_sku', 'item_sku',
+  ]);
 
   return content.map((part) => {
     if (part.type !== 'text' || typeof part.text !== 'string') return part;
@@ -404,10 +415,10 @@ export function markPlaceholderRows(
       if (node && typeof node === 'object') {
         const obj = node as Record<string, unknown>;
 
-        // 检测是否是占位行：任意 string 字段匹配 amzn.*. 前缀
+        // 只在商品标识字段匹配时标记，避免误伤 price_list 等里的非商品字段
         let isPlaceholder = false;
-        for (const val of Object.values(obj)) {
-          if (typeof val === 'string' && PLACEHOLDER_RE.test(val)) {
+        for (const [k, v] of Object.entries(obj)) {
+          if (ID_FIELDS.has(k) && typeof v === 'string' && PLACEHOLDER_RE.test(v)) {
             isPlaceholder = true;
             break;
           }

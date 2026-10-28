@@ -160,9 +160,15 @@ function enrichSchemaWithEnums(schema: Record<string, unknown>): Record<string, 
     const prop = props[paramName];
     if (prop && typeof prop === 'object') {
       // 上游已声明 enum 就不覆盖（尊重上游）
-      if (!('enum' in prop) && prop.type === 'integer') {
+      // type 检查放开：领星用 integer，其他上游可能用 number
+      const propType = (prop as any).type;
+      if (!('enum' in prop) && (propType === 'integer' || propType === 'number')) {
         prop.enum = allowed;
-        prop.description = String(prop.description ?? '') + `（仅支持 ${allowed.join(',')}）`;
+        // 只在上游 description 里没有"仅支持"/"枚举"等字样时追加，避免重复
+        const desc = String((prop as any).description ?? '');
+        if (!desc.includes('仅支持') && !desc.includes('枚举')) {
+          (prop as any).description = desc + `（仅支持 ${allowed.join(',')}）`;
+        }
       }
     }
   }
