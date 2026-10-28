@@ -803,11 +803,12 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
       logOutcome(false, true, `上游 ${upId} 未启用`);
       return errorResult(`上游 ${upId} 未配置或已停用`);
     }
-    // api_key 必填 — 除非 upstream 已经配置了自定义 headers 鉴权（如 NocoDB/ABA搜索词用 x-api-key）
+    // 认证方式检查：api_key / 自定义 headers / URL query（如 SIF 的 secret-key）— 三者有一即可
     const hasCustomHeaders = Object.keys(parseUpstreamHeaders(upConfig)).length > 0;
-    if (!upConfig.api_key && !hasCustomHeaders) {
-      logOutcome(false, true, '上游未配置 API Key');
-      return errorResult(`上游 ${upConfig.name} 未配置 API Key 或鉴权 Headers，请联系管理员`);
+    const hasUrlAuth = /[?&](key|token|secret|auth|access|api[_-]?key)=/i.test(upConfig.url ?? '');
+    if (!upConfig.api_key && !hasCustomHeaders && !hasUrlAuth) {
+      logOutcome(false, true, '上游未配置认证');
+      return errorResult(`上游 ${upConfig.name} 未配置认证信息（api_key / headers / URL query），请联系管理员`);
     }
     try {
       // 延迟 import 避免循环依赖
