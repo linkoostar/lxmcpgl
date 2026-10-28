@@ -49,6 +49,8 @@ export function initDb(): void {
       name      TEXT DEFAULT '',
       country   TEXT DEFAULT '',
       seller_id TEXT DEFAULT '',
+      store_id  TEXT DEFAULT '',
+      profile_id TEXT DEFAULT '',
       updated_at TEXT DEFAULT ''
     );
     CREATE TABLE IF NOT EXISTS user_shops (
@@ -173,6 +175,20 @@ function migrate(): void {
   if (!coCols.includes('is_empty_shell')) {
     db.exec(`ALTER TABLE cost_logs ADD COLUMN is_empty_shell INTEGER DEFAULT 0`);
     console.log('[db] cost_logs 已补 is_empty_shell 列');
+  }
+
+  // ===== shops 表扩 store_id + profile_id =====
+  // 领星 ad_campaign_report / FBA 等行内的 store_id 是 Amazon 店铺纯数字 id（如 3894542930），
+  // 跟 seller_id（A1P8NM96COGRQG marketplace token）和 sid（1911 数字）值域都不相同。
+  // 必须从 ad_auth_shops 接口拉完整映射才能正确桥接。
+  const shopCols = (db.prepare(`PRAGMA table_info(shops)`).all() as Array<{ name: string }>).map((c) => c.name);
+  if (!shopCols.includes('store_id')) {
+    db.exec(`ALTER TABLE shops ADD COLUMN store_id TEXT DEFAULT ''`);
+    console.log('[db] shops 已补 store_id 列');
+  }
+  if (!shopCols.includes('profile_id')) {
+    db.exec(`ALTER TABLE shops ADD COLUMN profile_id TEXT DEFAULT ''`);
+    console.log('[db] shops 已补 profile_id 列');
   }
 
   // ===== P0-2：tools 主键从 (tool_id) 迁移为 (upstream, tool_id) =====
@@ -407,12 +423,23 @@ export function getToolById(toolId: string, upstream?: string): ToolRow | undefi
 
 // ---------- shops ----------
 
-export function upsertShop(s: { sid: string; name: string; country: string; seller_id: string }): void {
+export function upsertShop(s: { sid: string; name: string; country: string; seller_id: string; store_id?: string; profile_id?: string }): void {
   db.prepare(
-    `INSERT INTO shops (sid, name, country, seller_id, updated_at) VALUES (?, ?, ?, ?, ?)
+    `INSERT INTO shops (sid, name, country, seller_id, store_id, profile_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(sid) DO UPDATE SET name = excluded.name, country = excluded.country,
-       seller_id = excluded.seller_id, updated_at = excluded.updated_at`
-  ).run(s.sid, s.name, s.country, s.seller_id, new Date().toISOString());
+       seller_id = excluded.seller_id, store_id = excluded.store_id, profile_id = excluded.profile_id,
+       updated_at = excluded.updated_at`
+  ).run(s.sid, s.name, s.country, s.seller_id ?? '', s.store_id ?? '', s.profile_id ?? '', new Date().toISOString());
+}
+
+export function upsertShopByStoreId(s: { store_id: string; name: string; country: string; seller_id?: string; profile_id?: string }): void {
+  // ad_auth_shops 里不一定带 sid，用 store_id 做主键兜底
+  db.prepare(
+    `INSERT INTO shops (sid, name, country, seller_id, store_id, profile_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(sid) DO UPDATE SET name = excluded.name, country = excluded.country,
+       seller_id = excluded.seller_id, store_id = excluded.store_id, profile_id = excluded.profile_id,
+       updated_at = excluded.updated_at`
+  ).run(`store:${s.store_id}`, s.name, s.country, s.seller_id ?? '', s.store_id, s.profile_id ?? '', new Date().toISOString());
 }
 
 export function listShops(): Array<{ sid: string; name: string; country: string; seller_id: string }> {

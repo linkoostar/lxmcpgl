@@ -12,6 +12,7 @@ import {
   sha256,
   getToolById,
   upsertShop,
+  upsertShopByStoreId,
   listShops,
   listUsers,
   getUserById,
@@ -617,23 +618,79 @@ apiRouter.post(
     }
     try {
       const client = getUpstreamClient(getSetting('upstream_url'), getSetting('upstream_key'));
-      const resp = await client.callTool('action', { toolId: 'get_my_sids', params: {} });
-      if (resp?.error) throw new Error(JSON.stringify(resp.error).slice(0, 300));
-      const text = resp?.result?.content?.find((c: any) => c?.type === 'text')?.text ?? '';
-      const payload = JSON.parse(text);
-      const list = payload?.data?.list ?? payload?.data ?? [];
-      if (!Array.isArray(list)) throw new Error('get_my_sids 返回结构异常');
-      for (const s of list) {
-        const sid = s?.id ?? s?.sid;
-        if (sid === undefined || sid === null) continue;
-        upsertShop({
-          sid: String(sid),
-          name: String(s?.name ?? ''),
-          country: String(s?.country ?? s?.country_code ?? ''),
-          seller_id: String(s?.seller_id ?? ''),
-        });
+
+      // ① get_my_sids — 领星 sid + name + country + seller_id
+      const mySidsResp = await client.callTool('action', { toolId: 'get_my_sids', params: {} });
+      if (mySidsResp?.error) throw new Error(JSON.stringify(mySidsResp.error).slice(0, 300));
+      const mySidsText = mySidsResp?.result?.content?.find((c: any) => c?.type === 'text')?.text ?? '';
+      const mySidsPayload = JSON.parse(mySidsText);
+      const mySidsList = mySidsPayload?.data?.list ?? mySidsPayload?.data ?? [];
+      if (Array.isArray(mySidsList)) {
+        for (const s of mySidsList) {
+          const sid = s?.id ?? s?.sid;
+          if (sid === undefined || sid === null) continue;
+          upsertShop({
+            sid: String(sid),
+            name: String(s?.name ?? ''),
+            country: String(s?.country ?? s?.country_code ?? ''),
+            seller_id: String(s?.seller_id ?? ''),
+            store_id: String(s?.store_id ?? s?.storeId ?? ''),
+            profile_id: String(s?.profile_id ?? s?.profileId ?? ''),
+          });
+        }
       }
-      res.json({ ok: true, count: listShops().length });
+
+      // ② ad_auth_shops — Amazon store_id (纯数字) + profile_id → 补全 get_my_sids 没带的字段
+      //    这个接口返回的 store_id 是纯数字 Amazon 店铺 id（如 3894542930），
+      //    和 seller_id（A1P8... token）/ sid（1911 数字）值域都不同，必须单独拉
+      let shopsFromAdAuth = 0;
+      try {
+        const adResp = await client.callTool('action', { toolId: 'ad_auth_shops', params: {} });
+        const adText = adResp?.result?.content?.find((c: any) => c?.type === 'text')?.text ?? '';
+        const adPayload = JSON.parse(adText);
+        // 递归找 shops 列表
+        const findShops = (o: unknown, dep = 0): any[] => {
+          if (dep > 4 || !o) return [];
+          if (Array.isArray(o)) return o.length > 0 && typeof o[0] === 'object' ? o : [];
+          if (typeof o === 'object') {
+            for (const v of Object.values(o as Record<string, unknown>)) {
+              const r = findShops(v, dep + 1);
+              if (r.length > 0) return r;
+            }
+          }
+          return [];
+        };
+        const adList = findShops(adPayload?.data ?? adPayload);
+        for (const s of adList) {
+          const storeId = s?.store_id ?? s?.storeId;
+          const sid = s?.id ?? s?.sid;
+          const profileId = s?.profile_id ?? s?.profileId;
+          if (sid) {
+            upsertShop({
+              sid: String(sid),
+              name: String(s?.shop_name ?? s?.name ?? ''),
+              country: String(s?.country_code ?? s?.country ?? ''),
+              seller_id: String(s?.seller_string_id ?? s?.seller_id ?? ''),
+              store_id: String(storeId ?? ''),
+              profile_id: String(profileId ?? ''),
+            });
+          } else if (storeId) {
+            upsertShopByStoreId({
+              store_id: String(storeId),
+              name: String(s?.shop_name ?? s?.name ?? ''),
+              country: String(s?.country_code ?? s?.country ?? ''),
+              seller_id: String(s?.seller_string_id ?? s?.seller_id ?? ''),
+              profile_id: String(profileId ?? ''),
+            });
+            shopsFromAdAuth++;
+          }
+        }
+      } catch (adErr) {
+        // ad_auth_shops 可能因无广告店铺权限而失败，不阻断整体 sync
+        console.warn(`[shops/sync] ad_auth_shops 调用失败（可忽略）: ${String(adErr).slice(0, 200)}`);
+      }
+
+      res.json({ ok: true, count: listShops().length, sids_from_get_my_sids: mySidsList.length, extra_from_ad_auth: shopsFromAdAuth });
     } catch (e: any) {
       res.status(502).json({ error: String(e?.message || e).slice(0, 300) });
     }

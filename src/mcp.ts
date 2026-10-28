@@ -325,14 +325,40 @@ function isShopScopedUpstream(upstreamId: string): boolean {
   return row?.adapter === 'lingxing-meta';
 }
 
-/** 构建 seller_id → Set<sid> + store_id → Set<sid> 的双向映射 */
+/**
+ * 构建 shops 表的 ID 映射。
+ * shops 表现在有三种值域，互相之间完全不相交：
+ *   sid       = 领星店铺 sid（1911 这种纯数字字符串，用于白名单比对）
+ *   store_id  = Amazon 店铺 id（3894542930 这种纯数字，ad_campaign_report 行内带的就是它）
+ *   seller_id = Amazon seller token（A1P8NM96COGRQG 这种 marketplace 格式）
+ *   profile_id = 广告 profile（2077184146349981 这种）
+ * 构建：store_id → Set<sid>、seller_id → Set<sid>、profile_id → Set<sid>
+ */
 function buildShopIdMapping(): Map<string, Set<string>> {
   const map = new Map<string, Set<string>>();
-  const rows = db.prepare('SELECT sid, seller_id FROM shops').all() as Array<{ sid: string; seller_id: string }>;
+  const rows = db
+    .prepare('SELECT sid, seller_id, store_id, profile_id FROM shops')
+    .all() as Array<{ sid: string; seller_id: string; store_id: string; profile_id: string }>;
   for (const row of rows) {
+    // sid 本身也可能被抽到（某些工具返回领星 sid）
+    if (row.sid) {
+      let set = map.get(row.sid);
+      if (!set) { set = new Set(); map.set(row.sid, set); }
+      set.add(row.sid);
+    }
+    if (row.store_id) {
+      let set = map.get(row.store_id);
+      if (!set) { set = new Set(); map.set(row.store_id, set); }
+      set.add(row.sid);
+    }
     if (row.seller_id) {
       let set = map.get(row.seller_id);
       if (!set) { set = new Set(); map.set(row.seller_id, set); }
+      set.add(row.sid);
+    }
+    if (row.profile_id) {
+      let set = map.get(row.profile_id);
+      if (!set) { set = new Set(); map.set(row.profile_id, set); }
       set.add(row.sid);
     }
   }
