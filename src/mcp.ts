@@ -758,28 +758,22 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
             { type: 'permission_denied', upstream: tool.upstream, tool: name, reason: 'no_shop_whitelist' }
           );
         }
-        // 上游所有 seller_id → shop sid 映射（缓存到 handler 内）
-        const sellerToSids = new Map<string, Set<string>>();
-        const sellerRows = db.prepare('SELECT seller_id, sid FROM shops').all() as Array<{ seller_id: string; sid: string }>;
-        for (const row of sellerRows) {
-          if (!row.seller_id) continue; // 过滤空值
-          let set = sellerToSids.get(row.seller_id);
-          if (!set) { set = new Set(); sellerToSids.set(row.seller_id, set); }
-          set.add(row.sid);
-        }
+        // 统一用 buildShopIdMapping（已映射 sid / store_id / seller_id / profile_id → Set<sid>）
+        // 之前自己又写了个 sellerToSids，正则 /^[A-Z0-9]{10,30}$/ 把纯数字 store_id 也匹配成 seller_id，
+        // 然后查不到就拒绝 → 广告类工具（profile_ids）全部失败
+        const idMap = buildShopIdMapping();
 
         const denied: string[] = [];
         for (const ref of shopRefs) {
-          // 如果 ref 是 seller_id 格式（Amazon seller_id 通常 14-22 字符大写字母+数字）
-          const isSellerId = sellerToSids.has(ref) || /^[A-Z0-9]{10,30}$/.test(ref);
-          if (isSellerId) {
-            // seller_id：映射到 shop sid 再比对
-            const mapped = sellerToSids.get(ref);
-            if (!mapped || ![...mapped].some((s) => allowedShopIds.has(s))) {
+          const mapped = idMap.get(ref);
+          if (mapped) {
+            // ref 是映射里的某个 ID（store_id / seller_id / profile_id / sid 本身）
+            if (![...mapped].some((s) => allowedShopIds.has(s))) {
               denied.push(ref);
             }
           } else {
-            // 默认当作 shop sid 直接比对
+            // ref 不在映射里 → 可能是 sid 本身（sid 不在 shops 表里？不应该发生）
+            // 也可能是 shops 表还没 sync 过（空表），按 fail-closed 拒绝
             if (!allowedShopIds.has(ref)) denied.push(ref);
           }
         }
