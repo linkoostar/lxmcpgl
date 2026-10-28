@@ -381,7 +381,8 @@ class FlatMcpAdapter implements UpstreamAdapter {
     // 空壳检测：某些上游返回 isError=false 但关键字段全 null
     const warn = detectEmptyShell(content, toolId);
     if (warn) {
-      content.push({ type: 'text', text: JSON.stringify({ __gateway_warn: warn }) });
+      // __gateway_warn 插到 content 第一个位置
+      content.unshift({ type: 'text', text: JSON.stringify({ __gateway_warn: warn }) });
     }
     return { content, isError: resp.result.isError };
   }

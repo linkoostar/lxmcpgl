@@ -325,6 +325,20 @@ function isShopScopedUpstream(upstreamId: string): boolean {
   return row?.adapter === 'lingxing-meta';
 }
 
+/** 构建 seller_id → Set<sid> + store_id → Set<sid> 的双向映射 */
+function buildShopIdMapping(): Map<string, Set<string>> {
+  const map = new Map<string, Set<string>>();
+  const rows = db.prepare('SELECT sid, seller_id FROM shops').all() as Array<{ sid: string; seller_id: string }>;
+  for (const row of rows) {
+    if (row.seller_id) {
+      let set = map.get(row.seller_id);
+      if (!set) { set = new Set(); map.set(row.seller_id, set); }
+      set.add(row.sid);
+    }
+  }
+  return map;
+}
+
 interface ShopFilterStat {
   removed: number;
 }
@@ -334,28 +348,47 @@ interface ShopFilterStat {
  * - 行内带 sid / shop_id / store_id 等店铺标识且全部不在白名单 → 删除并计数
  * - 行内没有任何店铺标识（汇总行、或无店铺维度的数据）→ 保留，不做猜测
  *
- * 历史教训：之前的 fail-closed 版本会把「整段没有店铺标识的主结果集」清空，
- * 导致上游明明返回了数据，下游却看到空数组 + 总数正确，属于静默丢数据。
+ * 关键：上游返回的 store_id 可能是 marketplace 格式（A1XYW53UGM63O3），
+ * 而 shops 表存的是领星 sid（1911/1875）。必须通过 sellerToSids 映射桥接。
  */
-function filterShopListInNode(node: unknown, allowedShops: Set<string>, stat: ShopFilterStat): unknown {
+function filterShopListInNode(
+  node: unknown,
+  allowedShops: Set<string>,
+  stat: ShopFilterStat,
+  idMap: Map<string, Set<string>>
+): unknown {
   if (Array.isArray(node)) {
     const out: unknown[] = [];
     for (const item of node) {
       if (item && typeof item === 'object' && !Array.isArray(item)) {
         const ids = extractShopIdsFromObj(item as Record<string, unknown>);
-        if (ids.length > 0 && !ids.some((id) => allowedShops.has(id))) {
+        // 比对前先做映射：抽到的 ids 可能是 marketplace/seller 格式，
+        // 需通过 idMap 桥接到 sid 再和 allowedShops 比对
+        const resolvedIds: string[] = [];
+        for (const raw of ids) {
+          if (allowedShops.has(raw)) {
+            resolvedIds.push(raw); // 已经是 sid，直接命中
+          } else if (idMap.has(raw)) {
+            // marketplace/seller_id → 查 shops 表映射的 sid 集合
+            const mappedSids = idMap.get(raw)!;
+            for (const sid of mappedSids) resolvedIds.push(sid);
+          }
+          // 都不是 → 忽略（可能是 profile_id 这种其他平台 id，不做猜测）
+        }
+        if (ids.length > 0 && resolvedIds.length === 0) {
+          // 抽到了店铺标识，但映射后一个都不在白名单 → 明确未授权 → 剔除
           stat.removed += 1;
-          continue; // 明确属于未授权店铺，剔除
+          continue;
         }
       }
-      out.push(filterShopListInNode(item, allowedShops, stat));
+      out.push(filterShopListInNode(item, allowedShops, stat, idMap));
     }
     return out;
   }
   if (node && typeof node === 'object') {
     const out: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
-      out[k] = filterShopListInNode(v, allowedShops, stat);
+      out[k] = filterShopListInNode(v, allowedShops, stat, idMap);
     }
     return out;
   }
@@ -363,14 +396,19 @@ function filterShopListInNode(node: unknown, allowedShops: Set<string>, stat: Sh
 }
 
 /** 对 MCP content 数组应用店铺白名单裁剪，返回新 content 与裁剪统计 */
-function filterContentByShops(content: unknown, allowedShops: Set<string>, stat: ShopFilterStat): unknown {
+function filterContentByShops(
+  content: unknown,
+  allowedShops: Set<string>,
+  stat: ShopFilterStat,
+  idMap: Map<string, Set<string>>
+): unknown {
   if (!Array.isArray(content)) return content;
   return content.map((part: any) => {
     if (!part || typeof part !== 'object') return part;
     if (typeof part.text !== 'string') return part;
     try {
       const parsed = JSON.parse(part.text);
-      const filtered = filterShopListInNode(parsed, allowedShops, stat);
+      const filtered = filterShopListInNode(parsed, allowedShops, stat, idMap);
       return { ...part, text: JSON.stringify(filtered) };
     } catch {
       return part; // 非 JSON 文本原样返回
@@ -850,17 +888,19 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
             allowedShops = new Set(fb.map((r) => r.sid));
           }
           const stat: ShopFilterStat = { removed: 0 };
-          filteredContent = filterContentByShops(content, allowedShops, stat) as any[];
+          const idMap = buildShopIdMapping();
+          filteredContent = filterContentByShops(content, allowedShops, stat, idMap) as any[];
           if (stat.removed > 0) {
             console.log(`[mcp] ${caller} ${name} 店铺裁剪 ${stat.removed} 行（allowed=${allowedShops.size}）`);
+            // __gateway_warn 插到 content 第一个位置，避免客户端因为遍历顺序看不到
             filteredContent = [
-              ...filteredContent,
               {
                 type: 'text' as const,
                 text: JSON.stringify({
                   __gateway_warn: `已按店铺权限过滤 ${stat.removed} 行不属于授权店铺的数据；上游的总数字段（total/recordsFiltered）不会随之变化，不能据其判断明细是否完整`,
                 }),
               },
+              ...filteredContent,
             ];
           }
         }
