@@ -907,7 +907,7 @@ apiRouter.get(
     const upstream = String(req.query.upstream ?? '').trim() || undefined;
     const MAX = 5000;
     const r = listCallLogs({ q, caller, tool, success, since, until, upstream, page: 1, pageSize: MAX });
-    const headers = ['时间', '上游', '调用者', '工具', '上游tool_id', '类型', '成功', '耗时ms', '关联店铺', '错误'];
+    const headers = ['时间', '上游', '调用者', '工具', '上游tool_id', '类型', '成功', '耗时ms', 'Credits', '关联店铺', '错误'];
     const esc = (v: unknown) => {
       const s = v == null ? '' : String(v);
       if (/[",\n]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
@@ -916,6 +916,7 @@ apiRouter.get(
     const rows = r.items.map((row) => [
       row.ts, row.upstream || '', row.caller, row.tool_name, row.tool_id || '',
       row.tool_type || '', row.success ? '是' : '否', row.duration_ms ?? '',
+      row.cost_credits != null ? row.cost_credits : '',
       row.shop_refs || '', row.error || '',
     ].map(esc).join(','));
     const csv = '\uFEFF' + [headers.join(','), ...rows].join('\n'); // BOM 让 Excel 正确识别 UTF-8

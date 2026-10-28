@@ -577,7 +577,7 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
       started: Date.now(),
     };
 
-    function logOutcome(success: boolean, isError: boolean, error?: string): void {
+    function logOutcome(success: boolean, isError: boolean, error?: string, costCredits?: number | null): void {
       insertCallLog({
         caller: logCtx.caller,
         user_id: logCtx.userId,
@@ -590,6 +590,7 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
         is_error: isError,
         duration_ms: Date.now() - logCtx.started,
         error: error ?? null,
+        cost_credits: costCredits ?? null,
       });
     }
 
@@ -739,7 +740,7 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
 
       const duration = Date.now() - logCtx.started;
 
-      // cost_logs 写入（上游付费分摊）
+      // cost_logs + call_logs.cost_credits（两处都写：cost_logs 用于账单汇总，call_logs 用于调用记录可追溯）
       const cost = adapter.extractCost(callResult.content?.[0]?.text);
       if (cost !== null) {
         db.prepare(
@@ -787,7 +788,7 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
         console.error(
           `[mcp] ${caller} ${name} 上游错误 (${duration}ms) code=${String(rawCode)} trace=${String(traceId)}: ${msg.slice(0, 200)}`
         );
-        logOutcome(false, true, `[${upId}] code=${String(rawCode)} ${msg}`.slice(0, 400));
+        logOutcome(false, true, `[${upId}] code=${String(rawCode)} ${msg}`.slice(0, 400), cost);
         return errorResult(`上游返回错误: ${msg}`, {
           type: 'upstream_error',
           upstream: upId,
@@ -799,7 +800,7 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
       }
       const content = callResult.content;
       console.log(`[mcp] ${caller} ${name} ok ${duration}ms upstream=${identity.upstream}`);
-      logOutcome(true, false);
+      logOutcome(true, false, undefined, cost);
 
       // 店铺结果裁剪
       // 只对「店铺维度上游」生效：西柚/NocoDB 等上游没有店铺维度，结果必须原样返回

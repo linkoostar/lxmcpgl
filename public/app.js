@@ -1100,6 +1100,15 @@ async function loadLogList() {
       td(l.duration_ms != null ? `${l.duration_ms}ms` : '-'),
       (() => {
         const c = document.createElement('td');
+        if (l.cost_credits != null && l.cost_credits > 0) {
+          c.innerHTML = `<span style="color:#d97706;font-weight:600">${l.cost_credits}</span>`;
+        } else {
+          c.innerHTML = '<span class="muted">—</span>';
+        }
+        return c;
+      })(),
+      (() => {
+        const c = document.createElement('td');
         if (l.success) c.innerHTML = '<span class="tag ok">成功</span>';
         else c.innerHTML = `<span class="tag no">${l.is_error ? '失败' : '拒绝'}</span>`;
         return c;
@@ -1118,7 +1127,7 @@ async function loadLogList() {
     tbody.appendChild(tr);
   }
   if (!items.length) {
-    tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--muted);padding:30px">暂无调用记录，运营或管理员使用 MCP 网关后会自动记录</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;color:var(--muted);padding:30px">暂无调用记录，运营或管理员使用 MCP 网关后会自动记录</td></tr>';
   }
 }
 

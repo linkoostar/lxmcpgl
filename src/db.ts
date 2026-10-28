@@ -57,18 +57,19 @@ export function initDb(): void {
       PRIMARY KEY (user_id, sid)
     );
     CREATE TABLE IF NOT EXISTS call_logs (
-      id          INTEGER PRIMARY KEY AUTOINCREMENT,
-      ts          TEXT NOT NULL,
-      caller      TEXT NOT NULL,
-      user_id     INTEGER,
-      tool_name   TEXT NOT NULL,
-      tool_id     TEXT,
-      tool_type   TEXT,
-      shop_refs   TEXT,
-      success     INTEGER NOT NULL,
-      is_error    INTEGER NOT NULL,
-      duration_ms INTEGER,
-      error       TEXT
+      id           INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts           TEXT NOT NULL,
+      caller       TEXT NOT NULL,
+      user_id      INTEGER,
+      tool_name    TEXT NOT NULL,
+      tool_id      TEXT,
+      tool_type    TEXT,
+      shop_refs    TEXT,
+      success      INTEGER NOT NULL,
+      is_error     INTEGER NOT NULL,
+      duration_ms  INTEGER,
+      error        TEXT,
+      cost_credits REAL
     );
     CREATE INDEX IF NOT EXISTS idx_call_logs_ts     ON call_logs(ts);
     CREATE INDEX IF NOT EXISTS idx_call_logs_caller ON call_logs(caller);
@@ -136,6 +137,15 @@ function migrate(): void {
   db.exec(`UPDATE user_tools SET upstream = 'lingxing' WHERE upstream IS NULL OR upstream = ''`);
   db.exec(`UPDATE user_shops SET upstream = 'lingxing' WHERE upstream IS NULL OR upstream = ''`);
   db.exec(`UPDATE call_logs  SET upstream = 'lingxing' WHERE upstream IS NULL`);
+
+  // ===== call_logs 加 cost_credits 列 =====
+  // 调用记录里直接带上本次 credits 消耗，前端表格和 CSV 导出都能直接用，
+  // 不用再 JOIN cost_logs（同一调用 cost_logs 也会写，保持双写方便做历史对账）。
+  const clCols = (db.prepare(`PRAGMA table_info(call_logs)`).all() as Array<{ name: string }>).map((c) => c.name);
+  if (!clCols.includes('cost_credits')) {
+    db.exec(`ALTER TABLE call_logs ADD COLUMN cost_credits REAL`);
+    console.log('[db] call_logs 已补 cost_credits 列');
+  }
 
   // ===== P0-2：tools 主键从 (tool_id) 迁移为 (upstream, tool_id) =====
   // 旧库 tool_id 是全局主键，多上游同名工具会互相覆盖（导致错上游、错 credits、错权限）。
@@ -484,6 +494,7 @@ export interface CallLog {
   is_error: number;
   duration_ms: number | null;
   error: string;
+  cost_credits: number | null;
 }
 
 export function insertCallLog(l: {
@@ -498,12 +509,13 @@ export function insertCallLog(l: {
   is_error: boolean;
   duration_ms: number | null;
   error: string | null;
+  cost_credits?: number | null;
 }): void {
   const err = l.error ? String(l.error).slice(0, 500) : '';
   const shops = l.shop_refs ? JSON.stringify(l.shop_refs.slice(0, 50)) : '';
   db.prepare(
-    `INSERT INTO call_logs (ts, caller, user_id, tool_name, tool_id, tool_type, upstream, shop_refs, success, is_error, duration_ms, error)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    `INSERT INTO call_logs (ts, caller, user_id, tool_name, tool_id, tool_type, upstream, shop_refs, success, is_error, duration_ms, error, cost_credits)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
     new Date().toISOString(),
     l.caller,
@@ -516,7 +528,8 @@ export function insertCallLog(l: {
     l.success ? 1 : 0,
     l.is_error ? 1 : 0,
     l.duration_ms,
-    err
+    err,
+    l.cost_credits ?? null
   );
 }
 
