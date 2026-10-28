@@ -124,7 +124,16 @@ function minimizeSchema(schema: any): any {
   // 顶层 type
   if (schema.type !== undefined) out.type = schema.type;
   if (schema.required) out.required = schema.required;
-  if (schema.enum) out.enum = schema.enum;
+  if (schema.enum) {
+    // enum 截断：>20 项截前 20 项 + 加标记。完整校验交给上游，agent 看到不完整标记会更谨慎
+    const MAX_ENUM = 20;
+    if (schema.enum.length > MAX_ENUM) {
+      out.enum = schema.enum.slice(0, MAX_ENUM);
+      out._enum_truncated = true;
+    } else {
+      out.enum = schema.enum;
+    }
+  }
   if (schema.default !== undefined) out.default = schema.default;
   if (schema.properties && typeof schema.properties === 'object') {
     const props: Record<string, any> = {};
@@ -132,7 +141,15 @@ function minimizeSchema(schema: any): any {
       if (v && typeof v === 'object') {
         const p: Record<string, any> = {};
         if ((v as any).type !== undefined) p.type = (v as any).type;
-        if ((v as any).enum) p.enum = (v as any).enum;
+        if ((v as any).enum) {
+          const MAX_ENUM = 20;
+          if ((v as any).enum.length > MAX_ENUM) {
+            p.enum = (v as any).enum.slice(0, MAX_ENUM);
+            p._enum_truncated = true;
+          } else {
+            p.enum = (v as any).enum;
+          }
+        }
         if ((v as any).default !== undefined) p.default = (v as any).default;
         // 嵌套对象递归
         if ((v as any).properties) p.properties = minimizeSchema((v as any).properties);
@@ -657,10 +674,6 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
           name: exposedNameOf(r),
           description: truncated,
           inputSchema: minimizeSchema(safeParseSchema(r.input_schema)),
-          // 非标准扩展字段，Agent/客户端如果认 MCP tools 里的自定义字段可以直接用
-          _upstream: r.upstream,
-          _upstream_name: upstreamName,
-          _upstream_desc: upstreamDesc,
         };
       }),
       // 定义版本信息：客户端可据此判断缓存是否过期（listChanged=false 时不推送变更）
