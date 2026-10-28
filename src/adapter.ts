@@ -158,10 +158,15 @@ function detectBizErrorInContent(content: Array<{ type: string; text?: string }>
       }
     }
 
-    // ⑤ HTTP 风格 status >= 400 → 业务错误（西柚/NoCoDB 等 flat-mcp 上游风格）
+    // ⑤ HTTP 风格 status >= 400 + 明确 error 标记 → 业务错误
     //    西柚 DownstreamError: {status:504, data:{status:504, error:true, message:"..."}}
-    if ((typeof parsed.status === 'number' && parsed.status >= 400) ||
-        (typeof parsed.data?.status === 'number' && parsed.data.status >= 400)) {
+    //    必须同时满足：status>=400 + error:true（内层或外层）
+    //    评审：领星订单/刊登/物流等业务对象里恰好有 status 字段（业务状态码 400/500/504 等），
+    //    只看 status>=400 会把正常数据当成错误丢掉。加 error:true 前置条件后不会误判。
+    const hasErrorFlag = parsed.error === true || parsed.data?.error === true;
+    const highStatus = (typeof parsed.status === 'number' && parsed.status >= 400) ||
+                       (typeof parsed.data?.status === 'number' && parsed.data.status >= 400);
+    if (hasErrorFlag && highStatus) {
       return buildUpstreamError(parsed);
     }
   }

@@ -371,6 +371,28 @@ export function sha256(s: string): string {
   return createHash('sha256').update(s).digest('hex');
 }
 
+/**
+ * 对 JSON 字符串先 canonicalize（key 排序）再 hash。
+ * 评审指出：直接对原始 JSON string 哈希，上游只调整了字段顺序也会触发 schema_hash 变化 → 误退回 unreviewed。
+ * canonicalize 后字段顺序不影响 hash，只有真正的内容变化才触发。
+ */
+function hashSchema(jsonStr: string): string {
+  try {
+    const parsed = JSON.parse(jsonStr);
+    const canonical = canonicalize(parsed);
+    return sha256(canonical).slice(0, 16);
+  } catch {
+    return sha256(jsonStr).slice(0, 16); // parse 失败就 hash 原始字符串
+  }
+}
+
+function canonicalize(obj: any): string {
+  if (obj === null || typeof obj !== 'object') return JSON.stringify(obj);
+  if (Array.isArray(obj)) return '[' + obj.map(canonicalize).join(',') + ']';
+  const sortedKeys = Object.keys(obj).sort();
+  return '{' + sortedKeys.map((k) => JSON.stringify(k) + ':' + canonicalize(obj[k])).join(',') + '}';
+}
+
 function seed(): void {
   const defaults: Record<string, string> = {
     upstream_url: config.upstreamUrlEnv || DEFAULT_UPSTREAM_URL,
@@ -428,7 +450,7 @@ export function upsertTool(t: {
   let shopScope = existing?.shop_scope ?? 'unreviewed';
   let newHash: string;
   if (t.input_schema) {
-    newHash = createHash('sha256').update(t.input_schema).digest('hex').slice(0, 16);
+    newHash = hashSchema(t.input_schema);
     // 上游改了 schema → 人工审核过时，自动退回 unreviewed
     if (existing?.shop_scope && existing.shop_scope !== 'unreviewed' && existing.schema_hash && existing.schema_hash !== newHash) {
       console.log(`[db] tool ${upstream}.${t.tool_id} schema 变更 (${existing.schema_hash.slice(0,6)}→${newHash.slice(0,6)})，shop_scope=${existing.shop_scope} 退回 unreviewed`);
@@ -463,7 +485,7 @@ export function upsertTool(t: {
  */
 export function setToolShopScope(upstream: string, toolId: string, scope: 'unreviewed' | 'shop_scoped' | 'global_safe'): boolean {
   const tool = db.prepare('SELECT input_schema FROM tools WHERE upstream=? AND tool_id=?').get(upstream, toolId) as { input_schema: string | null } | undefined;
-  const hash = tool?.input_schema ? createHash('sha256').update(tool.input_schema).digest('hex').slice(0, 16) : '';
+  const hash = tool?.input_schema ? hashSchema(tool.input_schema) : '';
   const result = db.prepare('UPDATE tools SET shop_scope=?, shop_scope_suggest=?, schema_hash=? WHERE upstream=? AND tool_id=?').run(scope, '', hash, upstream, toolId);
   return result.changes > 0;
 }
