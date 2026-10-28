@@ -396,8 +396,11 @@ function filterShopListInNode(
             resolvedIds.push(raw); // 已经是 sid，直接命中
           } else if (idMap.has(raw)) {
             // marketplace/seller_id → 查 shops 表映射的 sid 集合
+            // 关键：桥接出来的 sid **必须再和 allowedShops 比对**，只留白名单内的
             const mappedSids = idMap.get(raw)!;
-            for (const sid of mappedSids) resolvedIds.push(sid);
+            for (const sid of mappedSids) {
+              if (allowedShops.has(sid)) resolvedIds.push(sid);
+            }
           }
           // 都不是 → 忽略（可能是 profile_id 这种其他平台 id，不做猜测）
         }
@@ -726,17 +729,15 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
     // 店铺级校验（仅对运营用户 + 店铺维度上游生效）
     // 非店铺维度上游（西柚/NocoDB 等）的参数里即使出现 seller_id 之类字段，也与 shops 白名单无关
     if (identity.kind === 'user' && !identity.all_shops && shopRefs.length > 0 && isShopScopedUpstream(tool.upstream ?? '')) {
-      let allowedShopIds = new Set(getUserShopIds(identity.id));
-      // 安全兜底：如果 user_shops 表为空（说明创建时既没 all_shops 也没 shop_ids），
-      // 退化到 shops 表里所有已同步的店铺——宁可多放行，不要全 deny
+      const allowedShopIds = new Set(getUserShopIds(identity.id));
+      // fail-closed：user_shops 为空 → 配置缺失，明确拒绝调用
+      // （之前的 fail-open 兜底在 sync 灌入全表后会静默放行所有店铺，这是严重安全漏洞）
       if (allowedShopIds.size === 0) {
-        const fallback = db.prepare('SELECT sid FROM shops').all() as Array<{ sid: string }>;
-        allowedShopIds = new Set(fallback.map((r) => r.sid));
-        if (allowedShopIds.size === 0) {
-          console.warn(`[mcp] ${identity.username} user_shops 为空且 shops 表也空——跳过店铺校验`);
-        } else {
-          console.warn(`[mcp] ${identity.username} user_shops 为空，降级放行 shops 表 ${allowedShopIds.size} 个店铺`);
-        }
+        logOutcome(false, true, '未配置店铺白名单');
+        return errorResult(
+          `密钥未配置店铺白名单，无法调用店铺维度工具。请在管理后台 "运营用户 → 店铺权限" 补配，或设为全部店铺。`,
+          { type: 'permission_denied', upstream: tool.upstream, tool: name, reason: 'no_shop_whitelist' }
+        );
       }
       // 上游所有 seller_id → shop sid 映射（缓存到 handler 内）
       const sellerToSids = new Map<string, Set<string>>();
@@ -937,16 +938,17 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
       if (Array.isArray(content)) {
         let filteredContent = content as any[];
         if (identity.kind === 'user' && !identity.all_shops && isShopScopedUpstream(upId)) {
-          let allowedShops = new Set(getUserShopIds(identity.id));
+          const allowedShops = new Set(getUserShopIds(identity.id));
           if (allowedShops.size === 0) {
-            const fb = db.prepare('SELECT sid FROM shops').all() as Array<{ sid: string }>;
-            allowedShops = new Set(fb.map((r) => r.sid));
-          }
-          const stat: ShopFilterStat = { removed: 0 };
-          const idMap = buildShopIdMapping();
-          filteredContent = filterContentByShops(content, allowedShops, stat, idMap) as any[];
-          if (stat.removed > 0) {
-            console.log(`[mcp] ${caller} ${name} 店铺裁剪 ${stat.removed} 行（allowed=${allowedShops.size}）`);
+            // 参数级校验已经 fail-closed 了，理论上走不到这里；
+            // 防御性兜底：user_shops 空就跳过裁剪、原样返回（上层已经会拒绝调用）
+            console.warn(`[mcp] ${caller} ${name} 店铺裁剪跳过：user_shops 为空`);
+          } else {
+            const stat: ShopFilterStat = { removed: 0 };
+            const idMap = buildShopIdMapping();
+            filteredContent = filterContentByShops(content, allowedShops, stat, idMap) as any[];
+            if (stat.removed > 0) {
+              console.log(`[mcp] ${caller} ${name} 店铺裁剪 ${stat.removed} 行（allowed=${allowedShops.size}）`);
             // __gateway_warn 插到 content 第一个位置，避免客户端因为遍历顺序看不到
             filteredContent = [
               {
@@ -959,6 +961,7 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
             ];
           }
         }
+        } // closing: if (identity.kind === 'user' && !all_shops && shopScoped)
         // 清理响应里的内网地址（如 NocoDB 的 next 分页 URL 会带 192.168.x.x:port / baseId / tableId）
         const scrubStat = { removed: 0 };
         filteredContent = stripInternalUrlsInContent(filteredContent, scrubStat) as any[];
