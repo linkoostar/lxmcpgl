@@ -217,6 +217,16 @@ function migrate(): void {
   if (!upCols.includes('updated_at')) db.exec(`ALTER TABLE upstreams ADD COLUMN updated_at TEXT DEFAULT ''`);
   if (!upCols.includes('headers')) db.exec(`ALTER TABLE upstreams ADD COLUMN headers TEXT DEFAULT '{}'`);
 
+  // ===== shop_scope：工具店铺隔离分类 =====
+  // unreviewed（默认）= 未审核，受限运营不可调用
+  // shop_scoped = 管理员确认按店铺参数隔离（需要店铺参数）
+  // global_safe = 管理员确认全 ERP 级，不返回跨店数据
+  const toolCols = (db.prepare(`PRAGMA table_info(tools)`).all() as Array<{ name: string }>).map((c) => c.name);
+  if (!toolCols.includes('shop_scope')) {
+    db.exec(`ALTER TABLE tools ADD COLUMN shop_scope TEXT DEFAULT 'unreviewed'`);
+    console.log('[db] tools 已补 shop_scope 列（默认 unreviewed）');
+  }
+
   // 工具分类兜底
   backfillToolTypes();
 }
@@ -364,6 +374,7 @@ export interface ToolRow {
   upstream?: string;
   enabled: number;
   updated_at: string;
+  shop_scope?: string; // unreviewed / shop_scoped / global_safe
 }
 
 export function upsertTool(t: {

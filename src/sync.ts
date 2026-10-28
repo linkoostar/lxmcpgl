@@ -3,6 +3,82 @@ import { META_TOOLS } from './config.js';
 import { getUpstreamClient, type UpstreamClient } from './upstream.js';
 
 /**
+ * 递归扫描 JSON Schema 的 properties / items / anyOf / oneOf，
+ * 判断 schema 里是否存在任意店铺类字段（sid / store_id / seller_id / profile_id 等）。
+ *
+ * 评审指出的网关缺口：之前只扫顶层 properties，嵌套在 items/anyOf 里的店铺字段检测不到。
+ * 改为深度优先遍历，覆盖所有嵌套层级。
+ */
+const SHOP_SCHEMA_KEYS = new Set([
+  'sid', 'sids',
+  'store_id', 'store_ids',
+  'shop_id', 'shop_ids',
+  'seller_id', 'seller_ids',
+  'profile_id', 'profile_ids',
+  'account_id', 'account_ids',
+  'pvi_ids',
+]);
+
+function schemaHasShopField(schema: any, depth = 0): boolean {
+  if (depth > 8 || !schema || typeof schema !== 'object') return false;
+  // properties：对象类型的参数定义
+  if (schema.properties && typeof schema.properties === 'object') {
+    for (const k of Object.keys(schema.properties)) {
+      if (SHOP_SCHEMA_KEYS.has(k.toLowerCase())) return true;
+      if (schemaHasShopField(schema.properties[k], depth + 1)) return true;
+    }
+  }
+  // items：数组元素的 schema（如 { type:'array', items: { type:'object', properties: {...} } }）
+  if (schema.items) {
+    if (schemaHasShopField(schema.items, depth + 1)) return true;
+  }
+  // anyOf / oneOf / allOf：联合类型
+  for (const arr of [schema.anyOf, schema.oneOf, schema.allOf]) {
+    if (Array.isArray(arr)) {
+      for (const sub of arr) {
+        if (schemaHasShopField(sub, depth + 1)) return true;
+      }
+    }
+  }
+  // additionalProperties / patternProperties
+  if (schema.additionalProperties && typeof schema.additionalProperties === 'object') {
+    if (schemaHasShopField(schema.additionalProperties, depth + 1)) return true;
+  }
+  return false;
+}
+
+/**
+ * 同步后自动标记 shop_scope：
+ * - unreviewed + schema 有店铺字段 → shop_scoped（建议值，管理员可改）
+ * - unreviewed + schema 无店铺字段 → global_safe（建议值）
+ * - 已被管理员手动标记的（不是 unreviewed）→ 不覆盖
+ * 上游改了工具 schema → 下次 sync 时如果 tool hash 变了，
+ * 管理员会看到并手动重新审核（当前版本还没 hash 自动退回 unreviewed，后续加）
+ */
+export function backfillShopScopes(): { shop_scoped: number; global_safe: number; skipped: number } {
+  const tools = db.prepare('SELECT tool_id, upstream, input_schema, shop_scope FROM tools').all() as Array<{
+    tool_id: string; upstream: string; input_schema: string | null; shop_scope: string;
+  }>;
+  let shop_scoped = 0, global_safe = 0, skipped = 0;
+  for (const t of tools) {
+    // 只处理 unreviewed 的，已被管理员标记的不覆盖
+    if (t.shop_scope && t.shop_scope !== 'unreviewed') { skipped++; continue; }
+    if (!t.input_schema) { skipped++; continue; }
+    try {
+      const schema = JSON.parse(t.input_schema);
+      const hasShop = schemaHasShopField(schema);
+      const newScope = hasShop ? 'shop_scoped' : 'global_safe';
+      db.prepare('UPDATE tools SET shop_scope = ? WHERE upstream = ? AND tool_id = ?').run(newScope, t.upstream, t.tool_id);
+      if (newScope === 'shop_scoped') shop_scoped++; else global_safe++;
+    } catch { skipped++; }
+  }
+  console.log(`[sync] shop_scope 自动标记: shop_scoped=${shop_scoped} global_safe=${global_safe} skipped=${skipped}`);
+  return { shop_scoped, global_safe, skipped };
+}
+
+
+
+/**
  * 工具同步：
  *  1. 调上游 help 分页拉全业务工具清单
  *  2. 并发调 search 拉每个工具的入参 JSON Schema
@@ -245,6 +321,8 @@ export async function syncTools(): Promise<SyncResult> {
       duration_ms: Date.now() - started,
     };
     setSetting('last_sync_at', new Date().toISOString());
+    // 同步完后自动标记 shop_scope（只覆盖 unreviewed 的，已标记的不碰）
+    backfillShopScopes();
 
     // 自动初始化默认权限模板：如果管理员还没配过（default_tools_all=0 且 default_tools 空），
     // 把当前所有 read 类工具 id 填进去，让新建运营自动继承只读模板。
