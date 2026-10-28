@@ -38,9 +38,11 @@ import { syncTools, syncUpstreamById, isSyncing, listTools, batchSetEnabled, syn
 import { getAdapter } from './adapter.js';
 import { buildHealth } from './health.js';
 
-// cookie 名带端口后缀，同域名多实例（比如 8085 老网关 + 8086 新网关）互不干扰
+// cookie 名带部署后缀，同域名多实例（如 8085 老网关 + 8086 新网关 + 8087 灰度）互不干扰
 // 浏览器 cookie 不按端口隔离，必须靠名字区分
-const COOKIE_NAME = `lx_session_${config.port}`;
+// 环境变量 LX_COOKIE_SUFFIX 控制后缀，默认用端口号；部署时显式指定更可控（例：LX_COOKIE_SUFFIX=prod1）
+const cookieSuffix = process.env.LX_COOKIE_SUFFIX || String(config.port);
+const COOKIE_NAME = `lx_session_${cookieSuffix}`;
 const SESSION_TTL_MS = 12 * 3600 * 1000;
 
 // ---------- 会话（HMAC 签名 token，重启不失效） ----------
