@@ -133,50 +133,6 @@ function extractSchema(payload: any): Record<string, unknown> | null {
 }
 
 /**
- * 给 schema 里已知有枚举约束但上游没声明的参数硬加 enum。
- *
- * 领星等上游对 length/page_size 硬约束 [20,50,100,200,500,1000,2000,5000]，
- * 但 schema 里只写 {type:"integer"} 不写 enum → Agent 传 length=5 被拒 →
- * 叠加 detectBizErrorInContent 历史盲区 → 静默失败。
- *
- * 所有入库点（syncOneUpstream / refreshToolSchema / syncAllUpstreams）统一走这里，
- * 避免每个调用方各写一套 enrich 逻辑（经验：过滤/检测规则抽成单点函数）。
- *
- * 只加 enum，不改 type/default/其他字段——零破坏。
- */
-function enrichSchemaWithEnums(schema: Record<string, unknown>): Record<string, unknown> {
-  const props = (schema.properties ?? {}) as Record<string, Record<string, unknown>>;
-  if (!props || typeof props !== 'object') return schema;
-
-  // 已知的硬约束映射表
-  const ENUM_MAP: Record<string, number[]> = {
-    length: [20, 50, 100, 200, 500, 1000, 2000, 5000],
-    page_size: [20, 50, 100, 200, 500, 1000, 2000, 5000],
-    pageSize: [20, 50, 100, 200, 500, 1000, 2000, 5000],
-    limit: [20, 50, 100, 200, 500, 1000, 2000, 5000],
-  };
-
-  for (const [paramName, allowed] of Object.entries(ENUM_MAP)) {
-    const prop = props[paramName];
-    if (prop && typeof prop === 'object') {
-      // 上游已声明 enum 就不覆盖（尊重上游）
-      // type 检查放开：领星用 integer，其他上游可能用 number
-      const propType = (prop as any).type;
-      if (!('enum' in prop) && (propType === 'integer' || propType === 'number')) {
-        prop.enum = allowed;
-        // 只在上游 description 里没有"仅支持"/"枚举"等字样时追加，避免重复
-        const desc = String((prop as any).description ?? '');
-        if (!desc.includes('仅支持') && !desc.includes('枚举')) {
-          (prop as any).description = desc + `（仅支持 ${allowed.join(',')}）`;
-        }
-      }
-    }
-  }
-
-  return schema;
-}
-
-/**
  * schema 是否真的带了参数定义。
  * 上游偶发返回 {type:'object', properties:{}} 空壳，直接入库会把已有的参数定义清空，
  * 导致工具变成「无参可传」。这类空壳一律视为缺失，由 upsertTool 的 COALESCE 保留旧 schema。
@@ -263,7 +219,7 @@ export async function syncTools(): Promise<SyncResult> {
           return;
         }
         const schema = extractSchema(unwrapCallResult(resp));
-        const usableSchema = schema && schemaHasFields(schema) ? enrichSchemaWithEnums(schema) : null;
+        const usableSchema = schema && schemaHasFields(schema) ? schema : null;
         if (!usableSchema) schemaMissing++;
         upsertTool({
           tool_id: t.tool_id,
@@ -395,12 +351,11 @@ export async function refreshToolSchema(client: UpstreamClient, toolId: string, 
   try {
     const resp = await client.callTool('search', { toolId });
     if (resp?.error) return;
-    const rawSchema = extractSchema(unwrapCallResult(resp));
-    if (!rawSchema || !schemaHasFields(rawSchema)) {
+    const schema = extractSchema(unwrapCallResult(resp));
+    if (!schema || !schemaHasFields(schema)) {
       console.warn(`[sync] 刷新 Schema 跳过（上游未返回有效参数定义）: ${upstream ? upstream + '/' : ''}${toolId}`);
       return;
     }
-    const schema = enrichSchemaWithEnums(rawSchema);
     if (upstream) {
       db.prepare('UPDATE tools SET input_schema = ?, updated_at = ? WHERE upstream = ? AND tool_id = ?').run(
         JSON.stringify(schema),
@@ -549,8 +504,8 @@ async function syncLingxingMeta(up: { id: string; name: string; url: string; api
         failed++;
         return;
       }
-      const rawSchema = extractSchema(unwrapCallResult(resp));
-      const usableSchema = rawSchema && schemaHasFields(rawSchema) ? enrichSchemaWithEnums(rawSchema) : null;
+      const schema = extractSchema(unwrapCallResult(resp));
+      const usableSchema = schema && schemaHasFields(schema) ? schema : null;
       if (!usableSchema) schemaMissing++;
       upsertTool({
         tool_id: t.tool_id,
