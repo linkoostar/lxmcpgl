@@ -46,6 +46,8 @@ export interface McpCallResult {
   content: Array<{ type: string; text?: string }>;
   isError?: boolean;
   upstreamError?: UpstreamErrorInfo;
+  /** 空壳数据标记（detectEmptyShell 的结果透传） */
+  emptyShell?: { isEmpty: boolean; effectiveRows: number; warn: string | null };
 }
 
 /** Adapter 接口 — 所有上游必须实现 */
@@ -258,7 +260,7 @@ class LingxingMetaAdapter implements UpstreamAdapter {
         upstreamError: bizErr,
       };
     }
-    return { content: resp.result.content, isError: resp.result.isError };
+    return { content: resp.result.content, isError: resp.result.isError, emptyShell: detectEmptyShell(resp.result.content) };
   }
 
   async probe(config: UpstreamConfig): Promise<boolean> {
@@ -271,7 +273,6 @@ class LingxingMetaAdapter implements UpstreamAdapter {
       return false;
     }
   }
-
   extractShopRefs(args: Record<string, unknown>): string[] {
     const out: string[] = [];
     const SHOP_KEYS = new Set(['sid', 'sids', 'shop_id', 'shop_ids', 'store_id', 'seller_id', 'profile_id', 'pvi_ids']);
@@ -294,14 +295,33 @@ class LingxingMetaAdapter implements UpstreamAdapter {
 
 /**
  * 空壳检测：解析 content 里的 JSON，判断是否关键字段全 null 但 isError=false
- * 返回警告字符串（null = 正常）
  * 西柚等上游在参数合法但数据确实不存在时，返回 {asin:'xxx', title:null, price:null, ...}
- * Agent 会误判为"该商品没数据"，我们加个 __gateway_warn 提示
+ * 返回：{ warn, isEmpty, effectiveRows } — warn 非空表示疑似空壳
+ * 同时统计主数组的有效行数（排除 null/空行），用于 call_logs.effective_rows
  */
-function detectEmptyShell(content: Array<{ type: string; text?: string }>, toolId: string): string | null {
+export function detectEmptyShell(
+  content: Array<{ type: string; text?: string }>
+): { warn: string | null; isEmpty: boolean; effectiveRows: number } {
+  let effectiveRows = 0;
   try {
     const text = content.find((c) => c.type === 'text')?.text;
-    if (!text) return null;
+    if (text) {
+      const parsed = JSON.parse(text);
+      // 递归找所有顶级数组，统计总行数
+      const countArrays = (o: unknown): void => {
+        if (Array.isArray(o)) {
+          // 只计有效元素（非 null/undefined/空对象）
+          const valid = o.filter((x) => x != null && !(typeof x === 'object' && Object.keys(x).length === 0));
+          if (valid.length > 0 && valid.length > effectiveRows) effectiveRows = valid.length;
+          for (const item of o) countArrays(item);
+        } else if (o && typeof o === 'object') {
+          for (const v of Object.values(o as Record<string, unknown>)) countArrays(v);
+        }
+      };
+      countArrays(parsed);
+    }
+
+    if (!text) return { warn: null, isEmpty: false, effectiveRows };
     const parsed = JSON.parse(text);
     const candidates: unknown[] = [];
     if (parsed && typeof parsed === 'object') {
@@ -319,11 +339,11 @@ function detectEmptyShell(content: Array<{ type: string; text?: string }>, toolI
       if (keys.length < 3) continue;
       const nullCount = keys.filter((k) => obj[k] === null || obj[k] === undefined || obj[k] === '').length;
       if (nullCount / keys.length >= 0.85) {
-        return `⚠️ 上游返回疑似空壳数据（${nullCount}/${keys.length} 字段为 null），工具: ${toolId}`;
+        return { warn: `⚠️ 上游返回疑似空壳数据（${nullCount}/${keys.length} 字段为 null）`, isEmpty: true, effectiveRows };
       }
     }
   } catch { /* 非 JSON */ }
-  return null;
+  return { warn: null, isEmpty: false, effectiveRows };
 }
 
 // =====================================================
@@ -379,12 +399,12 @@ class FlatMcpAdapter implements UpstreamAdapter {
     }
     const content = resp.result.content;
     // 空壳检测：某些上游返回 isError=false 但关键字段全 null
-    const warn = detectEmptyShell(content, toolId);
-    if (warn) {
+    const shell = detectEmptyShell(content);
+    if (shell.warn) {
       // __gateway_warn 插到 content 第一个位置
-      content.unshift({ type: 'text', text: JSON.stringify({ __gateway_warn: warn }) });
+      content.unshift({ type: 'text', text: JSON.stringify({ __gateway_warn: shell.warn }) });
     }
-    return { content, isError: resp.result.isError };
+    return { content, isError: resp.result.isError, emptyShell: shell };
   }
 
   async probe(config: UpstreamConfig): Promise<boolean> {

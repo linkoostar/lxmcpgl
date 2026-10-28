@@ -615,7 +615,13 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
       started: Date.now(),
     };
 
-    function logOutcome(success: boolean, isError: boolean, error?: string, costCredits?: number | null): void {
+    function logOutcome(
+      success: boolean,
+      isError: boolean,
+      error?: string,
+      costCredits?: number | null,
+      opts?: { effectiveRows?: number | null; isEmptyShell?: boolean }
+    ): void {
       insertCallLog({
         caller: logCtx.caller,
         user_id: logCtx.userId,
@@ -629,6 +635,9 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
         duration_ms: Date.now() - logCtx.started,
         error: error ?? null,
         cost_credits: costCredits ?? null,
+        effective_rows: opts?.effectiveRows ?? null,
+        is_admin: identity.kind === 'admin',
+        is_empty_shell: opts?.isEmptyShell ?? false,
       });
     }
 
@@ -790,11 +799,28 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
       const duration = Date.now() - logCtx.started;
 
       // cost_logs + call_logs.cost_credits（两处都写：cost_logs 用于账单汇总，call_logs 用于调用记录可追溯）
-      const cost = adapter.extractCost(callResult.content?.[0]?.text);
+      const shell = callResult.emptyShell;
+      const isEmptyShell = !!shell?.isEmpty;
+      let cost = adapter.extractCost(callResult.content?.[0]?.text);
+      if (cost !== null && isEmptyShell) {
+        // 空壳数据：有 cost 但有效行数为 0 或关键字段全 null → cost 归零（分摊公平性）
+        console.log(`[mcp] ${caller} ${name} 空壳检测命中（有效行 ${shell?.effectiveRows ?? 0}），cost 归零: ${cost} → 0`);
+        cost = 0;
+      }
       if (cost !== null) {
         db.prepare(
-          'INSERT INTO cost_logs (upstream, user_id, tool_name, tool_id, cost_credits, duration_ms, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
-        ).run(upId, identity.kind === 'user' ? identity.id : null, tool.exposed_name, tool.tool_id, cost, duration, new Date().toISOString());
+          'INSERT INTO cost_logs (upstream, user_id, tool_name, tool_id, cost_credits, duration_ms, created_at, is_admin, is_empty_shell) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+        ).run(
+          upId,
+          identity.kind === 'user' ? identity.id : null,
+          tool.exposed_name,
+          tool.tool_id,
+          cost,
+          duration,
+          new Date().toISOString(),
+          identity.kind === 'admin' ? 1 : 0,
+          isEmptyShell ? 1 : 0
+        );
       }
 
       // ---- 统一错误信封：保留上游原始 code / traceId，便于定位 ----
@@ -873,9 +899,12 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
       }
       const arrSummary = arrLens.length > 0 ? ` arrays[${arrLens.join(';')}]` : '';
       console.log(
-        `[mcp] ${caller} ${name} ok ${duration}ms upstream=${upId} content=${contentBytes}B${arrSummary}`
+        `[mcp] ${caller} ${name} ok ${duration}ms upstream=${upId} content=${contentBytes}B${arrSummary}${isEmptyShell ? ' 空壳⚠️' : ''}`
       );
-      logOutcome(true, false, undefined, cost);
+      logOutcome(true, false, undefined, cost, {
+        effectiveRows: shell?.effectiveRows ?? null,
+        isEmptyShell,
+      });
 
       // 店铺结果裁剪
       // 只对「店铺维度上游」生效：西柚/NocoDB 等上游没有店铺维度，结果必须原样返回

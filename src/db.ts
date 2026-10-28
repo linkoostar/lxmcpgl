@@ -69,7 +69,10 @@ export function initDb(): void {
       is_error     INTEGER NOT NULL,
       duration_ms  INTEGER,
       error        TEXT,
-      cost_credits REAL
+      cost_credits REAL,
+      effective_rows INTEGER,
+      is_admin     INTEGER DEFAULT 0,
+      is_empty_shell INTEGER DEFAULT 0
     );
     CREATE INDEX IF NOT EXISTS idx_call_logs_ts     ON call_logs(ts);
     CREATE INDEX IF NOT EXISTS idx_call_logs_caller ON call_logs(caller);
@@ -97,7 +100,9 @@ export function initDb(): void {
       tool_id       TEXT,
       cost_credits  REAL DEFAULT 0,
       duration_ms   INTEGER,
-      created_at    TEXT DEFAULT ''
+      created_at    TEXT DEFAULT '',
+      is_admin      INTEGER DEFAULT 0,
+      is_empty_shell INTEGER DEFAULT 0
     );
     CREATE INDEX IF NOT EXISTS idx_cost_logs_user     ON cost_logs(user_id);
     CREATE INDEX IF NOT EXISTS idx_cost_logs_upstream ON cost_logs(upstream);
@@ -145,6 +150,29 @@ function migrate(): void {
   if (!clCols.includes('cost_credits')) {
     db.exec(`ALTER TABLE call_logs ADD COLUMN cost_credits REAL`);
     console.log('[db] call_logs 已补 cost_credits 列');
+  }
+  if (!clCols.includes('effective_rows')) {
+    db.exec(`ALTER TABLE call_logs ADD COLUMN effective_rows INTEGER`);
+    console.log('[db] call_logs 已补 effective_rows 列');
+  }
+  if (!clCols.includes('is_admin')) {
+    db.exec(`ALTER TABLE call_logs ADD COLUMN is_admin INTEGER DEFAULT 0`);
+    console.log('[db] call_logs 已补 is_admin 列');
+  }
+  if (!clCols.includes('is_empty_shell')) {
+    db.exec(`ALTER TABLE call_logs ADD COLUMN is_empty_shell INTEGER DEFAULT 0`);
+    console.log('[db] call_logs 已补 is_empty_shell 列');
+  }
+
+  // ===== cost_logs 也补 is_admin / is_empty_shell =====
+  const coCols = (db.prepare(`PRAGMA table_info(cost_logs)`).all() as Array<{ name: string }>).map((c) => c.name);
+  if (!coCols.includes('is_admin')) {
+    db.exec(`ALTER TABLE cost_logs ADD COLUMN is_admin INTEGER DEFAULT 0`);
+    console.log('[db] cost_logs 已补 is_admin 列');
+  }
+  if (!coCols.includes('is_empty_shell')) {
+    db.exec(`ALTER TABLE cost_logs ADD COLUMN is_empty_shell INTEGER DEFAULT 0`);
+    console.log('[db] cost_logs 已补 is_empty_shell 列');
   }
 
   // ===== P0-2：tools 主键从 (tool_id) 迁移为 (upstream, tool_id) =====
@@ -495,6 +523,9 @@ export interface CallLog {
   duration_ms: number | null;
   error: string;
   cost_credits: number | null;
+  effective_rows: number | null;
+  is_admin: number;
+  is_empty_shell: number;
 }
 
 export function insertCallLog(l: {
@@ -510,12 +541,15 @@ export function insertCallLog(l: {
   duration_ms: number | null;
   error: string | null;
   cost_credits?: number | null;
+  effective_rows?: number | null;
+  is_admin?: boolean;
+  is_empty_shell?: boolean;
 }): void {
   const err = l.error ? String(l.error).slice(0, 500) : '';
   const shops = l.shop_refs ? JSON.stringify(l.shop_refs.slice(0, 50)) : '';
   db.prepare(
-    `INSERT INTO call_logs (ts, caller, user_id, tool_name, tool_id, tool_type, upstream, shop_refs, success, is_error, duration_ms, error, cost_credits)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    `INSERT INTO call_logs (ts, caller, user_id, tool_name, tool_id, tool_type, upstream, shop_refs, success, is_error, duration_ms, error, cost_credits, effective_rows, is_admin, is_empty_shell)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
     new Date().toISOString(),
     l.caller,
@@ -529,7 +563,10 @@ export function insertCallLog(l: {
     l.is_error ? 1 : 0,
     l.duration_ms,
     err,
-    l.cost_credits ?? null
+    l.cost_credits ?? null,
+    l.effective_rows ?? null,
+    l.is_admin ? 1 : 0,
+    l.is_empty_shell ? 1 : 0
   );
 }
 
