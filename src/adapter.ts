@@ -194,10 +194,34 @@ class LingxingMetaAdapter implements UpstreamAdapter {
   canHandle(c: UpstreamConfig): boolean { return c.adapter === 'lingxing-meta'; }
 
   async listTools(config: UpstreamConfig): Promise<StandardTool[]> {
-    // 领星的工具同步逻辑现有 sync.ts 里已经实现（search 轮询拉 schema）
-    // 这里直接返回空数组 — 实际同步由 sync.ts 里的 syncLingxingTools 做
-    // M1.4 再迁过来
-    return [];
+    // 领星元工具模式没有直接暴露 tools/list，只有 help/search/action 三个元工具。
+    // 通过 help 分页拉业务工具清单（复用 sync.ts 里的 syncLingxingTools 逻辑）。
+    const { getUpstreamClient } = await import('./upstream.js');
+    const client = getUpstreamClient(config.url, config.api_key ?? '');
+    const tools: StandardTool[] = [];
+    let offset = 0;
+    const limit = 50;
+    while (true) {
+      const resp = await client.callTool('help', { offset, limit });
+      if (resp?.error) throw new Error(JSON.stringify(resp.error).slice(0, 300));
+      const text = resp?.result?.content?.find((c: any) => c?.type === 'text')?.text ?? '';
+      let payload: any;
+      try { payload = JSON.parse(text); } catch { break; }
+      const list = payload?.data?.tools ?? payload?.tools ?? [];
+      if (!Array.isArray(list) || list.length === 0) break;
+      for (const t of list) {
+        if (!t?.toolId) continue;
+        tools.push({
+          tool_id: t.toolId,
+          name: t.name ?? t.toolId,
+          description: t.description ?? '',
+          tool_type: classifyByName(t.toolId),
+        });
+      }
+      if (list.length < limit) break;
+      offset += limit;
+    }
+    return tools;
   }
 
   async callTool(config: UpstreamConfig, toolId: string, args: Record<string, unknown>): Promise<McpCallResult> {
