@@ -1128,7 +1128,13 @@ function renderLogStats(stats) {
     const fail = t.failed_count > 0 ? ` <span style="color:#dc2626">⚠${t.failed_count}</span>` : '';
     return `<span class="chip" title="成功${t.success_count}/${t.count}，失败${t.failed_count}，点数${t.credits}">${escapeHtml(t.tool_name)} <b>×${t.count}</b>${cred}${fail}</span>`;
   }).join('') || '<span class="muted">—</span>';
-  const callerChips = topCallers.map((t) => `<span class="chip caller">${escapeHtml(t.caller)} <b>×${t.count}</b></span>`).join('') || '<span class="muted">—</span>';
+  const callerChips = topCallers.map((t) => {
+    const cred = t.credits > 0 ? ` <b style="color:#d97706">${t.credits.toFixed(1)}pt</b>` : '';
+    // hover 显示每个上游的分摊
+    const upParts = (t.upstream_breakdown || []).map(b => `${b.upstream}: ${b.count}次 / ${b.credits}pt`).join(', ');
+    const tip = upParts ? `共 ${t.count} 次，${cred?cred.replace(/<[^>]+>/g,'')+'pt':0}总点数\n` + upParts : '';
+    return `<span class="chip caller" title="${escapeHtml(tip)}">${escapeHtml(t.caller)} <b>×${t.count}</b>${cred}</span>`;
+  }).join('') || '<span class="muted">—</span>';
 
   // upstream 汇总条
   const ups = stats.upstream_stats || [];

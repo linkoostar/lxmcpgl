@@ -757,7 +757,7 @@ export function getCallLogStats(opts: CallLogStatsOpts = {}): {
   total_credits: number;
   upstream_stats: Array<{ upstream: string; count: number; credits: number; avg_ms: number }>;
   top_tools: Array<{ tool_name: string; upstream: string; count: number; credits: number }>;
-  top_callers: Array<{ caller: string; count: number }>;
+  top_callers: Array<{ caller: string; count: number; credits: number; upstream_breakdown: Array<{ upstream: string; count: number; credits: number }> }>;
 } {
   // call_logs where（ts 字段）
   const clConds: string[] = [];
@@ -850,9 +850,52 @@ export function getCallLogStats(opts: CallLogStatsOpts = {}): {
       charged_count: creditInfo.charged,
     };
   });
-  const topCallers = db
+  // top_callers — call_logs 算 count，cost_logs 算 credits。cost_logs 里 user_id 指向 users.id（运营用户），
+  // admin 调用 user_id=NULL；call_logs 里 caller 存的是 username（admin/运营用户名）
+  // 所以需要通过 users 表 JOIN：call_logs.caller = users.username 对应 cost_logs.user_id = users.id
+  const callersRaw = db
     .prepare(`SELECT caller, COUNT(*) AS count FROM call_logs ${clWhere} GROUP BY caller ORDER BY count DESC LIMIT 6`)
     .all(...clArgs) as Array<{ caller: string; count: number }>;
+
+  const callersCredits = db
+    .prepare(`SELECT COALESCE(u.username, 'admin') AS caller, c.upstream,
+                     COUNT(*) AS count, COALESCE(SUM(c.cost_credits), 0) AS credits
+              FROM cost_logs c LEFT JOIN users u ON c.user_id = u.id
+              ${coWhere}
+              GROUP BY caller, c.upstream`)
+    .all(...coArgs) as Array<{ caller: string; upstream: string; count: number; credits: number }>;
+
+  // 聚合：先按 caller 汇总总 credits，再构建 per-upstream breakdown
+  const callerCreditsMap = new Map<string, { total: number; upstreams: Map<string, number> }>();
+  for (const row of callersCredits) {
+    if (!callerCreditsMap.has(row.caller)) callerCreditsMap.set(row.caller, { total: 0, upstreams: new Map() });
+    const entry = callerCreditsMap.get(row.caller)!;
+    entry.total += Number(row.credits);
+    entry.upstreams.set(row.upstream, Number(row.credits));
+  }
+
+  const topCallers = callersRaw.map((c) => {
+    const creditInfo = callerCreditsMap.get(c.caller);
+    const breakdown: Array<{ upstream: string; count: number; credits: number }> = [];
+    // 上游调用次数从 call_logs 来（cost_logs 没 count，JOIN 一下）
+    const perUpCountSql = `SELECT upstream, COUNT(*) AS count FROM call_logs ${clWhere}${clWhere ? ' AND' : ' WHERE'} caller = ? GROUP BY upstream`;
+    const perUpCount = db
+      .prepare(perUpCountSql)
+      .all(...clArgs, c.caller) as Array<{ upstream: string; count: number }>;
+    for (const u of perUpCount) {
+      breakdown.push({
+        upstream: u.upstream,
+        count: u.count,
+        credits: creditInfo?.upstreams.get(u.upstream) ?? 0,
+      });
+    }
+    return {
+      caller: c.caller,
+      count: c.count,
+      credits: creditInfo?.total ?? 0,
+      upstream_breakdown: breakdown.sort((a, b) => b.count - a.count),
+    };
+  });
 
   return {
     total: summary.total ?? 0,
