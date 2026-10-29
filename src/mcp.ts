@@ -567,6 +567,24 @@ function stripInternalUrlsInContent(content: unknown, stat: { removed: number })
   });
 }
 
+/** 去掉上游返回里包裹的 markdown 代码围栏（如 ```json {...} ```） */
+function stripMarkdownFenceInContent(content: unknown): unknown {
+  if (!Array.isArray(content)) return content;
+  return content.map((part: any) => {
+    if (!part || typeof part !== 'object' || typeof part.text !== 'string') return part;
+    const t = part.text.trim();
+    const m = t.match(/^```(?:json|JSON|JavaScript|js)?\s*\n([\s\S]*?)\n?```\s*$/);
+    if (!m) return part;
+    try {
+      return { ...part, text: JSON.stringify(JSON.parse(m[1].trim())) };
+    } catch {
+      const stripped = t.replace(/^```(?:json|JSON|JavaScript|js)?\s*\n/, '').replace(/\n?```\s*$/, '');
+      if (stripped !== t) return { ...part, text: stripped };
+      return part;
+    }
+  });
+}
+
 /**
  * 上游已知问题标注 — 已废弃。
  * 评审：硬编码上游事实，上游修好后需手动删，和"上游修好网关不该跟着改"原则冲突。
@@ -656,17 +674,24 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
     const exposedNameOf = (r: { upstream: string; exposed_name: string }): string =>
       (nameCount.get(r.exposed_name) ?? 0) > 1 ? `${r.upstream}__${r.exposed_name}` : r.exposed_name;
 
+    const builtinTools = [
+      {
+        name: '_tool_search',
+        description: '[网关] 按关键词检索可用工具。输入关键词（如 "广告"、"ASIN"、"listing"），返回匹配的工具列表（含上游、用途简述）。377 个工具撑爆上下文时先用这个缩小范围。',
+        inputSchema: { type: 'object', properties: { keyword: { type: 'string', description: '搜索关键词（匹配工具名和描述' }, upstream: { type: 'string', description: '可选：限定上游' }, limit: { type: 'integer', description: '返回上限，默认10，最大30' } }, required: ['keyword'] },
+      },
+      {
+        name: '_gateway_info',
+        description: '[网关] 返回网关版本、工具总数、上游状态等基础信息。',
+        inputSchema: { type: 'object', properties: {} },
+      },
+    ];
     return {
-      tools: rows.map((r) => {
+      tools: [...rows.map((r) => {
         const upInfo = upMap.get(r.upstream);
         const upstreamName = upInfo?.name ?? r.upstream;
-        // 极简 upstream 前缀：只保留 [上游名]，不拼 notes。
-        // notes 已经在 initialize 的 instructions 里列了，不需要每个工具重复
-        // → 每个 prefix 从 ~16 字降到 ~4 字，省 ~2000 字
         const descPrefix = `[${upstreamName}] `;
         const rawDesc = r.description || r.name || r.exposed_name;
-        // description 截断：领星给的短描述（avg 34）不截；SIF/西柚/ABA 等 flat-mcp 上游会塞 1000+ 字说明
-        // 截到 300 chars 前 200 字足够 agent 判断工具用途（"市场竞争度评估"），不影响 tool discovery 准确性
         const MAX_DESC_LEN = 300;
         const fullDesc = descPrefix + rawDesc;
         const truncated = fullDesc.length > MAX_DESC_LEN ? fullDesc.slice(0, MAX_DESC_LEN) + '…' : fullDesc;
@@ -675,11 +700,10 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
           description: truncated,
           inputSchema: minimizeSchema(safeParseSchema(r.input_schema)),
         };
-      }),
-      // 定义版本信息：客户端可据此判断缓存是否过期（listChanged=false 时不推送变更）
+      }), ...builtinTools],
       _meta: {
         tools_hash: toolsHashOf(upstreams),
-        tools_count: rows.length,
+        tools_count: rows.length + builtinTools.length,
         synced_at: rows.reduce<string | null>((acc, r) => (r.updated_at && (!acc || r.updated_at > acc) ? r.updated_at : acc), null),
         gateway_version: config.version,
       },
@@ -733,6 +757,35 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
         is_empty_shell: isEmptyShell,
         gateway_points: gatewayPoints,
       });
+    }
+
+    // ---- 网关自身工具（_ 前缀）—— 直接处理，不走上游 ----
+    if (name === '_gateway_info') {
+      const gwUpstreams = upstreams.map((u) => ({ id: u.id, name: u.name, adapter: u.adapter, tools: toolCounts[u.id] ?? 0 }));
+      const result = { gateway: '方中 MCP 网关', version: config.version, identity: identity.kind === 'admin' ? 'admin' : `user:${identity.username}`, upstreams: gwUpstreams, total_tools: gwUpstreams.reduce((s, u) => s + u.tools, 0) };
+      insertCallLog({ caller: logCtx.caller, user_id: logCtx.userId, tool_name: name, tool_id: name, tool_type: 'gateway', upstream: '', shop_refs: null, success: true, is_error: false, duration_ms: Date.now() - logCtx.started, error: null, cost_credits: null, effective_rows: null, is_admin: identity.kind === 'admin', is_empty_shell: true, gateway_points: 0 });
+      return { content: [{ type: 'text' as const, text: JSON.stringify(result) }] };
+    }
+    if (name === '_tool_search') {
+      const kw = String(args.keyword ?? '').trim();
+      const limit = Math.min(Math.max(Number(args.limit ?? 10), 1), 30);
+      const upstreamFilter = typeof args.upstream === 'string' ? args.upstream : null;
+      if (!kw) return errorResult('请提供 keyword 参数');
+      const activeUpIds2 = upstreams.map((u) => u.id);
+      const scope2 = identity.kind === 'admin' ? { all: true, ids: [...activeUpIds2] } : resolveUserUpstreams(identity.upstream, activeUpIds2);
+      const toolUpstream = scope2.ids.length > 0 ? scope2.ids : activeUpIds2;
+      const ph = toolUpstream.map(() => '?').join(',');
+      let allTools = db.prepare(`SELECT upstream, exposed_name, description FROM tools WHERE enabled = 1 AND upstream IN (${ph})`).all(...toolUpstream) as any[];
+      if (identity.kind === 'user' && !identity.all_tools) {
+        const allowed = new Set(getUserToolIds(identity.id));
+        allTools = allTools.filter((r) => allowed.has(r.exposed_name));
+      }
+      const hay = (r: any) => `${r.exposed_name} ${r.description ?? ''}`.toLowerCase();
+      const matched = allTools.filter((r) => hay(r).includes(kw.toLowerCase()) && (!upstreamFilter || r.upstream === upstreamFilter)).slice(0, limit);
+      const upNames = new Map(upstreams.map((u) => [u.id, u.name]));
+      const result = { keyword: kw, total: matched.length, results: matched.map((r) => ({ name: r.exposed_name, upstream: upNames.get(r.upstream) ?? r.upstream, desc: (r.description ?? '').slice(0, 100) })) };
+      insertCallLog({ caller: logCtx.caller, user_id: logCtx.userId, tool_name: name, tool_id: name, tool_type: 'gateway', upstream: '', shop_refs: null, success: true, is_error: false, duration_ms: Date.now() - logCtx.started, error: null, cost_credits: null, effective_rows: matched.length, is_admin: identity.kind === 'admin', is_empty_shell: true, gateway_points: 0 });
+      return { content: [{ type: 'text' as const, text: JSON.stringify(result) }] };
     }
 
     // 调用者可见的 upstream 范围（admin = 全部 active；用户 = users.upstream，fail-closed）
@@ -1071,34 +1124,47 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
 
       // 店铺结果裁剪
       // 只对「店铺维度上游」生效：西柚/NocoDB 等上游没有店铺维度，结果必须原样返回
-      // 白名单 bypass 工具（get_my_sids/ad_auth_shops 等）返回的是店铺目录本身 → 不裁剪
+      // bypass 工具（get_my_sids/ad_auth_shops 等店铺目录类）也按 user_shops 白名单裁剪，
+      // 但裁剪后 0 行时保留全部 + warning（运营能看到领星绑定了哪些店，方便申请权限）
       if (Array.isArray(content)) {
         let filteredContent = content as any[];
         const isBypassTool = SHOP_SCOPE_BYPASS_TOOLS.has(tool?.tool_id ?? '') || SHOP_SCOPE_BYPASS_TOOLS.has(name);
-        if (identity.kind === 'user' && !identity.all_shops && isShopScopedUpstream(upId) && !isBypassTool) {
+        if (identity.kind === 'user' && !identity.all_shops && isShopScopedUpstream(upId)) {
           const allowedShops = new Set(getUserShopIds(identity.id));
           if (allowedShops.size === 0) {
-            // 参数级校验已经 fail-closed 了，理论上走不到这里；
-            // 防御性兜底：user_shops 空就跳过裁剪、原样返回（上层已经会拒绝调用）
+            // user_shops 未配置 → 防御性兜底：原样返回 + warning
+            if (isBypassTool) {
+              filteredContent = [
+                { type: 'text' as const, text: JSON.stringify({ __gateway_warn: '未配置店铺白名单，当前展示领星账号绑定的全部店铺（仅可见目录，不能调用 shop_scoped 工具）' }) },
+                ...filteredContent,
+              ];
+            }
             console.warn(`[mcp] ${caller} ${name} 店铺裁剪跳过：user_shops 为空`);
           } else {
             const stat: ShopFilterStat = { removed: 0 };
             const idMap = buildShopIdMapping();
             filteredContent = filterContentByShops(content, allowedShops, stat, idMap) as any[];
-            if (stat.removed > 0) {
-              console.log(`[mcp] ${caller} ${name} 店铺裁剪 ${stat.removed} 行（allowed=${allowedShops.size}）`);
-            // __gateway_warn 插到 content 第一个位置，避免客户端因为遍历顺序看不到
-            filteredContent = [
-              {
-                type: 'text' as const,
-                text: JSON.stringify({
-                  __gateway_warn: `已按店铺权限过滤 ${stat.removed} 行不属于授权店铺的数据；上游的总数字段（total/recordsFiltered）不会随之变化，不能据其判断明细是否完整`,
-                }),
-              },
-              ...filteredContent,
-            ];
+            if (isBypassTool && filteredContent.length === 0 && stat.removed > 0) {
+              // bypass 工具裁剪后 0 行（运营白名单与领星返回无交集）→ 保留全部 + warning
+              console.warn(`[mcp] ${caller} ${name} bypass 工具裁剪后 0 行（allowed=${allowedShops.size}），保留全部`);
+              filteredContent = content as any[];
+              filteredContent = [
+                { type: 'text' as const, text: JSON.stringify({ __gateway_warn: `你当前可用店铺 ${allowedShops.size} 家，领星返回的 ${stat.removed + 1} 家中无匹配。当前展示全部仅供参考。` }) },
+                ...filteredContent,
+              ];
+            } else if (stat.removed > 0) {
+              console.log(`[mcp] ${caller} ${name} 店铺裁剪 ${stat.removed} 行（allowed=${allowedShops.size}${isBypassTool ? '，bypass工具' : ''}）`);
+              filteredContent = [
+                {
+                  type: 'text' as const,
+                  text: JSON.stringify({
+                    __gateway_warn: `已按店铺权限过滤 ${stat.removed} 行不属于授权店铺的数据；上游的总数字段（total/recordsFiltered）不会随之变化，不能据其判断明细是否完整`,
+                  }),
+                },
+                ...filteredContent,
+              ];
+            }
           }
-        }
         } // closing: if (identity.kind === 'user' && !all_shops && shopScoped)
         // 清理响应里的内网地址（如 NocoDB 的 next 分页 URL 会带 192.168.x.x:port / baseId / tableId）
         const scrubStat = { removed: 0 };
@@ -1106,6 +1172,7 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
         if (scrubStat.removed > 0) {
           console.log(`[mcp] ${caller} ${name} 已移除 ${scrubStat.removed} 个内网 URL 字段`);
         }
+        filteredContent = stripMarkdownFenceInContent(filteredContent) as any[];
         // bypass 工具（店铺目录类）→ 在返回里注入显式店铺提示，不让 agent 从大 JSON 里自己抽
         // 即使后面的数据很长，agent 第一眼也能看到可用 sid 列表 + 使用示例
         const isBypassToolForHint = SHOP_SCOPE_BYPASS_TOOLS.has(tool?.tool_id ?? '') || SHOP_SCOPE_BYPASS_TOOLS.has(name);
