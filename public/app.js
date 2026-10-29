@@ -1123,7 +1123,11 @@ function renderLogStats(stats) {
   const rate = stats.total > 0 ? ((stats.success / stats.total) * 100).toFixed(1) + '%' : '—';
   const topTools = (stats.top_tools || []).slice(0, 8);
   const topCallers = (stats.top_callers || []).slice(0, 5);
-  const toolChips = topTools.map((t) => `<span class="chip">${escapeHtml(t.tool_name)} <b>×${t.count}</b></span>`).join('') || '<span class="muted">—</span>';
+  const toolChips = topTools.map((t) => {
+    const cred = t.credits > 0 ? ` <b style="color:#d97706">${t.credits.toFixed(1)}pt</b>` : '';
+    const fail = t.failed_count > 0 ? ` <span style="color:#dc2626">⚠${t.failed_count}</span>` : '';
+    return `<span class="chip" title="成功${t.success_count}/${t.count}，失败${t.failed_count}，点数${t.credits}">${escapeHtml(t.tool_name)} <b>×${t.count}</b>${cred}${fail}</span>`;
+  }).join('') || '<span class="muted">—</span>';
   const callerChips = topCallers.map((t) => `<span class="chip caller">${escapeHtml(t.caller)} <b>×${t.count}</b></span>`).join('') || '<span class="muted">—</span>';
 
   // upstream 汇总条

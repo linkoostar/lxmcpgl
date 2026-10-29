@@ -756,7 +756,7 @@ export function getCallLogStats(opts: CallLogStatsOpts = {}): {
   avg_ms: number | null;
   total_credits: number;
   upstream_stats: Array<{ upstream: string; count: number; credits: number; avg_ms: number }>;
-  top_tools: Array<{ tool_name: string; count: number }>;
+  top_tools: Array<{ tool_name: string; upstream: string; count: number; credits: number }>;
   top_callers: Array<{ caller: string; count: number }>;
 } {
   // call_logs where（ts 字段）
@@ -821,9 +821,35 @@ export function getCallLogStats(opts: CallLogStatsOpts = {}): {
     .prepare(`SELECT COALESCE(SUM(cost_credits), 0) AS total FROM cost_logs ${coWhere}`)
     .all(...coArgs)[0] as { total: number };
 
-  const topTools = db
-    .prepare(`SELECT tool_name, COUNT(*) AS count FROM call_logs ${clWhere} GROUP BY tool_name ORDER BY count DESC LIMIT 8`)
-    .all(...clArgs) as Array<{ tool_name: string; count: number }>;
+  // top_tools — call_logs 算 count/success/failed，cost_logs 单独算 credits，JOIN 回来避免多对多放大
+  const topToolsCount = db
+    .prepare(`SELECT upstream, tool_name, COUNT(*) AS count,
+                     SUM(success) AS success_count,
+                     SUM(CASE WHEN success=0 THEN 1 ELSE 0 END) AS failed_count
+              FROM call_logs ${clWhere} GROUP BY upstream, tool_name ORDER BY count DESC LIMIT 8`)
+    .all(...clArgs) as Array<{ upstream: string; tool_name: string; count: number; success_count: number; failed_count: number }>;
+
+  // 只算成功调用的 credits（SIF: "只有成功返回有效数据才扣除点数"；空壳已归零，cost_logs 里是 0）
+  // JOIN cost_logs 时用 upstream + tool_name + 时间区间匹配，避免跨天/跨用户重复计数
+  const topToolsCredits = db
+    .prepare(`SELECT upstream, tool_name, COALESCE(SUM(cost_credits), 0) AS credits,
+                     SUM(CASE WHEN cost_credits > 0 THEN 1 ELSE 0 END) AS charged_count
+              FROM cost_logs ${coWhere} GROUP BY upstream, tool_name`)
+    .all(...coArgs) as Array<{ upstream: string; tool_name: string; credits: number; charged_count: number }>;
+
+  const toolCreditsMap = new Map(topToolsCredits.map((r) => [`${r.upstream}\u0000${r.tool_name}`, { credits: Number(r.credits), charged: r.charged_count }]));
+  const topTools = topToolsCount.map((t) => {
+    const creditInfo = toolCreditsMap.get(`${t.upstream}\u0000${t.tool_name}`) ?? { credits: 0, charged: 0 };
+    return {
+      tool_name: t.tool_name,
+      upstream: t.upstream,
+      count: t.count,
+      success_count: t.success_count ?? 0,
+      failed_count: t.failed_count ?? 0,
+      credits: creditInfo.credits,
+      charged_count: creditInfo.charged,
+    };
+  });
   const topCallers = db
     .prepare(`SELECT caller, COUNT(*) AS count FROM call_logs ${clWhere} GROUP BY caller ORDER BY count DESC LIMIT 6`)
     .all(...clArgs) as Array<{ caller: string; count: number }>;
