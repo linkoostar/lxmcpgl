@@ -695,6 +695,9 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
       costCredits?: number | null,
       opts?: { effectiveRows?: number | null; isEmptyShell?: boolean }
     ): void {
+      const isEmptyShell = opts?.isEmptyShell ?? false;
+      // 网关自建消耗分：成功且非空壳才计分。tool 可能为 undefined（限流/账号停用等早期拒绝），fallback 0
+      const gatewayPoints = success && !isEmptyShell ? (tool?.gateway_points ?? 1) : 0;
       insertCallLog({
         caller: logCtx.caller,
         user_id: logCtx.userId,
@@ -710,7 +713,8 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
         cost_credits: costCredits ?? null,
         effective_rows: opts?.effectiveRows ?? null,
         is_admin: identity.kind === 'admin',
-        is_empty_shell: opts?.isEmptyShell ?? false,
+        is_empty_shell: isEmptyShell,
+        gateway_points: gatewayPoints,
       });
     }
 
@@ -886,19 +890,22 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
         console.log(`[mcp] ${caller} ${name} 空壳检测命中（有效行 ${shell?.effectiveRows ?? 0}），cost 归零: ${cost} → 0`);
         cost = 0;
       }
-      if (cost !== null) {
+      // 网关自建消耗分：成功且非空壳才计分（cost_logs 也写入，方便费用分摊对账）
+      const gatewayPoints = !isEmptyShell ? (tool.gateway_points ?? 1) : 0;
+      if (cost !== null || gatewayPoints > 0) {
         db.prepare(
-          'INSERT INTO cost_logs (upstream, user_id, tool_name, tool_id, cost_credits, duration_ms, created_at, is_admin, is_empty_shell) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+          'INSERT INTO cost_logs (upstream, user_id, tool_name, tool_id, cost_credits, duration_ms, created_at, is_admin, is_empty_shell, gateway_points) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
         ).run(
           upId,
           identity.kind === 'user' ? identity.id : null,
           tool.exposed_name,
           tool.tool_id,
-          cost,
+          cost ?? 0,
           duration,
           new Date().toISOString(),
           identity.kind === 'admin' ? 1 : 0,
-          isEmptyShell ? 1 : 0
+          isEmptyShell ? 1 : 0,
+          gatewayPoints
         );
       }
 

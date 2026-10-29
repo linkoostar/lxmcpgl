@@ -259,6 +259,25 @@ function migrate(): void {
     console.log('[db] tools 已补 schema_hash 列');
   }
 
+  // ===== gateway_points：网关自建消耗分 =====
+  // tools.gateway_points = 每个工具默认消耗分（默认 1，可管理员 per-tool 调整）
+  // call_logs.gateway_points = 本次调用实际计的分（成功 && 非空壳才给）
+  // cost_logs.gateway_points = 聚合维度也带一份，方便费用分摊对账
+  if (!toolCols.includes('gateway_points')) {
+    db.exec(`ALTER TABLE tools ADD COLUMN gateway_points REAL DEFAULT 1`);
+    console.log('[db] tools 已补 gateway_points 列（默认 1）');
+  }
+  const clCols2 = (db.prepare(`PRAGMA table_info(call_logs)`).all() as Array<{ name: string }>).map((c) => c.name);
+  if (!clCols2.includes('gateway_points')) {
+    db.exec(`ALTER TABLE call_logs ADD COLUMN gateway_points REAL DEFAULT 0`);
+    console.log('[db] call_logs 已补 gateway_points 列');
+  }
+  const coCols2 = (db.prepare(`PRAGMA table_info(cost_logs)`).all() as Array<{ name: string }>).map((c) => c.name);
+  if (!coCols2.includes('gateway_points')) {
+    db.exec(`ALTER TABLE cost_logs ADD COLUMN gateway_points REAL DEFAULT 0`);
+    console.log('[db] cost_logs 已补 gateway_points 列');
+  }
+
   // 工具分类兜底
   backfillToolTypes();
 }
@@ -278,16 +297,17 @@ function migrateToolsCompositePk(): void {
     db.exec(`ALTER TABLE tools RENAME TO tools_legacy_p0`);
     db.exec(`
       CREATE TABLE tools (
-        tool_id      TEXT NOT NULL,
-        upstream     TEXT NOT NULL DEFAULT 'lingxing',
-        exposed_name TEXT,
-        name         TEXT DEFAULT '',
-        description  TEXT DEFAULT '',
-        input_schema TEXT,
-        raw          TEXT,
-        tool_type    TEXT DEFAULT '',
-        enabled      INTEGER NOT NULL DEFAULT 1,
-        updated_at   TEXT DEFAULT '',
+        tool_id       TEXT NOT NULL,
+        upstream      TEXT NOT NULL DEFAULT 'lingxing',
+        exposed_name  TEXT,
+        name          TEXT DEFAULT '',
+        description   TEXT DEFAULT '',
+        input_schema  TEXT,
+        raw           TEXT,
+        tool_type     TEXT DEFAULT '',
+        enabled       INTEGER NOT NULL DEFAULT 1,
+        updated_at    TEXT DEFAULT '',
+        gateway_points REAL DEFAULT 1,
         PRIMARY KEY (upstream, tool_id)
       )
     `);
@@ -431,6 +451,7 @@ export interface ToolRow {
   shop_scope?: string; // unreviewed / shop_scoped / global_safe
   shop_scope_suggest?: string; // 自动生成的建议值
   schema_hash?: string; // 上次 sync 时的 input_schema hash
+  gateway_points?: number; // 网关自建消耗分（默认 1，可 per-tool 调整）
 }
 
 export function upsertTool(t: {
@@ -680,12 +701,13 @@ export function insertCallLog(l: {
   effective_rows?: number | null;
   is_admin?: boolean;
   is_empty_shell?: boolean;
+  gateway_points?: number | null;
 }): void {
   const err = l.error ? String(l.error).slice(0, 500) : '';
   const shops = l.shop_refs ? JSON.stringify(l.shop_refs.slice(0, 50)) : '';
   db.prepare(
-    `INSERT INTO call_logs (ts, caller, user_id, tool_name, tool_id, tool_type, upstream, shop_refs, success, is_error, duration_ms, error, cost_credits, effective_rows, is_admin, is_empty_shell)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    `INSERT INTO call_logs (ts, caller, user_id, tool_name, tool_id, tool_type, upstream, shop_refs, success, is_error, duration_ms, error, cost_credits, effective_rows, is_admin, is_empty_shell, gateway_points)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
     new Date().toISOString(),
     l.caller,
@@ -702,7 +724,8 @@ export function insertCallLog(l: {
     l.cost_credits ?? null,
     l.effective_rows ?? null,
     l.is_admin ? 1 : 0,
-    l.is_empty_shell ? 1 : 0
+    l.is_empty_shell ? 1 : 0,
+    l.gateway_points ?? 0
   );
 }
 
@@ -747,6 +770,17 @@ export interface CallLogStatsOpts {
   caller?: string;
 }
 
+/** 抽 WHERE 拼装——getCallLogStats 和 trend endpoint 共用 */
+export function buildCallLogsWhere(opts: CallLogStatsOpts = {}): { where: string; args: unknown[] } {
+  const conds: string[] = [];
+  const args: unknown[] = [];
+  if (opts.since) { conds.push('ts >= ?'); args.push(opts.since); }
+  if (opts.until) { conds.push('ts <= ?'); args.push(opts.until); }
+  if (opts.upstream) { conds.push('upstream = ?'); args.push(opts.upstream); }
+  if (opts.caller) { conds.push('caller = ?'); args.push(opts.caller); }
+  return { where: conds.length > 0 ? `WHERE ${conds.join(' AND ')}` : '', args };
+}
+
 export function getCallLogStats(opts: CallLogStatsOpts = {}): {
   total: number;
   success: number;
@@ -755,56 +789,72 @@ export function getCallLogStats(opts: CallLogStatsOpts = {}): {
   unique_tools: number;
   avg_ms: number | null;
   total_credits: number;
-  upstream_stats: Array<{ upstream: string; count: number; credits: number; avg_ms: number }>;
-  top_tools: Array<{ tool_name: string; upstream: string; count: number; credits: number }>;
-  top_callers: Array<{ caller: string; count: number; credits: number; upstream_breakdown: Array<{ upstream: string; count: number; credits: number }> }>;
+  total_gateway_points: number;
+  upstream_stats: Array<{ upstream: string; count: number; credits: number; gateway_points: number; avg_ms: number }>;
+  top_tools: Array<{ tool_name: string; upstream: string; count: number; credits: number; gateway_points: number }>;
+  top_callers: Array<{ caller: string; count: number; credits: number; gateway_points: number; upstream_breakdown: Array<{ upstream: string; count: number; credits: number; gateway_points: number }> }>;
 } {
   // call_logs where（ts 字段）
-  const clConds: string[] = [];
-  const clArgs: unknown[] = [];
-  if (opts.since) { clConds.push('ts >= ?'); clArgs.push(opts.since); }
-  if (opts.until) { clConds.push('ts <= ?'); clArgs.push(opts.until); }
-  if (opts.upstream) { clConds.push('upstream = ?'); clArgs.push(opts.upstream); }
-  if (opts.caller) { clConds.push('caller = ?'); clArgs.push(opts.caller); }
-  const clWhere = clConds.length > 0 ? `WHERE ${clConds.join(' AND ')}` : '';
+  const { where: clWhere, args: clArgs } = buildCallLogsWhere(opts);
 
   // cost_logs where（created_at），时间条件复用 opts.since/opts.until，其他用 upstream/caller 映射
+  // 注意：cost_logs 的 WHERE 可能被拼进 LEFT JOIN users 的 SQL（callersCredits），所以所有列必须加 c. 前缀防歧义
+  // uidRows 提前到 if 外声明，两个版本共用
+  const uidRows = opts.caller
+    ? (db.prepare("SELECT id FROM users WHERE username = ?").all(opts.caller) as Array<{ id: number }>)
+    : [];
+
   const coConds: string[] = [];
   const coArgs: unknown[] = [];
-  if (opts.since) { coConds.push('created_at >= ?'); coArgs.push(opts.since); }
-  if (opts.until) { coConds.push('created_at <= ?'); coArgs.push(opts.until); }
-  if (opts.upstream) { coConds.push('upstream = ?'); coArgs.push(opts.upstream); }
+  if (opts.since) { coConds.push('c.created_at >= ?'); coArgs.push(opts.since); }
+  if (opts.until) { coConds.push('c.created_at <= ?'); coArgs.push(opts.until); }
+  if (opts.upstream) { coConds.push('c.upstream = ?'); coArgs.push(opts.upstream); }
   if (opts.caller) {
-    // caller 在 cost_logs 里对应 user_id（cost_logs.user_id 是运营用户 id，admin 调用为 NULL）
-    const uidRows = db.prepare("SELECT id FROM users WHERE username = ?").all(opts.caller) as Array<{ id: number }>;
     if (uidRows.length > 0) {
       const ph = uidRows.map(() => '?').join(',');
-      coConds.push(`(user_id IN (${ph}) OR user_id IS NULL)`);
+      coConds.push(`(c.user_id IN (${ph}) OR c.user_id IS NULL)`);
       coArgs.push(...uidRows.map((r) => r.id));
     } else {
-      // call_logs 里这个 caller 可能是 admin（cost_logs.user_id = NULL），也可能没人
-      coConds.push('user_id IS NULL');
+      coConds.push('c.user_id IS NULL');
     }
   }
   const coWhere = coConds.length > 0 ? `WHERE ${coConds.join(' AND ')}` : '';
 
+  // 无前缀版本（单表 FROM cost_logs 的查询用，避免多余的 c. 别名）
+  const coCondsPlain: string[] = [];
+  const coArgsPlain: unknown[] = [];
+  if (opts.since) { coCondsPlain.push('created_at >= ?'); coArgsPlain.push(opts.since); }
+  if (opts.until) { coCondsPlain.push('created_at <= ?'); coArgsPlain.push(opts.until); }
+  if (opts.upstream) { coCondsPlain.push('upstream = ?'); coArgsPlain.push(opts.upstream); }
+  if (opts.caller) {
+    if (uidRows.length > 0) {
+      const ph = uidRows.map(() => '?').join(',');
+      coCondsPlain.push(`(user_id IN (${ph}) OR user_id IS NULL)`);
+      coArgsPlain.push(...uidRows.map((r: { id: number }) => r.id));
+    } else {
+      coCondsPlain.push('user_id IS NULL');
+    }
+  }
+  const coWherePlain = coCondsPlain.length > 0 ? `WHERE ${coCondsPlain.join(' AND ')}` : '';
+
   const summary = db
     .prepare(`SELECT COUNT(*) AS total, SUM(success) AS success, SUM(CASE WHEN success=0 THEN 1 ELSE 0 END) AS failed,
-                     AVG(duration_ms) AS avg_ms, COUNT(DISTINCT caller) AS unique_callers, COUNT(DISTINCT tool_name) AS unique_tools
+                     AVG(duration_ms) AS avg_ms, COUNT(DISTINCT caller) AS unique_callers, COUNT(DISTINCT tool_name) AS unique_tools,
+                     COALESCE(SUM(gateway_points), 0) AS total_gateway_points
               FROM call_logs ${clWhere}`)
     .all(...clArgs)[0] as any;
 
-  // upstream 维度汇总 —— call_logs 单独算 count/avg，cost_logs 单独算 credits，最后 JOIN 回来
+  // upstream 维度汇总 —— call_logs 单独算 count/avg/gateway_points，cost_logs 单独算 credits，最后 JOIN 回来
   // 避免 COUNT(*) 在多对多 JOIN 时被放大
   const upstreamCount = db
-    .prepare(`SELECT upstream, COUNT(*) AS count, AVG(duration_ms) AS avg_ms
+    .prepare(`SELECT upstream, COUNT(*) AS count, AVG(duration_ms) AS avg_ms, COALESCE(SUM(gateway_points), 0) AS gateway_points
               FROM call_logs ${clWhere} GROUP BY upstream`)
-    .all(...clArgs) as Array<{ upstream: string; count: number; avg_ms: number | null }>;
+    .all(...clArgs) as Array<{ upstream: string; count: number; avg_ms: number | null; gateway_points: number }>;
 
   const upstreamCredits = db
     .prepare(`SELECT upstream, COALESCE(SUM(cost_credits), 0) AS credits
-              FROM cost_logs ${coWhere} GROUP BY upstream`)
-    .all(...coArgs) as Array<{ upstream: string; credits: number }>;
+              FROM cost_logs ${coWherePlain} GROUP BY upstream`)
+    .all(...coArgsPlain) as Array<{ upstream: string; credits: number }>;
 
   const creditsMap = new Map(upstreamCredits.map((r) => [r.upstream, Number(r.credits)]));
   const upstreamStats = upstreamCount
@@ -812,30 +862,32 @@ export function getCallLogStats(opts: CallLogStatsOpts = {}): {
       upstream: u.upstream,
       count: u.count,
       credits: creditsMap.get(u.upstream) ?? 0,
+      gateway_points: Number(u.gateway_points),
       avg_ms: u.avg_ms != null ? Math.round(Number(u.avg_ms)) : 0,
     }))
     .sort((a, b) => b.count - a.count);
 
   // 全局总 credits（独立 SUM，不跟 call_logs JOIN）
   const totalCreditsRow = db
-    .prepare(`SELECT COALESCE(SUM(cost_credits), 0) AS total FROM cost_logs ${coWhere}`)
-    .all(...coArgs)[0] as { total: number };
+    .prepare(`SELECT COALESCE(SUM(cost_credits), 0) AS total FROM cost_logs ${coWherePlain}`)
+    .all(...coArgsPlain)[0] as { total: number };
 
-  // top_tools — call_logs 算 count/success/failed，cost_logs 单独算 credits，JOIN 回来避免多对多放大
+  // top_tools — call_logs 算 count/success/failed/gateway_points，cost_logs 单独算 credits，JOIN 回来避免多对多放大
   const topToolsCount = db
     .prepare(`SELECT upstream, tool_name, COUNT(*) AS count,
                      SUM(success) AS success_count,
-                     SUM(CASE WHEN success=0 THEN 1 ELSE 0 END) AS failed_count
+                     SUM(CASE WHEN success=0 THEN 1 ELSE 0 END) AS failed_count,
+                     COALESCE(SUM(gateway_points), 0) AS gateway_points
               FROM call_logs ${clWhere} GROUP BY upstream, tool_name ORDER BY count DESC LIMIT 8`)
-    .all(...clArgs) as Array<{ upstream: string; tool_name: string; count: number; success_count: number; failed_count: number }>;
+    .all(...clArgs) as Array<{ upstream: string; tool_name: string; count: number; success_count: number; failed_count: number; gateway_points: number }>;
 
   // 只算成功调用的 credits（SIF: "只有成功返回有效数据才扣除点数"；空壳已归零，cost_logs 里是 0）
   // JOIN cost_logs 时用 upstream + tool_name + 时间区间匹配，避免跨天/跨用户重复计数
   const topToolsCredits = db
     .prepare(`SELECT upstream, tool_name, COALESCE(SUM(cost_credits), 0) AS credits,
                      SUM(CASE WHEN cost_credits > 0 THEN 1 ELSE 0 END) AS charged_count
-              FROM cost_logs ${coWhere} GROUP BY upstream, tool_name`)
-    .all(...coArgs) as Array<{ upstream: string; tool_name: string; credits: number; charged_count: number }>;
+              FROM cost_logs ${coWherePlain} GROUP BY upstream, tool_name`)
+    .all(...coArgsPlain) as Array<{ upstream: string; tool_name: string; credits: number; charged_count: number }>;
 
   const toolCreditsMap = new Map(topToolsCredits.map((r) => [`${r.upstream}\u0000${r.tool_name}`, { credits: Number(r.credits), charged: r.charged_count }]));
   const topTools = topToolsCount.map((t) => {
@@ -847,15 +899,17 @@ export function getCallLogStats(opts: CallLogStatsOpts = {}): {
       success_count: t.success_count ?? 0,
       failed_count: t.failed_count ?? 0,
       credits: creditInfo.credits,
+      gateway_points: Number(t.gateway_points),
       charged_count: creditInfo.charged,
     };
   });
-  // top_callers — call_logs 算 count，cost_logs 算 credits。cost_logs 里 user_id 指向 users.id（运营用户），
+  // top_callers — call_logs 算 count + gateway_points，cost_logs 算 credits。cost_logs 里 user_id 指向 users.id（运营用户），
   // admin 调用 user_id=NULL；call_logs 里 caller 存的是 username（admin/运营用户名）
   // 所以需要通过 users 表 JOIN：call_logs.caller = users.username 对应 cost_logs.user_id = users.id
   const callersRaw = db
-    .prepare(`SELECT caller, COUNT(*) AS count FROM call_logs ${clWhere} GROUP BY caller ORDER BY count DESC LIMIT 6`)
-    .all(...clArgs) as Array<{ caller: string; count: number }>;
+    .prepare(`SELECT caller, COUNT(*) AS count, COALESCE(SUM(gateway_points), 0) AS gateway_points
+              FROM call_logs ${clWhere} GROUP BY caller ORDER BY count DESC LIMIT 6`)
+    .all(...clArgs) as Array<{ caller: string; count: number; gateway_points: number }>;
 
   const callersCredits = db
     .prepare(`SELECT COALESCE(u.username, 'admin') AS caller, c.upstream,
@@ -864,6 +918,17 @@ export function getCallLogStats(opts: CallLogStatsOpts = {}): {
               ${coWhere}
               GROUP BY caller, c.upstream`)
     .all(...coArgs) as Array<{ caller: string; upstream: string; count: number; credits: number }>;
+
+  // callers 的 gateway_points 也按 upstream 拆开（从 call_logs 来）
+  const callersGwPerUp = db
+    .prepare(`SELECT caller, upstream, COALESCE(SUM(gateway_points), 0) AS gateway_points
+              FROM call_logs ${clWhere} GROUP BY caller, upstream`)
+    .all(...clArgs) as Array<{ caller: string; upstream: string; gateway_points: number }>;
+  const gwMap = new Map<string, Map<string, number>>();
+  for (const r of callersGwPerUp) {
+    if (!gwMap.has(r.caller)) gwMap.set(r.caller, new Map());
+    gwMap.get(r.caller)!.set(r.upstream, Number(r.gateway_points));
+  }
 
   // 聚合：先按 caller 汇总总 credits，再构建 per-upstream breakdown
   const callerCreditsMap = new Map<string, { total: number; upstreams: Map<string, number> }>();
@@ -876,7 +941,8 @@ export function getCallLogStats(opts: CallLogStatsOpts = {}): {
 
   const topCallers = callersRaw.map((c) => {
     const creditInfo = callerCreditsMap.get(c.caller);
-    const breakdown: Array<{ upstream: string; count: number; credits: number }> = [];
+    const gwByUp = gwMap.get(c.caller);
+    const breakdown: Array<{ upstream: string; count: number; credits: number; gateway_points: number }> = [];
     // 上游调用次数从 call_logs 来（cost_logs 没 count，JOIN 一下）
     const perUpCountSql = `SELECT upstream, COUNT(*) AS count FROM call_logs ${clWhere}${clWhere ? ' AND' : ' WHERE'} caller = ? GROUP BY upstream`;
     const perUpCount = db
@@ -887,12 +953,14 @@ export function getCallLogStats(opts: CallLogStatsOpts = {}): {
         upstream: u.upstream,
         count: u.count,
         credits: creditInfo?.upstreams.get(u.upstream) ?? 0,
+        gateway_points: gwByUp?.get(u.upstream) ?? 0,
       });
     }
     return {
       caller: c.caller,
       count: c.count,
       credits: creditInfo?.total ?? 0,
+      gateway_points: Number(c.gateway_points),
       upstream_breakdown: breakdown.sort((a, b) => b.count - a.count),
     };
   });
@@ -905,6 +973,7 @@ export function getCallLogStats(opts: CallLogStatsOpts = {}): {
     unique_tools: summary.unique_tools ?? 0,
     avg_ms: summary.avg_ms != null ? Math.round(Number(summary.avg_ms)) : null,
     total_credits: Number(totalCreditsRow?.total ?? 0),
+    total_gateway_points: Number(summary.total_gateway_points ?? 0),
     upstream_stats: upstreamStats,
     top_tools: topTools,
     top_callers: topCallers,
@@ -915,6 +984,74 @@ export function cleanupCallLogs(beforeDays: number): number {
   const cutoff = new Date(Date.now() - beforeDays * 24 * 3600 * 1000).toISOString();
   const info = db.prepare('DELETE FROM call_logs WHERE ts < ?').run(cutoff);
   return info.changes;
+}
+
+/** 时间序列趋势 —— 按小时或天 bucket 聚合 */
+export function getCallLogTrend(
+  opts: CallLogStatsOpts & { granularity?: 'hour' | 'day' } = {}
+): Array<{ bucket: string; calls: number; success: number; failed: number; gateway_points: number; upstream_credits: number }> {
+  const MAX_BUCKETS = 720; // 防爆炸：小时粒度 30 天 = 720，超过自动降级
+  let granularity = opts.granularity ?? 'day';
+
+  // 默认时间范围：没传就拉最近 30 天
+  const since = opts.since ?? new Date(Date.now() - 30 * 24 * 3600 * 1000).toISOString();
+  const until = opts.until ?? new Date().toISOString();
+  const ms = new Date(until).getTime() - new Date(since).getTime();
+
+  // bucket 数量超了就降级
+  let fmt = granularity === 'hour' ? '%Y-%m-%d %H' : '%Y-%m-%d';
+  let bucketMs = granularity === 'hour' ? 3600_000 : 86400_000;
+  if (ms / bucketMs > MAX_BUCKETS && granularity === 'hour') {
+    granularity = 'day';
+    fmt = '%Y-%m-%d';
+    bucketMs = 86400_000;
+  }
+
+  const { where: clWhere, args: clArgs } = buildCallLogsWhere({ ...opts, since, until });
+
+  // call_logs 直接算 calls/success/failed/gateway_points
+  const rows = db
+    .prepare(`SELECT strftime('${fmt}', ts) AS bucket,
+                     COUNT(*) AS calls,
+                     SUM(success) AS success,
+                     SUM(CASE WHEN success=0 THEN 1 ELSE 0 END) AS failed,
+                     COALESCE(SUM(gateway_points), 0) AS gateway_points
+              FROM call_logs ${clWhere} GROUP BY bucket ORDER BY bucket ASC`)
+    .all(...clArgs) as Array<{ bucket: string; calls: number; success: number; failed: number; gateway_points: number }>;
+
+  // upstream_credits 从 cost_logs 查（相同 bucket 分组）
+  const coConds: string[] = [];
+  const coArgs: unknown[] = [];
+  coConds.push('created_at >= ?'); coArgs.push(since);
+  coConds.push('created_at <= ?'); coArgs.push(until);
+  if (opts.upstream) { coConds.push('upstream = ?'); coArgs.push(opts.upstream); }
+  if (opts.caller) {
+    const uidRows = db.prepare("SELECT id FROM users WHERE username = ?").all(opts.caller) as Array<{ id: number }>;
+    if (uidRows.length > 0) {
+      const ph = uidRows.map(() => '?').join(',');
+      coConds.push(`(user_id IN (${ph}) OR user_id IS NULL)`);
+      coArgs.push(...uidRows.map((r) => r.id));
+    } else {
+      coConds.push('user_id IS NULL');
+    }
+  }
+  const coWhere = coConds.length > 0 ? `WHERE ${coConds.join(' AND ')}` : '';
+
+  const creditRows = db
+    .prepare(`SELECT strftime('${fmt}', created_at) AS bucket, COALESCE(SUM(cost_credits), 0) AS upstream_credits
+              FROM cost_logs ${coWhere} GROUP BY bucket`)
+    .all(...coArgs) as Array<{ bucket: string; upstream_credits: number }>;
+  const creditMap = new Map(creditRows.map((r) => [r.bucket, Number(r.upstream_credits)]));
+
+  // 合并——以 call_logs 的 bucket 为主，补 cost_logs 的 credits
+  return rows.map((r) => ({
+    bucket: r.bucket,
+    calls: r.calls,
+    success: r.success ?? 0,
+    failed: r.failed ?? 0,
+    gateway_points: Number(r.gateway_points),
+    upstream_credits: creditMap.get(r.bucket) ?? 0,
+  }));
 }
 
 // ===== M1.7：upstreams CRUD helper =====

@@ -25,6 +25,7 @@ import {
   getToolCountByType,
   listCallLogs,
   getCallLogStats,
+  getCallLogTrend,
   cleanupCallLogs,
   listUpstreams,
   getUpstream,
@@ -1028,6 +1029,19 @@ apiRouter.get(
     const upstream = String(req.query.upstream ?? '').trim() || undefined;
     const caller = String(req.query.caller ?? '').trim() || undefined;
     res.json(getCallLogStats({ since, until, upstream, caller }));
+  })
+);
+
+apiRouter.get(
+  '/call-logs/stats/trend',
+  requireAuth,
+  wrap(async (req, res) => {
+    const since = String(req.query.since ?? '').trim() || undefined;
+    const until = String(req.query.until ?? '').trim() || undefined;
+    const upstream = String(req.query.upstream ?? '').trim() || undefined;
+    const caller = String(req.query.caller ?? '').trim() || undefined;
+    const granularity = (req.query.granularity === 'hour' ? 'hour' : 'day') as 'hour' | 'day';
+    res.json(getCallLogTrend({ since, until, upstream, caller, granularity }));
   })
 );
 
