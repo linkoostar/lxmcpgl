@@ -664,11 +664,11 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
     const activeUpIds = upstreams.map((u) => u.id);
     const upMap = new Map(upstreams.map((u) => [u.id, { name: u.name, notes: u.notes }]));
 
-    let rows: Array<{ upstream: string; tool_id: string; exposed_name: string; name: string; description: string; input_schema: string | null; updated_at: string | null }>;
+    let rows: Array<{ upstream: string; tool_id: string; exposed_name: string; name: string; description: string; input_schema: string | null; updated_at: string | null; tool_type: string | null }>;
     if (identity.kind === 'admin') {
       // admin 也只看「启用中且归属 active upstream」的工具，停用上游的历史工具不该被下游看到
       rows = db
-        .prepare(`SELECT t.upstream, t.tool_id, t.exposed_name, t.name, t.description, t.input_schema, t.updated_at
+        .prepare(`SELECT t.upstream, t.tool_id, t.exposed_name, t.name, t.description, t.input_schema, t.updated_at, t.tool_type
                   FROM tools t
                   JOIN upstreams u ON u.id = t.upstream
                   WHERE t.enabled = 1 AND u.active = 1
@@ -682,7 +682,7 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
       const placeholders = scope.ids.map(() => '?').join(',');
       const all = db
         .prepare(
-          `SELECT upstream, tool_id, exposed_name, name, description, input_schema, updated_at FROM tools
+          `SELECT upstream, tool_id, exposed_name, name, description, input_schema, updated_at, tool_type FROM tools
            WHERE enabled = 1 AND upstream IN (${placeholders}) ORDER BY upstream, tool_id`
         )
         .all(...scope.ids) as any[];
@@ -704,13 +704,15 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
     const builtinTools = [
       {
         name: '_tool_search',
-        description: '[网关] 按关键词检索可用工具。输入关键词（如 "广告"、"ASIN"、"listing"），返回匹配的工具列表（含上游、用途简述）。377 个工具撑爆上下文时先用这个缩小范围。',
-        inputSchema: { type: 'object', properties: { keyword: { type: 'string', description: '搜索关键词（匹配工具名和描述' }, upstream: { type: 'string', description: '可选：限定上游' }, limit: { type: 'integer', description: '返回上限，默认10，最大30' } }, required: ['keyword'] },
+        description: '[网关] 按关键词检索可用工具。输入关键词（如 "广告"、"ASIN"、"listing"），返回匹配的工具列表（含上游、用途简述）。工具数撑爆上下文时先用这个缩小范围。',
+        inputSchema: { type: 'object', properties: { keyword: { type: 'string', description: '搜索关键词（匹配工具名和描述）' }, upstream: { type: 'string', description: '可选：限定上游' }, limit: { type: 'integer', description: '返回上限，默认10，最大30' } }, required: ['keyword'] },
+        annotations: { readOnlyHint: true },
       },
       {
         name: '_gateway_info',
         description: '[网关] 返回网关版本、工具总数、上游状态等基础信息。',
         inputSchema: { type: 'object', properties: {} },
+        annotations: { readOnlyHint: true },
       },
     ];
     return {
@@ -726,6 +728,9 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
           name: exposedNameOf(r),
           description: truncated,
           inputSchema: minimizeSchema(safeParseSchema(r.input_schema)),
+          // MCP 标准 annotations：直接暴露网关已有的 tool_type 判定（sync 时定，block_write 拦截同源），
+          // 客户端可自动识别只读边界，不依赖自定义黑名单。只报 readOnlyHint——destructive 需要业务推断，不做。
+          annotations: { readOnlyHint: (r.tool_type ?? '').toLowerCase() !== 'write' },
         };
       }), ...builtinTools],
       _meta: {

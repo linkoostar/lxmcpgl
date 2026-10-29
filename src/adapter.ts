@@ -198,10 +198,36 @@ function detectBizErrorInContent(content: Array<{ type: string; text?: string }>
 function buildUpstreamError(merged: any): UpstreamErrorInfo {
   return {
     code: merged.code,
-    message: String(merged.msg ?? merged.message ?? '上游返回业务错误').slice(0, 500),
+    message: String(pickErrorMessage(merged) ?? '上游返回业务错误').slice(0, 500),
     trace_id: pickTraceId(merged),
     raw: merged,
   };
+}
+
+/**
+ * 错误 message 多级提取（错误通道归一，与 mcp.ts rawCode fallback 同类）：
+ * 上游常把真实原因藏在内层 data.msg / data.reason / error.message，
+ * 只取外层会让 Agent 看到"上游返回业务错误"这种无信息文案，真实原因埋在 raw 里被忽略。
+ * 只搬运上游已有字段，不推断业务含义。
+ */
+function pickErrorMessage(merged: any): string | null {
+  // 内层优先：双层响应外层 msg 常是"操作成功"这类壳文案，真实原因在内层
+  const candidates = [
+    merged.data?.msg,
+    merged.data?.message,
+    merged.data?.reason,
+    merged.data?.data?.msg,
+    merged.data?.data?.message,
+    merged.msg,
+    merged.message,
+    merged.error?.message,
+    merged.error?.msg,
+    merged.reason,
+  ];
+  for (const c of candidates) {
+    if (typeof c === 'string' && c.trim()) return c.trim();
+  }
+  return null;
 }
 
 // =====================================================
