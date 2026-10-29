@@ -863,28 +863,15 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
       console.log(`[mcp] ${identity.username} write 工具 ${name} 已在白名单 → 放行（block_write 例外）`);
     }
 
-    // ---- 参数预校验 ----
-    // fatal 级（本地拦截）：缺 required 参数、参数名完全不在 schema.properties 里
-    //   → 100% 确定错，领星 action 遇到必 422，还不如本地拦省一次上游调用
-    // warn 级（只记日志）：类型不匹配、枚举值不在范围内
-    //   → 上游可能宽松（integer 传 string 也接受），或 schema 本身不准
+    // ---- 参数预校验（只记日志，不拦截）----
+    // 透传原则：参数对错由上游判断，网关不替上游"更懂上游"。
+    // 本地 schema 可能因未 sync 而过期，拦截 = 比上游多一层判断，违反原则。
+    // 但 extractEmbeddedJson 会把上游返回的真实错误（含 upstream_code/trace_id）准确传递回去，
+    // Agent 拿到完整的错误信息能自我纠正。
     const allIssues = validateArgs(safeParseSchema(tool.input_schema), args);
-    const fatalIssues = allIssues.filter((i) => i.severity === 'fatal');
-    const warnIssues = allIssues.filter((i) => i.severity === 'warn');
-    for (const wi of warnIssues) {
-      console.warn(`[mcp] 参数预校验 warn (${name}): ${wi.message} (field=${wi.field})`);
-    }
-    if (fatalIssues.length > 0) {
-      const summary = fatalIssues.map((i) => `${i.field}: ${i.message}`).join('; ');
-      console.warn(`[mcp] 参数预校验 FATAL (${name}): ${summary} — 本地拦截，不走上游`);
-      return errorResult(`参数错误: ${summary}`, {
-        type: 'invalid_params',
-        tool: name,
-        issues: fatalIssues.map((i) => ({ field: i.field, message: i.message })),
-        hint: fatalIssues.some((i) => i.message.includes('旧参数名'))
-          ? '提示：参数名可能已更新，建议先调 _tool_search 搜索最新工具名，或等管理员刷新 schema 缓存'
-          : undefined,
-      });
+    for (const issue of allIssues) {
+      const level = issue.severity === 'fatal' ? 'warn' : 'debug';
+      console[level === 'warn' ? 'warn' : 'log'](`[mcp] 参数预校验 ${level} (${name}): ${issue.message} (field=${issue.field})`);
     }
 
     // 店铺级校验（仅对运营用户 + 店铺维度上游生效）
