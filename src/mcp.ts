@@ -1063,7 +1063,7 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
       // 白名单 bypass 工具（get_my_sids/ad_auth_shops 等）返回的是店铺目录本身 → 不裁剪
       if (Array.isArray(content)) {
         let filteredContent = content as any[];
-        const isBypassTool = SHOP_SCOPE_BYPASS_TOOLS.has(toolId ?? '') || SHOP_SCOPE_BYPASS_TOOLS.has(name);
+        const isBypassTool = SHOP_SCOPE_BYPASS_TOOLS.has(tool?.tool_id ?? '') || SHOP_SCOPE_BYPASS_TOOLS.has(name);
         if (identity.kind === 'user' && !identity.all_shops && isShopScopedUpstream(upId) && !isBypassTool) {
           const allowedShops = new Set(getUserShopIds(identity.id));
           if (allowedShops.size === 0) {
