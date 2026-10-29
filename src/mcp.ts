@@ -863,7 +863,8 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
             },
           ],
           isError: false,
-          structuredContent: null,
+          // structuredContent 故意不带（不传=undefined），
+          // MCP 协议要求 structuredContent 若出现必须是 object（不能 null），否则 zod 校验报 -32602
         };
       }
       // === shop_scoped + shopRefs 非空：参数级店铺校验 ===
@@ -895,12 +896,15 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
       }
       if (denied.length > 0) {
         logOutcome(false, true, `无权访问店铺: ${denied.join(',')}`);
-        return errorResult(`无权访问以下店铺: ${denied.join(', ')}`, {
+        const allowedList = [...allowedShopIds];
+        return errorResult(`无权访问以下店铺: ${denied.join(', ')}。当前可用店铺 sid: ${allowedList.join(', ')}`, {
           type: 'permission_denied',
           upstream: tool.upstream,
           tool: name,
           field: 'shop',
           denied,
+          available_sids: allowedList,
+          tip: `可用店铺 sid 清单: ${allowedList.join(', ')}。在参数中使用 sid / sids / store_id / profile_ids 等字段。`,
         });
       }
     }
