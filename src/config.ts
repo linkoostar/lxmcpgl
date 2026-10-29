@@ -1,4 +1,15 @@
 import path from 'node:path';
+import { readFileSync } from 'node:fs';
+
+/** 版本号单一来源：package.json。避免 config/README/tag 三处手抄漂移 */
+function readPkgVersion(): string {
+  try {
+    const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+    return pkg.version || '0.0.0';
+  } catch {
+    return '0.0.0';
+  }
+}
 
 export const config = {
   port: parseInt(process.env.PORT || '8080', 10),
@@ -9,7 +20,7 @@ export const config = {
   adminPassword: process.env.ADMIN_PASSWORD || 'admin123',
   upstreamUrlEnv: process.env.LINGXING_MCP_URL || '',
   upstreamKeyEnv: process.env.LINGXING_MCP_KEY || '',
-  version: '1.1.1',
+  version: readPkgVersion(),
   // 构建信息：由 CI/Docker build-arg 注入，用于确认「更新是否真正生效」
   commit: process.env.GIT_SHA || '',
   buildTime: process.env.BUILD_TIME || '',

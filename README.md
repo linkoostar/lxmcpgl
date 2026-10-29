@@ -2,7 +2,7 @@
 
 多上游 MCP 聚合中转网关：领星 ERP（元工具模式 `help → search → action`，289+ 业务工具）、西柚（广告/ABA 分析）、SIF（市场/流量）、NocoDB（数据层）等统一接入，对外以标准 MCP streamable HTTP 暴露。
 
-**v1.2.0** — 正式生产就绪版本。核心安全加固 + 透传原则收尾 + token 优化。
+**v1.4.0** — 店铺可见性隔离 + 网关元工具（`_tool_search` / `_gateway_info`）+ 上游错误准确透传（`upstream_code` / `trace_id` 挖取 + code=102 缺参补注）。
 
 ## 设计原则（重要）
 
@@ -169,5 +169,7 @@ npm start
 - [x] **阶段 2**：多运营用户（独立 Key / 停用 / 重置 / 限流）、工具白名单、店铺级权限（四值域桥接 + fail-closed）、write 类管控、工具批量启停、上游 Schema 过期（code 102）自动刷新重试
 - [x] **阶段 3**：多上游聚合（`lingxing-meta` / `flat-mcp` adapter 路由）、调用日志入库 + 筛选 + CSV 导出、Credits 追溯、双层响应内层业务错误检测、西柚 HTTP 风格 `status≥400 + error:true` 检测、定期同步 + canonicalize hash 对比
 - [x] **阶段 4（v1.2.0）**：透传原则收尾（删掉响应数据语义标记、删掉本地 enum 校验、删掉 _upstream* 冗余字段）、schema 最小化 + description 截断 token 优化、block_write 默认禁 + 手动例外、管理员 Key masked、URL query 认证自动识别
-- [ ] **阶段 5**：write 操作审批、用量看板、告警、调用记录审计日志
+- [x] **阶段 5（v1.3.0）**：网关自建消耗分 + 调用统计图表（双分展示 + 趋势 + Top 对比）
+- [x] **阶段 6（v1.4.0）**：店铺可见性隔离（bypass 工具返回体也按 user_shops 裁剪，0 行回退 + warn）、网关注入式元工具 `_tool_search` / `_gateway_info`、`extractEmbeddedJson` 从纯文本错误挖出 `upstream_code/trace_id` 准确透传、code=102 自动刷新重试 + 缺 required 参数补注（只报 100% 可信的缺参，类型错不报防误导）、stripMarkdownFence 过滤、descPrefix 极简、版本号单一来源（package.json）
+- [ ] **阶段 7**：write 操作审批、用量看板、告警、调用记录审计日志
 - ~~响应数据语义标记~~（is_placeholder_row / _formulas / 本地 enum 校验等）— **已关闭**，不符合网关设计原则

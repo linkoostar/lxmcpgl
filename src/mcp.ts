@@ -172,7 +172,8 @@ interface ValidationIssue {
   expected: string;
   got: string;
   message: string;
-  /** 严重度：fatal=本地拦截（100% 确定错）；warn=只记日志（可能是 schema 漂移或上游宽松） */
+  /** 严重度：fatal=记 warn 级日志（本地 schema 下 100% 错）；warn=记 debug 级日志。
+   *  透传原则：两者都不拦截，参数对错最终由上游判定 */
   severity: 'fatal' | 'warn';
 }
 
@@ -205,11 +206,12 @@ function matchesSchemaType(v: unknown, t: string): boolean {
 }
 
 /**
- * 双轨校验：
- * - fatal 级（本地拦截）：缺 required 参数、参数名完全不在 schema.properties 里
- *   → 这两类 100% 确定错，领星 action 遇到必 422
- * - warn 级（只记日志）：类型不匹配、枚举值不在范围内
- *   → 上游可能宽松（如 integer 传 string 也接受），或 schema 本身不准
+ * 双轨校验（全部只记日志/补注，不拦截 —— 透传原则）：
+ * - fatal 级（记 warn 日志）：缺 required 参数、参数名完全不在 schema.properties 里
+ *   → 按本地 schema 看 100% 错；上游 code=102 时「缺 required」会作为 __gateway_warn 补注给 Agent
+ * - warn 级（记 debug 日志）：类型不匹配、枚举值不在范围内
+ *   → 不可靠，不补注：领星同名参数在不同工具里类型常不一致（sids 有的 string 有的 array），
+ *     且本地 schema 可能未 sync，报给 Agent 反而误导
  */
 function validateArgs(schema: Record<string, unknown>, args: Record<string, unknown>): ValidationIssue[] {
   const issues: ValidationIssue[] = [];
@@ -1036,33 +1038,8 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
         }
       }
 
-      // ===== code=102 仍未恢复 → 附加本地 schema 校验补注（透传 + 补注，非拦截）=====
-      // 上游返回 code=102 时，错误文案"工具参数定义已更新"过于笼统。
-      // 网关按本地缓存 schema 再校验一遍，只补注"缺 required 参数"这一类。
-      // 为什么只补缺参：
-      //   required 是上游说"你必须传"，不可能今天 required 明天 optional → 100% 可信
-      //   类型错/未知字段名不可靠 —— 领星本身 schema 混乱（同名字段不同工具类型不同），
-      //     且本地 schema 可能未 sync，补注可能把 Agent 带歪
-      if (callResult.upstreamError?.code === 102 && Array.isArray(callResult.content)) {
-        const localIssues = validateArgs(safeParseSchema(tool.input_schema), args);
-        // 只留缺 required 的（message 以"缺少必填参数"开头）
-        const missingReq = localIssues.filter((i) => i.message.startsWith('缺少必填参数'));
-        if (missingReq.length > 0) {
-          const missingList = missingReq.map((i) => i.field).join(', ');
-          callResult.content = [
-            {
-              type: 'text' as const,
-              text: JSON.stringify({
-                __gateway_warn: `上游 code=102：按本地 schema 看缺少必填参数 [${missingList}]。如果这些参数其实不该传，说明上游 schema 可能已更新（本地版本 ${tool.updated_at ?? '未知'}），等管理员同步后重试。`,
-                missing_required: missingReq.map((i) => i.field),
-                local_schema_updated_at: tool.updated_at ?? null,
-              }),
-            },
-            ...callResult.content,
-          ];
-          console.log(`[mcp] ${caller} ${name} code=102 缺 required 补注: ${missingList}`);
-        }
-      }
+      // 注：code=102 的本地缺参补注不在这里插 content —— 下方统一错误信封会重建 content，
+      // 插进来会被丢弃。补注作为 gateway_hint 挂在错误信封里（见"统一错误信封"块）。
 
       const duration = Date.now() - logCtx.started;
 
@@ -1144,12 +1121,30 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
           `[mcp] ${caller} ${name} 上游错误 (${duration}ms) code=${String(rawCode)} trace=${String(traceId)}: ${msg.slice(0, 200)}`
         );
         logOutcome(false, true, `[${upId}] code=${String(rawCode)} ${msg}`.slice(0, 400), cost);
+        // code=102 时挂 gateway_hint：只报「缺 required 参数」这一类 100% 可信的信息。
+        // 不报类型错/未知字段名 —— 领星同名参数在不同工具里类型常不一致，本地 schema 也可能未 sync，
+        // 报出去反而误导 Agent（补注是参考信息，不是拦截判断）。
+        let gatewayHint: Record<string, unknown> | undefined;
+        if (Number(rawCode) === 102) {
+          const localIssues = validateArgs(safeParseSchema(tool.input_schema), args);
+          const missingReq = localIssues.filter((i) => i.message.startsWith('缺少必填参数'));
+          if (missingReq.length > 0) {
+            const missingFields = missingReq.map((i) => i.field);
+            gatewayHint = {
+              missing_required: missingFields,
+              local_schema_updated_at: tool.updated_at ?? null,
+              note: '按本地 schema 看缺少上述必填参数；若这些参数其实不该传，说明上游 schema 可能已更新，等管理员同步后重试。',
+            };
+            console.log(`[mcp] ${caller} ${name} code=102 gateway_hint: ${missingFields.join(', ')}`);
+          }
+        }
         return errorResult(`上游返回错误: ${msg}`, {
           type: 'upstream_error',
           upstream: upId,
           tool: name,
           upstream_code: rawCode,
           trace_id: traceId,
+          gateway_hint: gatewayHint,
           raw: parsed?.data ?? undefined,
         });
       }
