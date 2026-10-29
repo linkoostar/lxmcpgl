@@ -31,21 +31,75 @@ body {
 .login-card .sub { margin: 0; color: var(--muted); }
 .login-card label { display: flex; flex-direction: column; gap: 6px; font-size: 13px; }
 
-/* 顶栏 */
-.topbar {
-  display: flex; align-items: center; gap: 16px;
-  background: var(--card); border-bottom: 1px solid var(--border);
-  padding: 0 20px; height: 52px; position: sticky; top: 0; z-index: 10;
+/* ============ 侧边栏布局 ============ */
+.app-shell {
+  display: flex; min-height: 100vh;
 }
-.brand { font-weight: 700; font-size: 15px; }
+
+.sidebar {
+  width: 200px; flex-shrink: 0;
+  background: var(--card);
+  border-right: 1px solid var(--border);
+  display: flex; flex-direction: column;
+  position: sticky; top: 0; height: 100vh;
+}
+
+.sidebar-brand {
+  padding: 16px 16px 14px;
+  border-bottom: 1px solid var(--border);
+}
+.sidebar-brand .brand { font-weight: 700; font-size: 15px; display: block; }
+.sidebar-version { display: block; font-size: 11px; color: var(--muted); margin-top: 2px; }
+
+.sidebar-nav {
+  flex: 1; padding: 8px; display: flex; flex-direction: column; gap: 2px;
+}
+
 .nav-btn {
-  border: none; background: none; padding: 8px 4px; margin-right: 12px;
-  font-size: 14px; color: var(--muted); cursor: pointer; border-bottom: 2px solid transparent;
+  border: none; background: none;
+  display: flex; align-items: center; gap: 10px;
+  padding: 9px 12px; margin: 0; border-radius: 8px;
+  font-size: 13px; color: var(--muted); cursor: pointer;
+  text-align: left; width: 100%;
+  border-bottom: none;
+  transition: background .15s, color .15s;
 }
-.nav-btn.active { color: var(--primary); border-bottom-color: var(--primary); font-weight: 600; }
+.nav-btn:hover { background: #f0f2f5; color: var(--text); }
+.nav-btn.active {
+  background: #eff6ff; color: var(--primary); font-weight: 600;
+}
+.nav-icon { font-size: 14px; width: 18px; text-align: center; }
+
+.sidebar-footer {
+  padding: 12px 14px; border-top: 1px solid var(--border);
+  display: flex; align-items: center; gap: 8px;
+}
+.sidebar-user { flex: 1; font-size: 12px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sidebar-logout {
+  border: 1px solid var(--border); background: transparent; color: var(--muted);
+  width: 28px; height: 28px; border-radius: 6px; cursor: pointer;
+  display: flex; align-items: center; justify-content: center; font-size: 14px;
+}
+.sidebar-logout:hover { background: #fef2f2; border-color: var(--danger); color: var(--danger); }
+
+/* 内容区 */
+.content { flex: 1; min-width: 0; background: var(--bg); }
+
+.content-topbar {
+  background: var(--card); border-bottom: 1px solid var(--border);
+  padding: 12px 28px; position: sticky; top: 0; z-index: 5;
+}
+.content-title { font-size: 14px; font-weight: 600; color: var(--text); }
 
 /* 页面 */
-.page { max-width: 1100px; margin: 20px auto; padding: 0 16px; }
+.page { max-width: none; margin: 20px 28px; padding: 0; }
+.page h2 { font-size: 15px; margin: 0 0 12px; }
+
+/* 图表卡片 */
+.log-chart-card {
+  background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 16px; margin-bottom: 16px;
+}
 .card {
   background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
   padding: 20px; margin-bottom: 16px;

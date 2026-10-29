@@ -24,20 +24,38 @@
   </div>
 
   <!-- 主界面 -->
-  <div id="view-app" class="hidden">
-    <header class="topbar">
-      <div class="brand">方中 MCP 网关</div>
-      <nav>
-        <button class="nav-btn" data-page="tools">工具列表</button>
-        <button class="nav-btn" data-page="users">运营用户</button>
-        <button class="nav-btn" data-page="settings">系统设置</button>
-        <button class="nav-btn" data-page="logs">调用统计</button>
+  <div id="view-app" class="hidden app-shell">
+    <!-- 左侧边栏 -->
+    <aside class="sidebar">
+      <div class="sidebar-brand">
+        <span class="brand">方中 MCP 网关</span>
+        <span id="app-version" class="sidebar-version"></span>
+      </div>
+      <nav class="sidebar-nav">
+        <button class="nav-btn" data-page="tools" title="工具列表">
+          <span class="nav-icon">🛠</span><span>工具列表</span>
+        </button>
+        <button class="nav-btn" data-page="users" title="运营用户">
+          <span class="nav-icon">👥</span><span>运营用户</span>
+        </button>
+        <button class="nav-btn" data-page="settings" title="系统设置">
+          <span class="nav-icon">⚙</span><span>系统设置</span>
+        </button>
+        <button class="nav-btn" data-page="logs" title="调用统计">
+          <span class="nav-icon">📊</span><span>调用统计</span>
+        </button>
       </nav>
-      <div class="spacer"></div>
-      <span id="app-version" class="muted" style="font-size:11px;margin-right:12px"></span>
-      <span id="me-name" class="muted"></span>
-      <button id="btn-logout" class="btn ghost small">退出</button>
-    </header>
+      <div class="sidebar-footer">
+        <span id="me-name" class="sidebar-user"></span>
+        <button id="btn-logout" class="sidebar-logout" title="退出">⎋</button>
+      </div>
+    </aside>
+
+    <!-- 内容区 -->
+    <div class="content">
+    <div class="content-topbar">
+      <span id="content-title" class="content-title">工具列表</span>
+    </div>
 
     <!-- 工具列表 -->
     <main id="page-tools" class="page hidden">
@@ -302,9 +320,8 @@
         </div>
       </div>
     </main>
-  </div>
-
-  <!-- 用户权限弹窗 -->
+    </div><!-- /content -->
+  </div><!-- /view-app -->
   <div id="user-mask" class="modal-mask hidden">
     <div class="modal">
       <div class="modal-head">

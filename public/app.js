@@ -52,6 +52,10 @@ function switchPage(name) {
   $('#page-users').classList.toggle('hidden', name !== 'users');
   $('#page-settings').classList.toggle('hidden', name !== 'settings');
   $('#page-logs').classList.toggle('hidden', name !== 'logs');
+  // 顶部标题跟随
+  const titleMap = { tools: '工具列表', users: '运营用户', settings: '系统设置', logs: '调用统计' };
+  const titleEl = $('#content-title');
+  if (titleEl) titleEl.textContent = titleMap[name] ?? '';
   if (name === 'tools') { populateUpstreamFilter().then(() => loadTools()); }
   if (name === 'users') loadUsers();
   if (name === 'settings') loadSettings();
@@ -1188,24 +1192,26 @@ function renderLogStats(stats, trend) {
   `;
   root.after(detail);
 
-  // 图表区域
+  // 图表区域（两个独立 .card 包裹，和其他卡片风格统一）
   const prevCharts = document.querySelector('.log-charts');
   if (prevCharts) prevCharts.remove();
   const charts = document.createElement('div');
   charts.className = 'log-charts';
-  charts.style.marginTop = '16px';
   charts.innerHTML = `
-    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
-      <div class="detail-head" style="margin:0;font-size:13px">📈 用量趋势</div>
-      <div class="log-chart-toggle">
-        <button class="btn small ${logState.granularity === 'day' ? '' : 'ghost'}" data-grain="day">按天</button>
-        <button class="btn small ${logState.granularity === 'hour' ? '' : 'ghost'}" data-grain="hour">按小时</button>
+    <div class="log-chart-card">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+        <div class="detail-head" style="margin:0;font-size:14px">📈 用量趋势</div>
+        <div class="log-chart-toggle">
+          <button class="btn small ${logState.granularity === 'day' ? '' : 'ghost'}" data-grain="day">按天</button>
+          <button class="btn small ${logState.granularity === 'hour' ? '' : 'ghost'}" data-grain="hour">按小时</button>
+        </div>
       </div>
+      <div style="position:relative;height:200px"><canvas id="chart-trend"></canvas></div>
     </div>
-    <div style="position:relative;height:180px"><canvas id="chart-trend"></canvas></div>
-    <div style="height:16px"></div>
-    <div class="detail-head" style="font-size:13px">🛠️ Top 工具消耗对比 <span class="muted">（gateway vs upstream）</span></div>
-    <div style="position:relative;height:140px"><canvas id="chart-tools"></canvas></div>
+    <div class="log-chart-card">
+      <div class="detail-head" style="font-size:14px;margin-bottom:8px">🛠️ Top 工具消耗对比 <span class="muted">（gateway vs upstream）</span></div>
+      <div style="position:relative;height:160px"><canvas id="chart-tools"></canvas></div>
+    </div>
   `;
   detail.after(charts);
 
@@ -1394,13 +1400,10 @@ $('#log-since-preset').addEventListener('change', () => syncLogDateRange());
 $('#log-since-date').addEventListener('change', () => syncLogDateRange());
 $('#log-until-date').addEventListener('change', () => syncLogDateRange());
 $('#btn-log-refresh').addEventListener('click', async () => {
-  // 先把当前控件值同步回 logState
-  logState.q = $('#log-search').value.trim();
-  logState.upstream = $('#log-upstream-filter').value;
-  logState.caller = $('#log-caller-filter').value;
-  logState.success = $('#log-success-filter').value;
-  syncLogDateRange();
+  const btn = $('#btn-log-refresh');
+  btn.disabled = true; btn.textContent = '刷新中…';
   try { await loadLogs(); } catch (e) { toast(e.message); }
+  finally { btn.disabled = false; btn.textContent = '刷新'; }
 });
 $('#btn-log-prev').addEventListener('click', () => { if (logState.page > 1) { logState.page--; loadLogList().catch((e) => toast(e.message)); } });
 $('#btn-log-next').addEventListener('click', () => { if (logState.page * logState.pageSize < logState.total) { logState.page++; loadLogList().catch((e) => toast(e.message)); } });
