@@ -660,11 +660,10 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
       tools: rows.map((r) => {
         const upInfo = upMap.get(r.upstream);
         const upstreamName = upInfo?.name ?? r.upstream;
-        // notes 截断：上游可能写了长说明 → 控制在 30 字以内，避免 descPrefix 污染工具本身的语义描述
-        const upstreamDescRaw = (upInfo?.notes ?? '').trim();
-        const upstreamDesc = upstreamDescRaw.length > 0 ? upstreamDescRaw.slice(0, 30) + (upstreamDescRaw.length > 30 ? '…' : '') : '';
-        // 在 description 开头注入「来源」，LLM 一眼就能按域分组
-        const descPrefix = upstreamDesc ? `[来自 ${upstreamName} · ${upstreamDesc}] ` : `[来自 ${upstreamName}] `;
+        // 极简 upstream 前缀：只保留 [上游名]，不拼 notes。
+        // notes 已经在 initialize 的 instructions 里列了，不需要每个工具重复
+        // → 每个 prefix 从 ~16 字降到 ~4 字，省 ~2000 字
+        const descPrefix = `[${upstreamName}] `;
         const rawDesc = r.description || r.name || r.exposed_name;
         // description 截断：领星给的短描述（avg 34）不截；SIF/西柚/ABA 等 flat-mcp 上游会塞 1000+ 字说明
         // 截到 300 chars 前 200 字足够 agent 判断工具用途（"市场竞争度评估"），不影响 tool discovery 准确性
