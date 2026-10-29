@@ -1195,17 +1195,17 @@ function renderLogStats(stats, trend) {
   charts.className = 'log-charts';
   charts.style.marginTop = '16px';
   charts.innerHTML = `
-    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
-      <div class="detail-head" style="margin:0">📈 用量趋势</div>
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
+      <div class="detail-head" style="margin:0;font-size:13px">📈 用量趋势</div>
       <div class="log-chart-toggle">
         <button class="btn small ${logState.granularity === 'day' ? '' : 'ghost'}" data-grain="day">按天</button>
         <button class="btn small ${logState.granularity === 'hour' ? '' : 'ghost'}" data-grain="hour">按小时</button>
       </div>
     </div>
-    <div style="position:relative;height:240px"><canvas id="chart-trend"></canvas></div>
-    <div style="height:24px"></div>
-    <div class="detail-head">🛠️ Top 工具消耗对比 <span class="muted">（gateway vs upstream）</span></div>
-    <div style="position:relative;height:200px"><canvas id="chart-tools"></canvas></div>
+    <div style="position:relative;height:180px"><canvas id="chart-trend"></canvas></div>
+    <div style="height:16px"></div>
+    <div class="detail-head" style="font-size:13px">🛠️ Top 工具消耗对比 <span class="muted">（gateway vs upstream）</span></div>
+    <div style="position:relative;height:140px"><canvas id="chart-tools"></canvas></div>
   `;
   detail.after(charts);
 
