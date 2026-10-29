@@ -172,6 +172,8 @@ interface ValidationIssue {
   expected: string;
   got: string;
   message: string;
+  /** 严重度：fatal=本地拦截（100% 确定错）；warn=只记日志（可能是 schema 漂移或上游宽松） */
+  severity: 'fatal' | 'warn';
 }
 
 /** ID 类字段：上游常见「字符串逗号分隔」与「数组」两种约定，不做类型拦截 */
@@ -203,22 +205,43 @@ function matchesSchemaType(v: unknown, t: string): boolean {
 }
 
 /**
- * 保守校验：必填 + 枚举 + 明确的基础类型。
- * 故意不做 anyOf/oneOf/$ref/additionalProperties 校验，避免按上游错误的 schema 误拦。
+ * 双轨校验：
+ * - fatal 级（本地拦截）：缺 required 参数、参数名完全不在 schema.properties 里
+ *   → 这两类 100% 确定错，领星 action 遇到必 422
+ * - warn 级（只记日志）：类型不匹配、枚举值不在范围内
+ *   → 上游可能宽松（如 integer 传 string 也接受），或 schema 本身不准
  */
-function validateArgs(schema: Record<string, unknown>, args: Record<string, unknown>): ValidationIssue | null {
+function validateArgs(schema: Record<string, unknown>, args: Record<string, unknown>): ValidationIssue[] {
+  const issues: ValidationIssue[] = [];
   const required = Array.isArray(schema.required) ? (schema.required as unknown[]).map(String) : [];
-  for (const f of required) {
-    if (!(f in args) || args[f] === undefined) {
-      return { field: f, expected: '必填', got: 'undefined', message: `缺少必填参数 ${f}` };
-    }
-  }
   const props =
     schema.properties && typeof schema.properties === 'object' && !Array.isArray(schema.properties)
       ? (schema.properties as Record<string, any>)
       : {};
+  const knownFields = new Set([...Object.keys(props), ...required]);
+
+  for (const f of required) {
+    if (!(f in args) || args[f] === undefined) {
+      issues.push({ field: f, expected: '必填', got: 'undefined', message: `缺少必填参数 ${f}`, severity: 'fatal' });
+    }
+  }
   for (const [k, v] of Object.entries(args)) {
     if (v === undefined) continue;
+    // 网关内部字段（_xxx）不算参数错误
+    if (k.startsWith('_')) continue;
+    // 参数名完全不在 schema 里 → fatal（大概率用旧参数名）
+    if (!props[k] && !required.includes(k)) {
+      // 只拦字段名看起来像业务参数的（排除网关注入的）
+      if (!k.startsWith('_') && knownFields.size > 0) {
+        issues.push({
+          field: k, expected: `schema 字段 [${Object.keys(props).slice(0, 8).join(', ')}]`,
+          got: '未知参数',
+          message: `参数 ${k} 不在工具定义的字段列表里（可能是旧参数名，schema 已更新）`,
+          severity: 'fatal',
+        });
+      }
+      continue;
+    }
     const ps = props[k];
     if (!ps || typeof ps !== 'object') continue;
     // 复合 schema 无法可靠判断，跳过
@@ -226,12 +249,13 @@ function validateArgs(schema: Record<string, unknown>, args: Record<string, unkn
     if (Array.isArray(ps.enum) && ps.enum.length > 0) {
       const hit = ps.enum.some((e: unknown) => JSON.stringify(e) === JSON.stringify(v));
       if (!hit) {
-        return {
+        issues.push({
           field: k,
           expected: `枚举 ${ps.enum.map((x: unknown) => JSON.stringify(x)).join('|')}`,
           got: `${jsonTypeName(v)} ${JSON.stringify(v)?.slice(0, 60)}`,
           message: `参数 ${k} 取值不在允许范围`,
-        };
+          severity: 'warn',
+        });
       }
     }
     // ID 类字段放宽（string 与 array 都放行）
@@ -242,15 +266,16 @@ function validateArgs(schema: Record<string, unknown>, args: Record<string, unkn
       ? t.some((x: unknown) => matchesSchemaType(v, String(x)))
       : matchesSchemaType(v, String(t));
     if (!ok) {
-      return {
+      issues.push({
         field: k,
         expected: typeLabel(t),
         got: jsonTypeName(v),
         message: `参数 ${k} 类型应为 ${typeLabel(t)}，实际为 ${jsonTypeName(v)}`,
-      };
+        severity: 'warn', // 类型不匹配可能是上游宽松（integer 传 string），只 warn 不拦
+      });
     }
   }
-  return null;
+  return issues;
 }
 
 // ---------- 限流（每用户滑动窗口） ----------
@@ -838,15 +863,28 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
       console.log(`[mcp] ${identity.username} write 工具 ${name} 已在白名单 → 放行（block_write 例外）`);
     }
 
-    // ---- 参数预校验（降级为 warning 日志，不拦截）----
-    // 评审指出：用本地缓存 schema 拦截请求，上游改了 schema 网关没 sync 时会误拒。
-    // 和"上游修好后网关不该跟着改"原则冲突。
-    // 降级为：校验失败只记日志，请求照常转发，由上游判断真正的参数错误。
-    // 好处：上游返回的 code:102 会被 detectBizErrorInContent 捕获并转成 MCP 错误，
-    // 网关仍然会返回清晰的错误，但不会自己拦。
-    const validationIssue = validateArgs(safeParseSchema(tool.input_schema), args);
-    if (validationIssue) {
-      console.warn(`[mcp] 参数预校验 warning (${name}): ${validationIssue.message} (field=${validationIssue.field})，放行由上游判断`);
+    // ---- 参数预校验 ----
+    // fatal 级（本地拦截）：缺 required 参数、参数名完全不在 schema.properties 里
+    //   → 100% 确定错，领星 action 遇到必 422，还不如本地拦省一次上游调用
+    // warn 级（只记日志）：类型不匹配、枚举值不在范围内
+    //   → 上游可能宽松（integer 传 string 也接受），或 schema 本身不准
+    const allIssues = validateArgs(safeParseSchema(tool.input_schema), args);
+    const fatalIssues = allIssues.filter((i) => i.severity === 'fatal');
+    const warnIssues = allIssues.filter((i) => i.severity === 'warn');
+    for (const wi of warnIssues) {
+      console.warn(`[mcp] 参数预校验 warn (${name}): ${wi.message} (field=${wi.field})`);
+    }
+    if (fatalIssues.length > 0) {
+      const summary = fatalIssues.map((i) => `${i.field}: ${i.message}`).join('; ');
+      console.warn(`[mcp] 参数预校验 FATAL (${name}): ${summary} — 本地拦截，不走上游`);
+      return errorResult(`参数错误: ${summary}`, {
+        type: 'invalid_params',
+        tool: name,
+        issues: fatalIssues.map((i) => ({ field: i.field, message: i.message })),
+        hint: fatalIssues.some((i) => i.message.includes('旧参数名'))
+          ? '提示：参数名可能已更新，建议先调 _tool_search 搜索最新工具名，或等管理员刷新 schema 缓存'
+          : undefined,
+      });
     }
 
     // 店铺级校验（仅对运营用户 + 店铺维度上游生效）
@@ -1046,11 +1084,20 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
         const ue = callResult.upstreamError;
         let parsed: any = null;
         const text = callResult.content?.find((c) => c.type === 'text')?.text;
-        if (!ue && text) {
-          try {
-            parsed = JSON.parse(text);
-          } catch {
-            /* 非 JSON，保留原文 */
+        if (text) {
+          // 尝试纯 JSON
+          try { parsed = JSON.parse(text); } catch { /* 不是 */ }
+          // 尝试从纯文本错误里挖嵌入式 JSON（adapter 层 detectBizErrorInContent 已经覆盖，但保险起见 mcp 层也兜底）
+          if (!parsed) {
+            const respM = text.match(/response:\s*"((?:[^"\\]|\\.)*)"/);
+            if (respM) { try { parsed = JSON.parse(respM[1]); } catch { /* */ } }
+          }
+          if (!parsed) {
+            const lb = text.lastIndexOf('{');
+            const lc = text.lastIndexOf('}');
+            if (lb >= 0 && lc > lb) {
+              try { parsed = JSON.parse(text.slice(lb, lc + 1)); } catch { /* */ }
+            }
           }
         }
         // rawCode 多级 fallback：领星把业务码（如 102）包在 error.data.code 或 data.code 里

@@ -117,12 +117,33 @@ function pickTraceId(obj: any): string | undefined {
  * 历史 bug：只查外层 → 参数校验失败、权限不够等业务错误被静默放行 →
  * Agent 拿空 data.list 继续算 → 出错误结论（成本>售价等）。
  */
+/**
+ * 从上游错误纯文本里挖嵌入式 JSON。
+ * 领星 HTTP 422 错误格式: "call failed, status: 422, response: {\"code\":102,...}"
+ * 这种纯文本 JSON.parse 会失败，但里面的 response: {...} 子串是有效 JSON。
+ */
+function extractEmbeddedJson(text: string): any | null {
+  try { return JSON.parse(text); } catch { /* 不是纯 JSON，继续 */ }
+  // 模式 1: "response: {...}" 或 "response: \"{...}\""
+  const respM = text.match(/response:\s*"((?:[^"\\]|\\.)*)"/);
+  if (respM) {
+    try { return JSON.parse(respM[1]); } catch { /* 继续 */ }
+  }
+  // 模式 2: 最后一个 {...} 块 — 纯 JSON 嵌在描述文本里
+  const lastBrace = text.lastIndexOf('{');
+  const lastClose = text.lastIndexOf('}');
+  if (lastBrace >= 0 && lastClose > lastBrace) {
+    const chunk = text.slice(lastBrace, lastClose + 1);
+    try { return JSON.parse(chunk); } catch { /* 放弃 */ }
+  }
+  return null;
+}
+
 function detectBizErrorInContent(content: Array<{ type: string; text?: string }>): UpstreamErrorInfo | null {
   if (!Array.isArray(content)) return null;
   for (const part of content) {
     if (!part || part.type !== 'text' || typeof part.text !== 'string') continue;
-    let parsed: any;
-    try { parsed = JSON.parse(part.text); } catch { continue; }
+    let parsed: any = extractEmbeddedJson(part.text);
     if (!parsed || typeof parsed !== 'object') continue;
 
     // ① 外层 success=false → 直接业务错误
