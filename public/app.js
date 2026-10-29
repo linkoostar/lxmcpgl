@@ -1202,10 +1202,10 @@ function renderLogStats(stats, trend) {
         <button class="btn small ${logState.granularity === 'hour' ? '' : 'ghost'}" data-grain="hour">按小时</button>
       </div>
     </div>
-    <canvas id="chart-trend" height="100"></canvas>
-    <div style="height:20px"></div>
+    <div style="position:relative;height:240px"><canvas id="chart-trend"></canvas></div>
+    <div style="height:24px"></div>
     <div class="detail-head">🛠️ Top 工具消耗对比 <span class="muted">（gateway vs upstream）</span></div>
-    <canvas id="chart-tools" height="100"></canvas>
+    <div style="position:relative;height:200px"><canvas id="chart-tools"></canvas></div>
   `;
   detail.after(charts);
 
@@ -1226,10 +1226,16 @@ function renderLogStats(stats, trend) {
 function renderTrendChart(buckets) {
   const canvas = $('#chart-trend');
   if (!canvas) return;
-  // destroy 旧实例
   if (chartInstances.trend) { chartInstances.trend.destroy(); chartInstances.trend = null; }
 
-  if (!buckets.length || !window.Chart) return;
+  if (!buckets.length || !window.Chart) {
+    if (!window.Chart) {
+      canvas.parentElement.innerHTML = '<div class="muted" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center">Chart.js 加载中…</div>';
+    } else {
+      canvas.parentElement.innerHTML = '<div class="muted" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center">该时间范围无调用数据</div>';
+    }
+    return;
+  }
 
   const labels = buckets.map((b) => b.bucket);
   chartInstances.trend = new Chart(canvas, {
@@ -1237,20 +1243,21 @@ function renderTrendChart(buckets) {
     data: {
       labels,
       datasets: [
-        { label: '调用量', data: buckets.map((b) => b.calls), borderColor: '#2563eb', backgroundColor: 'rgba(37,99,235,0.1)', yAxisID: 'y', tension: 0.3, fill: true, pointRadius: 1.5 },
-        { label: 'Gateway Points', data: buckets.map((b) => b.gateway_points), borderColor: '#16a34a', backgroundColor: 'rgba(22,163,74,0.1)', yAxisID: 'y1', tension: 0.3, pointRadius: 1.5 },
-        { label: 'Upstream Credits', data: buckets.map((b) => b.upstream_credits), borderColor: '#d97706', backgroundColor: 'rgba(217,119,6,0.1)', yAxisID: 'y1', tension: 0.3, pointRadius: 1.5, borderDash: [4, 4] },
+        { label: '调用量', data: buckets.map((b) => b.calls), borderColor: '#2563eb', backgroundColor: 'rgba(37,99,235,0.08)', yAxisID: 'y', tension: 0.3, fill: true, pointRadius: 0 },
+        { label: 'Gateway Points', data: buckets.map((b) => b.gateway_points), borderColor: '#16a34a', backgroundColor: 'rgba(22,163,74,0.08)', yAxisID: 'y1', tension: 0.3, pointRadius: 0 },
+        { label: 'Upstream Credits', data: buckets.map((b) => b.upstream_credits), borderColor: '#d97706', backgroundColor: 'rgba(217,119,6,0.08)', yAxisID: 'y1', tension: 0.3, pointRadius: 0, borderDash: [4, 4] },
       ],
     },
     options: {
       responsive: true,
       maintainAspectRatio: false,
+      animation: false,
       interaction: { mode: 'index', intersect: false },
-      plugins: { legend: { position: 'top', labels: { boxWidth: 12, font: { size: 12 } } } },
+      plugins: { legend: { position: 'top', align: 'end', labels: { boxWidth: 10, font: { size: 11 }, padding: 12 } } },
       scales: {
-        y: { type: 'linear', position: 'left', title: { display: true, text: '调用量', font: { size: 11 } }, grid: { color: 'rgba(0,0,0,0.05)' } },
-        y1: { type: 'linear', position: 'right', title: { display: true, text: 'Points / Credits', font: { size: 11 } }, grid: { drawOnChartArea: false } },
-        x: { ticks: { maxRotation: 0, autoSkip: true, maxTicksLimit: 12, font: { size: 10 } }, grid: { display: false } },
+        y: { type: 'linear', position: 'left', title: { display: true, text: '调用量', font: { size: 10 } }, grid: { color: 'rgba(0,0,0,0.04)' }, ticks: { font: { size: 10 } } },
+        y1: { type: 'linear', position: 'right', title: { display: true, text: 'Points', font: { size: 10 } }, grid: { drawOnChartArea: false }, ticks: { font: { size: 10 } } },
+        x: { ticks: { maxRotation: 0, autoSkip: true, maxTicksLimit: 10, font: { size: 10 } }, grid: { display: false } },
       },
     },
   });
@@ -1262,10 +1269,16 @@ function renderToolBarChart(topTools) {
   if (!canvas) return;
   if (chartInstances.tools) { chartInstances.tools.destroy(); chartInstances.tools = null; }
 
-  if (!topTools.length || !window.Chart) return;
+  if (!topTools.length || !window.Chart) {
+    if (!window.Chart) {
+      canvas.parentElement.innerHTML = '<div class="muted" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center">Chart.js 加载中…</div>';
+    } else {
+      canvas.parentElement.innerHTML = '<div class="muted" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center">无工具调用数据</div>';
+    }
+    return;
+  }
 
-  // 取 top 8，名字截断
-  const names = topTools.map((t) => (t.tool_name.length > 20 ? t.tool_name.slice(0, 20) + '…' : t.tool_name));
+  const names = topTools.map((t) => (t.tool_name.length > 22 ? t.tool_name.slice(0, 22) + '…' : t.tool_name));
   chartInstances.tools = new Chart(canvas, {
     type: 'bar',
     data: {
@@ -1279,9 +1292,10 @@ function renderToolBarChart(topTools) {
       indexAxis: 'y',
       responsive: true,
       maintainAspectRatio: false,
-      plugins: { legend: { position: 'top', labels: { boxWidth: 12, font: { size: 12 } } } },
+      animation: false,
+      plugins: { legend: { position: 'top', align: 'end', labels: { boxWidth: 10, font: { size: 11 }, padding: 12 } } },
       scales: {
-        x: { beginAtZero: true, grid: { color: 'rgba(0,0,0,0.05)' }, ticks: { font: { size: 10 } } },
+        x: { beginAtZero: true, grid: { color: 'rgba(0,0,0,0.04)' }, ticks: { font: { size: 10 } } },
         y: { grid: { display: false }, ticks: { font: { size: 10 } } },
       },
     },
