@@ -1036,6 +1036,34 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
         }
       }
 
+      // ===== code=102 仍未恢复 → 附加本地 schema 校验补注（透传 + 补注，非拦截）=====
+      // 上游返回 code=102 时，错误文案"工具参数定义已更新"过于笼统。
+      // 网关按本地缓存 schema 再校验一遍，只补注"缺 required 参数"这一类。
+      // 为什么只补缺参：
+      //   required 是上游说"你必须传"，不可能今天 required 明天 optional → 100% 可信
+      //   类型错/未知字段名不可靠 —— 领星本身 schema 混乱（同名字段不同工具类型不同），
+      //     且本地 schema 可能未 sync，补注可能把 Agent 带歪
+      if (callResult.upstreamError?.code === 102 && Array.isArray(callResult.content)) {
+        const localIssues = validateArgs(safeParseSchema(tool.input_schema), args);
+        // 只留缺 required 的（message 以"缺少必填参数"开头）
+        const missingReq = localIssues.filter((i) => i.message.startsWith('缺少必填参数'));
+        if (missingReq.length > 0) {
+          const missingList = missingReq.map((i) => i.field).join(', ');
+          callResult.content = [
+            {
+              type: 'text' as const,
+              text: JSON.stringify({
+                __gateway_warn: `上游 code=102：按本地 schema 看缺少必填参数 [${missingList}]。如果这些参数其实不该传，说明上游 schema 可能已更新（本地版本 ${tool.updated_at ?? '未知'}），等管理员同步后重试。`,
+                missing_required: missingReq.map((i) => i.field),
+                local_schema_updated_at: tool.updated_at ?? null,
+              }),
+            },
+            ...callResult.content,
+          ];
+          console.log(`[mcp] ${caller} ${name} code=102 缺 required 补注: ${missingList}`);
+        }
+      }
+
       const duration = Date.now() - logCtx.started;
 
       // cost_logs + call_logs.cost_credits（两处都写：cost_logs 用于账单汇总，call_logs 用于调用记录可追溯）
