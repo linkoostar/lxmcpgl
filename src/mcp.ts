@@ -786,11 +786,64 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
       // 领星强制 shop_scoped：运营必须传店铺参数 + 店铺在白名单里
       // 不需要 shop_scope 字段审核机制（领星全是店铺维度）
       if (shopRefs.length === 0) {
-        logOutcome(false, true, 'shop_scoped 工具未提供店铺参数');
-        return errorResult(
-          `工具「${name}」是店铺维度工具，请求中未找到任何店铺引用。请在参数里指定要查询的店铺（如 sid/sids/store_id/seller_id/profile_ids 等）。`,
-          { type: 'invalid_params', upstream: tool.upstream, tool: name, reason: 'missing_shop_param' }
-        );
+        // === A. 自动注入：read 工具 + 店铺白名单只有 1 家 → 自动加 sid ===
+        const allowedShopIds = getUserShopIds(identity.id);
+        const safeToolType = (tool.tool_type ?? '').toLowerCase(); // read = 安全，write = 危险
+        if (allowedShopIds.length === 1 && safeToolType !== 'write') {
+          const autoSid = allowedShopIds[0];
+          // 注入到 args.sid（领星最通用的字段名）
+          args.sid = autoSid;
+          // 刷新 shopRefs，让后续校验链路统一
+          shopRefs.push(autoSid);
+          console.log(
+            `[mcp] ${identity.username} ${name} 未传店铺 → 自动注入唯一店铺 sid=${autoSid}（read 工具 + 单店运营）`
+          );
+        }
+      }
+
+      // 注入后 shopRefs 仍然为空 → 走 B（友好 hint）或硬拒绝
+      if (shopRefs.length === 0) {
+        // 收集可用店铺，拼成 hint
+        const allowedShopIds = getUserShopIds(identity.id);
+        let hint = '';
+        if (allowedShopIds.length > 0) {
+          const shopList = allowedShopIds.map((sid) => {
+            const row = db
+              .prepare('SELECT name, country, profile_id FROM shops WHERE sid = ?')
+              .get(sid) as { name: string; country: string; profile_id: string } | undefined;
+            const label = row?.name ? `${sid}(${row.name})` : sid;
+            return label;
+          });
+          hint = `可用店铺: ${shopList.join(', ')}。请在参数里加 sid: "${allowedShopIds[0]}" 或 sids: ${JSON.stringify(allowedShopIds)}`;
+        } else {
+          hint = '未配置店铺白名单 → 请先在运营用户管理里配置店铺权限';
+        }
+        // write 工具仍然硬拒绝（安全底线：改价发货不能自动猜店铺）
+        const safeToolType = (tool.tool_type ?? '').toLowerCase();
+        if (safeToolType === 'write') {
+          logOutcome(false, true, `write 工具未提供店铺参数（禁止自动注入）`);
+          return errorResult(
+            `写操作工具「${name}」禁止自动注入店铺。${hint}`,
+            { type: 'invalid_params', upstream: tool.upstream, tool: name, reason: 'missing_shop_param', hint }
+          );
+        }
+        // read 工具 → 返回带 hint 的空壳响应（gateway_points=0，不计分）
+        logOutcome(true, false, undefined, null, { isEmptyShell: true });
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                code: 0,
+                data: null,
+                msg: `缺少店铺参数。${hint}`,
+                _auto_inject_disabled: true,
+              }),
+            },
+          ],
+          isError: false,
+          structuredContent: null,
+        };
       }
       // === shop_scoped + shopRefs 非空：参数级店铺校验 ===
       const allowedShopIds = new Set(getUserShopIds(identity.id));
