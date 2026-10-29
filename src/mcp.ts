@@ -1131,12 +1131,30 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
           if (shopHints.length > 0) {
             // 去重 + 保留原始顺序
             const seen = new Set<string>();
-            const uniq = shopHints.filter((h) => {
+            let uniq = shopHints.filter((h) => {
               if (seen.has(h.sid)) return false;
               seen.add(h.sid);
               return true;
             });
-            const sampleSid = uniq[0].sid;
+
+            // 如果 user_shops 已配置（非空）→ hint 只列白名单店铺
+            // 避免 agent 拿到不属于自己的 sid 去调 shop_scoped 又被拒
+            // 如果 user_shops 未配置（空）→ 原样返回领星全部（让运营看到可用店铺）
+            if (identity.kind === 'user' && !identity.all_shops) {
+              const whitelist = new Set(getUserShopIds(identity.id));
+              if (whitelist.size > 0) {
+                const before = uniq.length;
+                uniq = uniq.filter((h) => whitelist.has(h.sid));
+                if (uniq.length === 0) {
+                  // 白名单过滤后一个都没剩 → 保留领星全部，但加个提醒
+                  console.warn(`[mcp] ${caller} ${name} bypass hint: user_shops 白名单 (${whitelist.size}) 与领星返回的店铺 (${before}) 无交集，返回全部`);
+                } else {
+                  console.log(`[mcp] ${caller} ${name} bypass hint: user_shops 白名单过滤 ${before} → ${uniq.length} 家`);
+                }
+              }
+            }
+
+            const sampleSid = uniq.length > 0 ? uniq[0].sid : '';
             const hintBlock = {
               type: 'text' as const,
               text: JSON.stringify({
@@ -1149,7 +1167,9 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
                     name: h.name || undefined,
                     country: h.country || undefined,
                   })),
-                  tip: `调用 shop_scoped 工具时，请在参数中加上 sid（单店）或 sids（多店）。示例: { sid: "${sampleSid}" }`,
+                  tip: uniq.length > 0
+                    ? `调用 shop_scoped 工具时，请在参数中加上 sid（单店）或 sids（多店）。示例: { sid: "${sampleSid}" }`
+                    : '当前用户未被授予任何店铺权限，请联系管理员配置',
                 },
               }),
             };
