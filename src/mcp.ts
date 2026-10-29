@@ -342,6 +342,16 @@ function extractShopIdsFromObj(obj: Record<string, unknown>): string[] {
   return out;
 }
 
+/** 店铺校验白名单：查询店铺/账号自身属性的工具 → 跳过店铺参数校验 + 跳过返回结果裁剪
+ * 这类工具返回的是"我有哪些店铺"，请求里不可能先带店铺参数（鸡生蛋问题），
+ * 返回的内容是店铺目录本身而不是"属于某些店铺的数据"，不该被裁剪掉。 */
+const SHOP_SCOPE_BYPASS_TOOLS = new Set<string>([
+  'get_my_sids',       // 领星：查询我的店铺列表
+  'list_my_sids',      // 西柚 SIF：查询我的店铺列表
+  'shop_list',         // 通用：店铺列表
+  'ad_auth_shops',     // 领星：查询广告授权店铺（同样不需要先传店铺）
+]);
+
 /** 只有店铺维度上游（领星元工具模式）的响应才有「按店铺隔离」的语义 */
 function isShopScopedUpstream(upstreamId: string): boolean {
   if (!upstreamId) return false;
@@ -782,15 +792,7 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
     // 西柚 / ABA / NocoDB（flat-mcp）是公共数据源 → 跳过所有店铺校验
     const isShopScoped = isShopScopedUpstream(tool.upstream ?? '');
 
-    // 白名单：查询店铺/账号自身属性的工具 → 跳过店铺校验
-    // 这类工具返回的是"我有哪些店铺"，请求里不可能先带店铺参数（鸡生蛋问题）
-    // 包括：get_my_sids（领星/西柚）、list_stores、account_info 等
-    const SHOP_SCOPE_BYPASS_TOOLS = new Set<string>([
-      'get_my_sids',       // 领星：查询我的店铺列表
-      'list_my_sids',      // 西柚 SIF：查询我的店铺列表
-      'shop_list',         // 通用：店铺列表
-      'ad_auth_shops',     // 领星：查询广告授权店铺（同样不需要先传店铺）
-    ]);
+    // 白名单 bypass：查询店铺/账号自身属性的工具 → 跳过店铺参数校验 + 结果裁剪
     const bypassShopCheck = SHOP_SCOPE_BYPASS_TOOLS.has(tool.tool_id) || SHOP_SCOPE_BYPASS_TOOLS.has(name);
 
     if (identity.kind === 'user' && !identity.all_shops && isShopScoped && !bypassShopCheck) {
@@ -1058,9 +1060,11 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
 
       // 店铺结果裁剪
       // 只对「店铺维度上游」生效：西柚/NocoDB 等上游没有店铺维度，结果必须原样返回
+      // 白名单 bypass 工具（get_my_sids/ad_auth_shops 等）返回的是店铺目录本身 → 不裁剪
       if (Array.isArray(content)) {
         let filteredContent = content as any[];
-        if (identity.kind === 'user' && !identity.all_shops && isShopScopedUpstream(upId)) {
+        const isBypassTool = SHOP_SCOPE_BYPASS_TOOLS.has(toolId ?? '') || SHOP_SCOPE_BYPASS_TOOLS.has(name);
+        if (identity.kind === 'user' && !identity.all_shops && isShopScopedUpstream(upId) && !isBypassTool) {
           const allowedShops = new Set(getUserShopIds(identity.id));
           if (allowedShops.size === 0) {
             // 参数级校验已经 fail-closed 了，理论上走不到这里；
