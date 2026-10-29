@@ -1095,6 +1095,61 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
         if (scrubStat.removed > 0) {
           console.log(`[mcp] ${caller} ${name} 已移除 ${scrubStat.removed} 个内网 URL 字段`);
         }
+        // bypass 工具（店铺目录类）→ 在返回里注入显式店铺提示，不让 agent 从大 JSON 里自己抽
+        // 即使后面的数据很长，agent 第一眼也能看到可用 sid 列表 + 使用示例
+        const isBypassToolForHint = SHOP_SCOPE_BYPASS_TOOLS.has(tool?.tool_id ?? '') || SHOP_SCOPE_BYPASS_TOOLS.has(name);
+        if (isBypassToolForHint && filteredContent.length > 0) {
+          const shopHints: Array<{ sid: string; name?: string; country?: string }> = [];
+          for (const block of filteredContent) {
+            if (typeof (block as any)?.text !== 'string') continue;
+            try {
+              const parsed = JSON.parse((block as any).text);
+              if (Array.isArray(parsed)) {
+                for (const row of parsed) {
+                  if (row && typeof row === 'object') {
+                    const sids = extractShopIdsFromObj(row);
+                    if (sids.length > 0) {
+                      shopHints.push({
+                        sid: sids[0],
+                        name: (row.name ?? row.shop_name ?? row.store_name ?? row.shopAlias ?? undefined) as string | undefined,
+                        country: (row.country ?? row.country_code ?? undefined) as string | undefined,
+                      });
+                    }
+                  }
+                }
+              }
+            } catch { /* 不是可解析的 JSON text block，跳过 */ }
+          }
+          if (shopHints.length > 0) {
+            // 去重 + 保留原始顺序
+            const seen = new Set<string>();
+            const uniq = shopHints.filter((h) => {
+              if (seen.has(h.sid)) return false;
+              seen.add(h.sid);
+              return true;
+            });
+            const sampleSid = uniq[0].sid;
+            const hintBlock = {
+              type: 'text' as const,
+              text: JSON.stringify({
+                __gateway_shop_hint: {
+                  tool: name,
+                  available_sids: uniq.map((h) => h.sid),
+                  shop_count: uniq.length,
+                  shops: uniq.map((h) => ({
+                    sid: h.sid,
+                    name: h.name || undefined,
+                    country: h.country || undefined,
+                  })),
+                  tip: `调用 shop_scoped 工具时，请在参数中加上 sid（单店）或 sids（多店）。示例: { sid: "${sampleSid}" }`,
+                },
+              }),
+            };
+            filteredContent = [hintBlock, ...filteredContent];
+            console.log(`[mcp] ${caller} ${name} 注入店铺提示: ${uniq.length} 家可用 sid=[${uniq.map((h) => h.sid).join(',')}]`);
+          }
+        }
+
         // 返回：透传 structuredContent 仅对不受限用户（admin / all_shops）
         // 评审：structuredContent 绕过了店铺裁剪 + 内网 URL 清理，
         // 一旦上游开始返回它，受限运营会拿到未过滤的全店数据
