@@ -1064,7 +1064,10 @@ function escapeHtml(s) {
 
 /* ---------- 调用统计 ---------- */
 
-const logState = { q: '', upstream: '', caller: '', success: '', since: '', until: '', preset: '7', page: 1, pageSize: 50, total: 0 };
+const logState = { q: '', upstream: '', caller: '', success: '', since: '', until: '', preset: '7', granularity: 'day', page: 1, pageSize: 50, total: 0 };
+
+// Chart.js 实例（切换 filter/granularity 时 destroy 重建）
+const chartInstances = { trend: null, tools: null };
 
 /** 从筛选控件同步日期范围到 logState.since/until */
 function syncLogDateRange() {
@@ -1096,12 +1099,17 @@ async function loadLogs() {
   if (logState.caller) statsParams.set('caller', logState.caller);
   if (logState.since) statsParams.set('since', logState.since);
   if (logState.until) statsParams.set('until', logState.until);
-  const [stats, callers, upstreams] = await Promise.all([
+
+  const trendParams = new URLSearchParams(statsParams.toString());
+  trendParams.set('granularity', logState.granularity || 'day');
+
+  const [stats, callers, upstreams, trend] = await Promise.all([
     api('/call-logs/stats?' + statsParams.toString()),
     api('/users'),
     api('/upstreams'),
+    api('/call-logs/stats/trend?' + trendParams.toString()),
   ]);
-  renderLogStats(stats);
+  renderLogStats(stats, trend);
 
   // 填充调用者筛选下拉
   const sel = $('#log-caller-filter');
@@ -1118,41 +1126,50 @@ async function loadLogs() {
   await loadLogList();
 }
 
-function renderLogStats(stats) {
+function renderLogStats(stats, trend) {
   const root = $('#log-stats');
   const rate = stats.total > 0 ? ((stats.success / stats.total) * 100).toFixed(1) + '%' : '—';
   const topTools = (stats.top_tools || []).slice(0, 8);
   const topCallers = (stats.top_callers || []).slice(0, 5);
+
+  // chip 双分：upstream_credits（橙）+ gateway_points（绿）
+  const fmtCred = (v) => v > 0 ? ` <b style="color:#d97706">${Number(v).toFixed(1)}pt</b>` : '';
+  const fmtGw = (v) => v > 0 ? ` <b style="color:#16a34a">${Number(v).toFixed(1)}gw</b>` : '';
+
   const toolChips = topTools.map((t) => {
-    const cred = t.credits > 0 ? ` <b style="color:#d97706">${t.credits.toFixed(1)}pt</b>` : '';
     const fail = t.failed_count > 0 ? ` <span style="color:#dc2626">⚠${t.failed_count}</span>` : '';
-    return `<span class="chip" title="成功${t.success_count}/${t.count}，失败${t.failed_count}，点数${t.credits}">${escapeHtml(t.tool_name)} <b>×${t.count}</b>${cred}${fail}</span>`;
+    return `<span class="chip" title="成功${t.success_count}/${t.count}，失败${t.failed_count}，upstream_credits=${t.credits}，gateway_points=${t.gateway_points}">${escapeHtml(t.tool_name)} <b>×${t.count}</b>${fmtCred(t.credits)}${fmtGw(t.gateway_points)}${fail}</span>`;
   }).join('') || '<span class="muted">—</span>';
+
   const callerChips = topCallers.map((t) => {
-    const cred = t.credits > 0 ? ` <b style="color:#d97706">${t.credits.toFixed(1)}pt</b>` : '';
-    // hover 显示每个上游的分摊
-    const upParts = (t.upstream_breakdown || []).map(b => `${b.upstream}: ${b.count}次 / ${b.credits}pt`).join(', ');
-    const tip = upParts ? `共 ${t.count} 次，${cred?cred.replace(/<[^>]+>/g,'')+'pt':0}总点数\n` + upParts : '';
-    return `<span class="chip caller" title="${escapeHtml(tip)}">${escapeHtml(t.caller)} <b>×${t.count}</b>${cred}</span>`;
+    const upParts = (t.upstream_breakdown || []).map(b => `${b.upstream}: ${b.count}次 / upstream ${b.credits} / gw ${b.gateway_points}`).join(', ');
+    const tip = upParts ? `共 ${t.count} 次，upstream ${t.credits}pt，gateway ${t.gateway_points}pt\n` + upParts : '';
+    return `<span class="chip caller" title="${escapeHtml(tip)}">${escapeHtml(t.caller)} <b>×${t.count}</b>${fmtCred(t.credits)}${fmtGw(t.gateway_points)}</span>`;
   }).join('') || '<span class="muted">—</span>';
 
   // upstream 汇总条
   const ups = stats.upstream_stats || [];
   const upHtml = ups.map((u) => {
     const credBadge = u.credits > 0 ? ` <b style="color:#d97706">${u.credits} credits</b>` : '';
-    return `<span class="chip">${escapeHtml(u.upstream)} ×${u.count}${credBadge}</span>`;
+    const gwBadge = u.gateway_points > 0 ? ` <b style="color:#16a34a">${u.gateway_points} gw</b>` : '';
+    return `<span class="chip">${escapeHtml(u.upstream)} ×${u.count}${credBadge}${gwBadge}</span>`;
   }).join('') || '<span class="muted">—</span>';
+
+  const totalUpstream = Number(stats.total_credits || 0);
+  const totalGw = Number(stats.total_gateway_points || 0);
 
   root.innerHTML = `
     <div class="log-stat-card"><div class="label">总调用</div><div class="value">${stats.total}</div></div>
     <div class="log-stat-card success"><div class="label">成功</div><div class="value">${stats.success || 0}</div><div class="muted" style="font-size:12px;margin-top:4px">成功率 ${rate}</div></div>
     <div class="log-stat-card failed"><div class="label">失败 / 拒绝</div><div class="value">${stats.failed || 0}</div></div>
-    <div class="log-stat-card credits"><div class="label">消耗 Credits</div><div class="value" style="color:#d97706">${Number(stats.total_credits || 0).toLocaleString()}</div></div>
+    <div class="log-stat-card credits"><div class="label">Upstream Credits</div><div class="value" style="color:#d97706">${totalUpstream.toLocaleString()}</div></div>
+    <div class="log-stat-card credits"><div class="label">Gateway Points</div><div class="value" style="color:#16a34a">${totalGw.toLocaleString()}</div></div>
     <div class="log-stat-card avg"><div class="label">平均耗时</div><div class="value">${stats.avg_ms != null ? stats.avg_ms + ' ms' : '—'}</div></div>
   `;
+
   // 独立横列：上游汇总 + 热门工具 + 调用者
-  const prev = document.querySelector('.log-stats-detail');
-  if (prev) prev.remove();
+  const prevDetail = document.querySelector('.log-stats-detail');
+  if (prevDetail) prevDetail.remove();
   const detail = document.createElement('div');
   detail.className = 'log-stats-detail';
   detail.innerHTML = `
@@ -1170,6 +1187,105 @@ function renderLogStats(stats) {
     </div>
   `;
   root.after(detail);
+
+  // 图表区域
+  const prevCharts = document.querySelector('.log-charts');
+  if (prevCharts) prevCharts.remove();
+  const charts = document.createElement('div');
+  charts.className = 'log-charts';
+  charts.style.marginTop = '16px';
+  charts.innerHTML = `
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+      <div class="detail-head" style="margin:0">📈 用量趋势</div>
+      <div class="log-chart-toggle">
+        <button class="btn small ${logState.granularity === 'day' ? '' : 'ghost'}" data-grain="day">按天</button>
+        <button class="btn small ${logState.granularity === 'hour' ? '' : 'ghost'}" data-grain="hour">按小时</button>
+      </div>
+    </div>
+    <canvas id="chart-trend" height="100"></canvas>
+    <div style="height:20px"></div>
+    <div class="detail-head">🛠️ Top 工具消耗对比 <span class="muted">（gateway vs upstream）</span></div>
+    <canvas id="chart-tools" height="100"></canvas>
+  `;
+  detail.after(charts);
+
+  // granularity toggle 事件绑定
+  charts.querySelectorAll('.log-chart-toggle button').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      logState.granularity = btn.dataset.grain;
+      loadLogs();
+    });
+  });
+
+  // 渲染图表
+  renderTrendChart(trend || []);
+  renderToolBarChart(topTools);
+}
+
+/** 趋势折线图 */
+function renderTrendChart(buckets) {
+  const canvas = $('#chart-trend');
+  if (!canvas) return;
+  // destroy 旧实例
+  if (chartInstances.trend) { chartInstances.trend.destroy(); chartInstances.trend = null; }
+
+  if (!buckets.length || !window.Chart) return;
+
+  const labels = buckets.map((b) => b.bucket);
+  chartInstances.trend = new Chart(canvas, {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [
+        { label: '调用量', data: buckets.map((b) => b.calls), borderColor: '#2563eb', backgroundColor: 'rgba(37,99,235,0.1)', yAxisID: 'y', tension: 0.3, fill: true, pointRadius: 1.5 },
+        { label: 'Gateway Points', data: buckets.map((b) => b.gateway_points), borderColor: '#16a34a', backgroundColor: 'rgba(22,163,74,0.1)', yAxisID: 'y1', tension: 0.3, pointRadius: 1.5 },
+        { label: 'Upstream Credits', data: buckets.map((b) => b.upstream_credits), borderColor: '#d97706', backgroundColor: 'rgba(217,119,6,0.1)', yAxisID: 'y1', tension: 0.3, pointRadius: 1.5, borderDash: [4, 4] },
+      ],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: { legend: { position: 'top', labels: { boxWidth: 12, font: { size: 12 } } } },
+      scales: {
+        y: { type: 'linear', position: 'left', title: { display: true, text: '调用量', font: { size: 11 } }, grid: { color: 'rgba(0,0,0,0.05)' } },
+        y1: { type: 'linear', position: 'right', title: { display: true, text: 'Points / Credits', font: { size: 11 } }, grid: { drawOnChartArea: false } },
+        x: { ticks: { maxRotation: 0, autoSkip: true, maxTicksLimit: 12, font: { size: 10 } }, grid: { display: false } },
+      },
+    },
+  });
+}
+
+/** Top 工具消耗对比柱状图（gateway_points vs upstream_credits） */
+function renderToolBarChart(topTools) {
+  const canvas = $('#chart-tools');
+  if (!canvas) return;
+  if (chartInstances.tools) { chartInstances.tools.destroy(); chartInstances.tools = null; }
+
+  if (!topTools.length || !window.Chart) return;
+
+  // 取 top 8，名字截断
+  const names = topTools.map((t) => (t.tool_name.length > 20 ? t.tool_name.slice(0, 20) + '…' : t.tool_name));
+  chartInstances.tools = new Chart(canvas, {
+    type: 'bar',
+    data: {
+      labels: names,
+      datasets: [
+        { label: 'Gateway Points', data: topTools.map((t) => t.gateway_points), backgroundColor: '#16a34a', borderRadius: 3 },
+        { label: 'Upstream Credits', data: topTools.map((t) => t.credits), backgroundColor: '#d97706', borderRadius: 3 },
+      ],
+    },
+    options: {
+      indexAxis: 'y',
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: { legend: { position: 'top', labels: { boxWidth: 12, font: { size: 12 } } } },
+      scales: {
+        x: { beginAtZero: true, grid: { color: 'rgba(0,0,0,0.05)' }, ticks: { font: { size: 10 } } },
+        y: { grid: { display: false }, ticks: { font: { size: 10 } } },
+      },
+    },
+  });
 }
 
 async function loadLogList() {
