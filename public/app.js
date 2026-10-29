@@ -157,6 +157,16 @@ async function loadTools() {
       td1.appendChild(s);
     }
 
+    const tdUp = document.createElement('td');
+    const upstreamLabels = {
+      lingxing: { label: '领星', cls: 'ok' },
+      xiyou: { label: '西柚', cls: 'caller' },
+      sif: { label: 'SIF', cls: 'warn' },
+      nocodb: { label: 'NocoDB', cls: 'warn' },
+    };
+    const upInfo = upstreamLabels[t.upstream] ?? { label: t.upstream, cls: '' };
+    tdUp.innerHTML = `<span class="tag ${upInfo.cls}" title="上游服务商">${escapeHtml(upInfo.label)}</span>`;
+
     const td2 = document.createElement('td');
     td2.innerHTML = `<b>${escapeHtml(t.name)}</b>`;
     if (t.description) {
@@ -235,11 +245,11 @@ async function loadTools() {
     detail.onclick = () => showToolDetail(t.upstream, t.tool_id);
     td5.append(toggle, detail);
 
-    tr.append(td0, td1, td2, td3, tdScope, td4, td5);
+    tr.append(td0, td1, tdUp, td2, td3, tdScope, td4, td5);
     tbody.appendChild(tr);
   }
   if (!data.items.length) {
-    tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--muted);padding:30px">暂无数据，点击右上角「同步工具」从上游拉取</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--muted);padding:30px">暂无数据，点击右上角「同步工具」从上游拉取</td></tr>';
   }
   updateBatchBar();
 }
