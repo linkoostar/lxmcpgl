@@ -588,7 +588,13 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
     for (const r of rows) toolCounts[r.upstream] = r.c;
   }
   const upstreamDesc = upstreams
-    .map((u) => `${u.name}（${u.notes || '无描述'}，${toolCounts[u.id] ?? 0} 工具）`)
+    .map((u) => {
+      const note = (u.notes ?? '').trim();
+      const noteBrief = note.length > 50 ? note.slice(0, 50) + '…' : note;
+      return noteBrief
+        ? `${u.name}（${noteBrief}，${toolCounts[u.id] ?? 0} 工具）`
+        : `${u.name}（${toolCounts[u.id] ?? 0} 工具）`;
+    })
     .join('；');
   const totalTools = upstreams.reduce((sum, u) => sum + (toolCounts[u.id] ?? 0), 0);
   const serverDesc = `方中 MCP 网关，聚合 ${upstreams.length} 个上游 · ${totalTools} 工具：${upstreamDesc}`;
@@ -654,7 +660,9 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
       tools: rows.map((r) => {
         const upInfo = upMap.get(r.upstream);
         const upstreamName = upInfo?.name ?? r.upstream;
-        const upstreamDesc = upInfo?.notes ?? '';
+        // notes 截断：上游可能写了长说明 → 控制在 30 字以内，避免 descPrefix 污染工具本身的语义描述
+        const upstreamDescRaw = (upInfo?.notes ?? '').trim();
+        const upstreamDesc = upstreamDescRaw.length > 0 ? upstreamDescRaw.slice(0, 30) + (upstreamDescRaw.length > 30 ? '…' : '') : '';
         // 在 description 开头注入「来源」，LLM 一眼就能按域分组
         const descPrefix = upstreamDesc ? `[来自 ${upstreamName} · ${upstreamDesc}] ` : `[来自 ${upstreamName}] `;
         const rawDesc = r.description || r.name || r.exposed_name;
