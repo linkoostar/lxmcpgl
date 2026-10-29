@@ -8,6 +8,7 @@
  */
 
 import type { UpstreamClient } from './upstream.js';
+import { withExternalSignal } from './upstream.js';
 import { SHOP_PARAM_KEYS } from './db.js';
 
 /** upstream 配置行（从 upstreams 表读） */
@@ -70,9 +71,15 @@ export interface UpstreamAdapter {
    * @param config  upstream 配置
    * @param toolId  上游原始 tool_id（不是 exposed_name）
    * @param args    工具参数
+   * @param opts    可选：signal — 客户端 cancelled 通知到达时 abort 上游请求
    * @returns MCP content 格式
    */
-  callTool(config: UpstreamConfig, toolId: string, args: Record<string, unknown>): Promise<McpCallResult>;
+  callTool(
+    config: UpstreamConfig,
+    toolId: string,
+    args: Record<string, unknown>,
+    opts?: { signal?: AbortSignal }
+  ): Promise<McpCallResult>;
 
   /**
    * 从参数里提取店铺引用（sid / profile_id / seller_id / store_id…）
@@ -286,7 +293,12 @@ class LingxingMetaAdapter implements UpstreamAdapter {
     return tools;
   }
 
-  async callTool(config: UpstreamConfig, toolId: string, args: Record<string, unknown>): Promise<McpCallResult> {
+  async callTool(
+    config: UpstreamConfig,
+    toolId: string,
+    args: Record<string, unknown>,
+    opts?: { signal?: AbortSignal }
+  ): Promise<McpCallResult> {
     // 复用现有 UpstreamClient
     const { getUpstreamClient } = await import('./upstream.js');
     const client = getUpstreamClient(config.url, config.api_key ?? '');
@@ -297,7 +309,7 @@ class LingxingMetaAdapter implements UpstreamAdapter {
     // help/search 是扁平（各自 inputSchema 简单），但 action 是嵌套的——
     // 因为 action 要转发到不定数量的业务工具，业务工具参数统一塞在 params 里。
     // 之前错误地改成扁平 { toolId, ...args }，导致 upstream 报 102 Schema 过期（参数结构不匹配）。
-    const resp = await client.callTool('action', { toolId, params: args });
+    const resp = await client.callTool('action', { toolId, params: args }, 120000, opts?.signal);
 
     // ===== 诊断日志：打印上游原始响应结构（开发/排查用，不影响逻辑） =====
     try {
@@ -508,10 +520,15 @@ class FlatMcpAdapter implements UpstreamAdapter {
     }));
   }
 
-  async callTool(config: UpstreamConfig, toolId: string, args: Record<string, unknown>): Promise<McpCallResult> {
+  async callTool(
+    config: UpstreamConfig,
+    toolId: string,
+    args: Record<string, unknown>,
+    opts?: { signal?: AbortSignal }
+  ): Promise<McpCallResult> {
     const client = this.getOrCreateClient(config);
     await client.initialize();
-    const resp = await client.callTool(toolId, args);
+    const resp = await client.callTool(toolId, args, opts?.signal);
     if (resp?.error) {
       // 同样优先挖 error.data.code（部分扁平 MCP 上游也会把业务码包在 data 里）
       const errData = resp.error.data as Record<string, unknown> | undefined;
@@ -625,7 +642,7 @@ class FlatMcpClient {
     private customHeaders: Record<string, string> = {}
   ) {}
 
-  private async rpc(method: string, params: unknown, timeoutMs = 30000): Promise<any> {
+  private async rpc(method: string, params: unknown, timeoutMs = 30000, externalSignal?: AbortSignal): Promise<any> {
     const body = JSON.stringify({ jsonrpc: '2.0', id: Date.now(), method, params });
     // 先放自定义 headers，再用标准 headers 覆盖（Content-Type/Accept 不能被覆盖）
     const headers: Record<string, string> = {
@@ -640,7 +657,7 @@ class FlatMcpClient {
       method: 'POST',
       headers,
       body,
-      signal: AbortSignal.timeout(timeoutMs),
+      signal: withExternalSignal(timeoutMs, externalSignal),
     });
     if (!resp.ok) throw new Error(`HTTP ${resp.status} ${resp.statusText}`);
     const txt = await resp.text();
@@ -677,9 +694,9 @@ class FlatMcpClient {
     return resp.result?.tools ?? [];
   }
 
-  async callTool(name: string, args: Record<string, unknown>): Promise<any> {
+  async callTool(name: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<any> {
     // 不在这里抛错：把 JSON-RPC error 原样返回，交给 adapter 归一化（保留 code/traceId）
-    return this.rpc('tools/call', { name, arguments: args });
+    return this.rpc('tools/call', { name, arguments: args }, 30000, signal);
   }
 }
 

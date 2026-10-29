@@ -1,6 +1,12 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { InitializeRequestSchema, ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import {
+  InitializeRequestSchema,
+  ListToolsRequestSchema,
+  CallToolRequestSchema,
+  CancelledNotificationSchema,
+  RequestIdSchema,
+} from '@modelcontextprotocol/sdk/types.js';
 import type { Request, Response } from 'express';
 import {
   db,
@@ -21,9 +27,12 @@ import { createHash, randomUUID } from 'node:crypto';
 import { config } from './config.js';
 
 /**
- * 下游 MCP 端点（无状态 streamableHttp）：
+ * 下游 MCP 端点（混合 session 模式 streamableHttp）：
  *  - tools/list：按调用者身份摊平暴露业务工具
  *  - tools/call：鉴权 → 限流 → 工具/店铺校验 → 转发上游 action(toolId, params)
+ *  - initialize 建立 session：支持 notifications/tools/list_changed 推送（GET SSE）
+ *  - notifications/cancelled：按 requestId abort in-flight 上游调用（signal 透传 fetch）
+ *  - 不带 session 的请求走无状态路径，向后兼容旧客户端
  */
 
 export type McpIdentity =
@@ -110,6 +119,78 @@ export function toolsHashOf(activeUpstreams: Array<{ id: string }>): string {
     .update(rows.map((r) => `${r.upstream}\u0000${r.tool_id}\u0000${r.updated_at ?? ''}\u0000${r.input_schema ?? ''}`).join('\u0001'))
     .digest('hex')
     .slice(0, 16);
+}
+
+// ---------- session 注册表 + list_changed 推送（MCP 标准能力） ----------
+// 混合模式：
+//  - initialize 走 session 模式：transport 生成 mcp-session-id，后续请求带该 header
+//    路由回同一 server+transport，服务端可经 GET SSE 流下发 notifications（tools/list_changed）
+//  - 不带 session header 的普通请求继续走无状态路径（向后兼容 curl/脚本/旧客户端）
+// 通知不带数据，跨 scope 无害：客户端收到后重拉自己的 tools/list。
+
+interface SessionEntry {
+  server: Server;
+  transport: StreamableHTTPServerTransport;
+  identityKey: string;
+  lastSeen: number;
+}
+
+const sessions = new Map<string, SessionEntry>();
+
+/** in-flight 上游调用注册表：key = `${identityKey}:${client requestId}`，cancelled 通知据此 abort */
+const inflight = new Map<string, AbortController>();
+
+function identityKeyOf(identity: McpIdentity): string {
+  return identity.kind === 'admin' ? 'admin' : `u${identity.id}`;
+}
+
+/** 向所有 session 客户端推送 notifications/tools/list_changed，返回通知的 session 数 */
+export function notifyToolsListChanged(): number {
+  let n = 0;
+  for (const [sid, s] of sessions) {
+    void s.server
+      .notification({ method: 'notifications/tools/list_changed' })
+      .catch((e: any) =>
+        console.warn(`[mcp] list_changed 推送失败 ${sid}: ${String(e?.message ?? e).slice(0, 120)}`)
+      );
+    n++;
+  }
+  return n;
+}
+
+let lastNotifiedHash: string | null = null;
+
+/**
+ * sync / 工具启停后调用：当前 hash 与上次不同 → 推送 list_changed。
+ * 首次调用只记基线不推送（避免启动瞬间对旧 session 误报）。
+ */
+export function checkAndNotifyToolsChanged(): void {
+  const h = toolsHashOf(listUpstreams().filter((u) => u.active));
+  if (lastNotifiedHash === null) {
+    lastNotifiedHash = h;
+    return;
+  }
+  if (h === lastNotifiedHash) return;
+  const before = lastNotifiedHash;
+  lastNotifiedHash = h;
+  const n = notifyToolsListChanged();
+  console.log(`[mcp] 工具定义变化 ${before} → ${h}，已向 ${n} 个 session 推送 list_changed`);
+}
+
+let sessionCleanupTimer: ReturnType<typeof setInterval> | null = null;
+function ensureSessionCleanup(): void {
+  if (sessionCleanupTimer) return;
+  sessionCleanupTimer = setInterval(() => {
+    const now = Date.now();
+    for (const [sid, s] of sessions) {
+      if (now - s.lastSeen > 24 * 3600_000) {
+        console.log(`[mcp] session 空闲超 24h，关闭: ${sid}`);
+        void s.transport.close().catch(() => { /* 已关闭 */ });
+        sessions.delete(sid);
+      }
+    }
+  }, 5 * 60_000);
+  sessionCleanupTimer.unref();
 }
 
 /**
@@ -620,18 +701,41 @@ function stripMarkdownFenceInContent(content: unknown): unknown {
 
 // ---------- 主处理 ----------
 
-export async function handleMcpRequest(req: Request, res: Response, identity: McpIdentity): Promise<void> {
-  // 构建动态 serverInfo — 让 Agent 启动时一眼知道网关聚合了哪些上游
-  const upstreams = listUpstreams().filter((u) => u.active);
-  // 只统计「已启用 + 上游 active」的工具，必须和 tools/list 实际暴露的数量一致
+/** active upstream 快照（session 模式下每个 handler 内重取，保证长会话不读到构建时的旧清单） */
+function activeUpstreams(): Array<{ id: string; name: string; notes?: string | null; adapter?: string }> {
+  return listUpstreams().filter((u) => u.active);
+}
+
+function computeToolCounts(upstreams: Array<{ id: string }>): Record<string, number> {
   const toolCounts: Record<string, number> = {};
-  if (upstreams.length > 0) {
-    const ph = upstreams.map(() => '?').join(',');
-    const rows = db
-      .prepare(`SELECT upstream, COUNT(*) AS c FROM tools WHERE enabled = 1 AND upstream IN (${ph}) GROUP BY upstream`)
-      .all(...upstreams.map((u) => u.id)) as Array<{ upstream: string; c: number }>;
-    for (const r of rows) toolCounts[r.upstream] = r.c;
-  }
+  if (upstreams.length === 0) return toolCounts;
+  const ph = upstreams.map(() => '?').join(',');
+  const rows = db
+    .prepare(`SELECT upstream, COUNT(*) AS c FROM tools WHERE enabled = 1 AND upstream IN (${ph}) GROUP BY upstream`)
+    .all(...upstreams.map((u) => u.id)) as Array<{ upstream: string; c: number }>;
+  for (const r of rows) toolCounts[r.upstream] = r.c;
+  return toolCounts;
+}
+
+/**
+ * SDK 的 CallToolRequestSchema 基于 RequestSchema（只有 method/params），
+ * zod 解析后 JSON-RPC 的 id 字段会被剥掉 → handler 拿不到 requestId，
+ * 无法与 notifications/cancelled 的 params.requestId 对上。
+ * 扩展 schema 保留 id（Server 内部 tools/call 二次校验用原 schema，不受影响）。
+ */
+const CallToolRequestWithIdSchema = CallToolRequestSchema.extend({
+  id: RequestIdSchema.optional(),
+});
+
+/**
+ * 构建一个挂了全部 handler 的 Server 实例。
+ * session 模式下由 initialize 创建并长期存活；无状态模式下每请求新建。
+ * 因此各 handler 内部必须重取 upstreams 快照，不能依赖构建时闭包。
+ */
+function buildServer(identity: McpIdentity): Server {
+  // 构建动态 serverInfo — 让 Agent 启动时一眼知道网关聚合了哪些上游
+  const upstreams = activeUpstreams();
+  const toolCounts = computeToolCounts(upstreams);
   const upstreamDesc = upstreams
     .map((u) => {
       const note = (u.notes ?? '').trim();
@@ -646,21 +750,34 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
 
   const server = new Server(
     { name: 'fangzhong-mcp-gateway', version: config.version, description: serverDesc },
-    { capabilities: { tools: { listChanged: false } } }
+    { capabilities: { tools: { listChanged: true } } }
   );
+
+  // MCP 标准 cancelled 通知：按 requestId 找到 in-flight 上游调用并 abort（signal 透传到上游 fetch）
+  server.setNotificationHandler(CancelledNotificationSchema, async (notification) => {
+    const rid = (notification.params as any)?.requestId;
+    const key = `${identityKeyOf(identity)}:${String(rid)}`;
+    const ctrl = inflight.get(key);
+    if (ctrl) {
+      console.log(`[mcp] 收到 cancelled 通知 (requestId=${String(rid)}) → abort in-flight 调用`);
+      ctrl.abort(new Error('cancelled by client'));
+    }
+  });
 
   // 覆盖 SDK 默认的 initialize handler — 返回动态 serverInfo + instructions
   server.setRequestHandler(InitializeRequestSchema, async () => ({
     protocolVersion: '2025-03-26',
-    capabilities: { tools: { listChanged: false } },
+    capabilities: { tools: { listChanged: true } },
     serverInfo: { name: '方中 MCP 网关', version: config.version },
     // MCP 标准字段：客户端会把这段说明带给模型，用于判断该网关能提供哪些数据域
     instructions: serverDesc,
-    _meta: { tools_hash: toolsHashOf(upstreams) },
+    _meta: { tools_hash: toolsHashOf(activeUpstreams()) },
   }));
 
   server.setRequestHandler(ListToolsRequestSchema, async () => {
     // 先查 active upstream 列表，用于给每个工具打 tag + 解析用户 upstream 范围
+    // session 模式下 server 长期存活，必须每次重取（不能依赖构建时闭包）
+    const upstreams = activeUpstreams();
     const activeUpIds = upstreams.map((u) => u.id);
     const upMap = new Map(upstreams.map((u) => [u.id, { name: u.name, notes: u.notes }]));
 
@@ -742,7 +859,9 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
     } as any;
   });
 
-  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  server.setRequestHandler(CallToolRequestWithIdSchema, async (request) => {
+    // session 模式下 server 长期存活：upstreams 快照必须在每次调用时重取
+    const upstreams = activeUpstreams();
     const name = String(request.params.name ?? '');
     const args = (request.params.arguments ?? {}) as Record<string, unknown>;
 
@@ -793,6 +912,7 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
 
     // ---- 网关自身工具（_ 前缀）—— 直接处理，不走上游 ----
     if (name === '_gateway_info') {
+      const toolCounts = computeToolCounts(upstreams);
       const gwUpstreams = upstreams.map((u) => ({ id: u.id, name: u.name, adapter: u.adapter, tools: toolCounts[u.id] ?? 0 }));
       const upstreamTotal = gwUpstreams.reduce((s, u) => s + u.tools, 0);
       const builtinTotal = 2;
@@ -1020,11 +1140,17 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
       logOutcome(false, true, '上游未配置认证');
       return errorResult(`上游 ${upConfig.name} 未配置认证信息（api_key / headers / URL query），请联系管理员`);
     }
+    // in-flight 注册：让 cancelled 通知能按 requestId 找到本次调用并 abort（signal 透传到上游 fetch）
+    const requestId = request.id as string | number | undefined;
+    const callCtrl = new AbortController();
+    const inflightKey =
+      requestId === undefined || requestId === null ? null : `${identityKeyOf(identity)}:${String(requestId)}`;
+    if (inflightKey) inflight.set(inflightKey, callCtrl);
     try {
       // 延迟 import 避免循环依赖
       const { getAdapter } = await import('./adapter.js');
       const adapter = getAdapter(upConfig);
-      let callResult = await adapter.callTool(upConfig, tool.tool_id, args);
+      let callResult = await adapter.callTool(upConfig, tool.tool_id, args, { signal: callCtrl.signal });
 
       // ===== code=102 自动刷新 Schema + 重试一次 =====
       // 领星上游工具定义更新后旧 schema 会过期，返回 code=102（业务错误，包在 content 里）。
@@ -1036,9 +1162,12 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
         console.log(`[mcp] ${caller} ${name} 触发 schema 刷新（code=${bizCode}）`);
         try {
           await refreshToolSchema(getUpstreamClient(upConfig.url, upConfig.api_key ?? ''), tool.tool_id, upId);
-          callResult = await adapter.callTool(upConfig, tool.tool_id, args);
+          // schema 刷新可能改变 tools_hash → 按标准推送 list_changed
+          checkAndNotifyToolsChanged();
+          callResult = await adapter.callTool(upConfig, tool.tool_id, args, { signal: callCtrl.signal });
           console.log(`[mcp] ${caller} ${name} 刷新 schema 后重试完成`);
         } catch (refreshErr: any) {
+          if (callCtrl.signal.aborted) throw refreshErr; // 取消不是刷新异常，交给外层 cancelled 分支
           console.warn(`[mcp] ${caller} ${name} schema 刷新异常: ${String(refreshErr?.message ?? refreshErr).slice(0, 200)}`);
         }
       }
@@ -1328,6 +1457,15 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
       logOutcome(false, true, '上游返回为空');
       return errorResult('上游返回为空');
     } catch (e: any) {
+      if (callCtrl.signal.aborted) {
+        console.log(`[mcp] ${caller} ${name} 已取消 (${Date.now() - logCtx.started}ms)：客户端发送 cancelled 通知`);
+        logOutcome(false, true, 'cancelled: 客户端发送 cancelled 通知');
+        return errorResult('调用已被客户端取消', {
+          type: 'cancelled',
+          upstream: upId,
+          tool: name,
+        });
+      }
       const msg = String(e?.message || e).slice(0, 500);
       const timedOut = /timeout|timed out|aborted/i.test(msg);
       console.error(`[mcp] ${caller} ${name} 调用失败: ${msg.slice(0, 300)} upstream=${upId}`);
@@ -1337,9 +1475,72 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
         upstream: upId,
         tool: name,
       });
+    } finally {
+      if (inflightKey) inflight.delete(inflightKey);
     }
   });
 
+  return server;
+}
+
+/**
+ * 下游 MCP 请求路由（混合 session 模式）：
+ *  1. 带 mcp-session-id 且命中 → 路由到该 session 的 transport（GET 即 SSE 通知流）
+ *  2. 不带 session 的 initialize → 建立 session（transport 生成 mcp-session-id，server 常驻）
+ *  3. 不带 session 的其余 POST → 无状态路径（向后兼容 curl/脚本/旧客户端）
+ */
+export async function handleMcpRequest(req: Request, res: Response, identity: McpIdentity): Promise<void> {
+  const sidHeader = String(req.headers['mcp-session-id'] ?? '').trim();
+  if (sidHeader) {
+    const entry = sessions.get(sidHeader);
+    if (!entry || entry.identityKey !== identityKeyOf(identity)) {
+      // session 不存在 / 已关闭 / 不属于当前 Key → 404（协议语义：session 失效）
+      res.status(404).json({
+        jsonrpc: '2.0',
+        error: { code: -32000, message: 'session not found（可能已关闭或不属于当前 Key，请重新 initialize）' },
+        id: null,
+      });
+      return;
+    }
+    entry.lastSeen = Date.now();
+    await entry.transport.handleRequest(req, res, req.body);
+    return;
+  }
+
+  const bodyMethod = Array.isArray(req.body) ? (req.body[0] as any)?.method : (req.body as any)?.method;
+
+  if (req.method === 'POST' && bodyMethod === 'initialize') {
+    // 建立 session：server+transport 常驻，客户端后续带 mcp-session-id 复用；
+    // GET /mcp（带 session）即服务端通知（notifications/tools/list_changed）的 SSE 通道
+    const server = buildServer(identity);
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: () => randomUUID(),
+      onsessioninitialized: (newSid) => {
+        sessions.set(newSid, { server, transport, identityKey: identityKeyOf(identity), lastSeen: Date.now() });
+        ensureSessionCleanup();
+        console.log(`[mcp] session 建立: ${newSid.slice(0, 8)}… (${identity.kind === 'admin' ? 'admin' : identity.username})`);
+      },
+      enableJsonResponse: true,
+    });
+    transport.onclose = () => {
+      if (transport.sessionId) sessions.delete(transport.sessionId);
+    };
+    await server.connect(transport);
+    await transport.handleRequest(req, res, req.body);
+    return;
+  }
+
+  if (req.method !== 'POST') {
+    res.status(405).json({
+      jsonrpc: '2.0',
+      error: { code: -32000, message: 'Method not allowed: GET/DELETE 需携带 mcp-session-id（先 initialize 建立 session）' },
+      id: null,
+    });
+    return;
+  }
+
+  // 无状态路径：每请求新建 server+transport，res 关闭即清理
+  const server = buildServer(identity);
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
     enableJsonResponse: true,

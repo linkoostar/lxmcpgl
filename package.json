@@ -1,6 +1,6 @@
 {
   "name": "lxmcpgl",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "LingXing MCP Gateway - MCP relay with web admin, permission management and audit logging",
   "type": "module",
   "main": "dist/index.js",

@@ -3,7 +3,7 @@ import path from 'node:path';
 import { config } from './config.js';
 import { initDb, getSetting, sha256, getUserByKeyHash, listUpstreams, type UserRow } from './db.js';
 import { apiRouter, apiErrorHandler } from './web.js';
-import { handleMcpRequest, identityFromUser, type McpIdentity, toolsHashOf } from './mcp.js';
+import { handleMcpRequest, identityFromUser, type McpIdentity, toolsHashOf, checkAndNotifyToolsChanged } from './mcp.js';
 import { syncAllUpstreams } from './sync.js';
 import { buildHealth } from './health.js';
 import type { Request, Response, NextFunction } from 'express';
@@ -67,11 +67,9 @@ async function main(): Promise<void> {
   app.use('/api', apiRouter);
   app.use('/api', apiErrorHandler);
 
+  // MCP 端点：POST（initialize/tools/list/tools/call/notifications）+ GET（session SSE 通知流）
+  // + DELETE（关闭 session）。session 路由与无状态兼容都在 handleMcpRequest 内。
   app.all('/mcp', mcpAuth, (req, res) => {
-    if (req.method !== 'POST') {
-      res.status(405).json({ jsonrpc: '2.0', error: { code: -32000, message: 'Method not allowed' }, id: null });
-      return;
-    }
     handleMcpRequest(req, res, (req as any).mcpIdentity).catch((e) => {
       console.error('[mcp] 请求处理异常:', e);
       if (!res.headersSent) {
@@ -143,6 +141,8 @@ async function main(): Promise<void> {
         } else {
           console.log(`[gw] 定期同步完成：${r.synced}/${r.total_listed} 工具，hash 无变化（${Date.now() - started}ms）`);
         }
+        // MCP 标准：工具定义变化（含管理后台启停工具）→ 向 session 客户端推送 list_changed
+        checkAndNotifyToolsChanged();
       } catch (e: any) {
         console.warn(`[gw] 定期同步异常: ${String(e?.message ?? e).slice(0, 200)}`);
       }

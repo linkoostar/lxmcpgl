@@ -19,6 +19,24 @@ interface JsonRpcResponse {
   error?: { code?: number; message?: string; data?: unknown };
 }
 
+/**
+ * 组合超时 signal 与外部取消 signal（cancelled 通知 → abort 上游 fetch）。
+ * 不直接用 AbortSignal.any：engines 是 node>=20，20.3 以下没有该 API，手动桥接最稳。
+ */
+export function withExternalSignal(timeoutMs: number, external?: AbortSignal): AbortSignal {
+  const timeoutSignal = AbortSignal.timeout(timeoutMs);
+  if (!external) return timeoutSignal;
+  if (external.aborted) return external;
+  const ctrl = new AbortController();
+  if (timeoutSignal.aborted) {
+    ctrl.abort(timeoutSignal.reason);
+    return ctrl.signal;
+  }
+  timeoutSignal.addEventListener('abort', () => ctrl.abort(timeoutSignal.reason), { once: true });
+  external.addEventListener('abort', () => ctrl.abort(external.reason), { once: true });
+  return ctrl.signal;
+}
+
 export class UpstreamClient {
   private nextId = 1;
   private sessionId: string | null = null;
@@ -37,12 +55,12 @@ export class UpstreamClient {
     return h;
   }
 
-  private async post(body: unknown, timeoutMs = 60000): Promise<{ res: Response; text: string }> {
+  private async post(body: unknown, timeoutMs = 60000, externalSignal?: AbortSignal): Promise<{ res: Response; text: string }> {
     const res = await fetch(this.url, {
       method: 'POST',
       headers: this.headers(),
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(timeoutMs),
+      signal: withExternalSignal(timeoutMs, externalSignal),
     });
     const text = await res.text();
     return { res, text };
@@ -98,9 +116,9 @@ export class UpstreamClient {
     }
   }
 
-  private async sendRpc(method: string, params: unknown, timeoutMs: number): Promise<JsonRpcResponse | null> {
+  private async sendRpc(method: string, params: unknown, timeoutMs: number, signal?: AbortSignal): Promise<JsonRpcResponse | null> {
     const id = this.nextId++;
-    const { res, text } = await this.post({ jsonrpc: '2.0', id, method, params }, timeoutMs);
+    const { res, text } = await this.post({ jsonrpc: '2.0', id, method, params }, timeoutMs, signal);
     return this.readResponse(res, text, id);
   }
 
@@ -159,21 +177,21 @@ export class UpstreamClient {
   }
 
   /** 带 session 失效自动重试的 RPC */
-  async rpc(method: string, params?: unknown, timeoutMs = 60000): Promise<JsonRpcResponse | null> {
+  async rpc(method: string, params?: unknown, timeoutMs = 60000, signal?: AbortSignal): Promise<JsonRpcResponse | null> {
     await this.ensureInit();
-    let resp = await this.sendRpc(method, params, timeoutMs);
+    let resp = await this.sendRpc(method, params, timeoutMs, signal);
     if (resp?.error && this.isSessionError(resp)) {
       this.initialized = false;
       this.sessionId = null;
       await this.ensureInit();
-      resp = await this.sendRpc(method, params, timeoutMs);
+      resp = await this.sendRpc(method, params, timeoutMs, signal);
     }
     return resp;
   }
 
-  /** 上游元工具调用（tools/call） */
-  async callTool(name: string, args: Record<string, unknown> = {}, timeoutMs = 120000): Promise<JsonRpcResponse | null> {
-    return this.rpc('tools/call', { name, arguments: args }, timeoutMs);
+  /** 上游元工具调用（tools/call）；signal 用于客户端 cancelled 时中断上游等待 */
+  async callTool(name: string, args: Record<string, unknown> = {}, timeoutMs = 120000, signal?: AbortSignal): Promise<JsonRpcResponse | null> {
+    return this.rpc('tools/call', { name, arguments: args }, timeoutMs, signal);
   }
 
   /** 上游 tools/list（元工具清单） */

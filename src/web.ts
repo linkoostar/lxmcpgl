@@ -38,6 +38,7 @@ import {
 import { config, META_TOOLS } from './config.js';
 import { getUpstreamClient, resetUpstreamClient, UpstreamError } from './upstream.js';
 import { syncTools, syncUpstreamById, isSyncing, listTools, batchSetEnabled, syncAllUpstreams } from './sync.js';
+import { checkAndNotifyToolsChanged } from './mcp.js';
 import { getAdapter } from './adapter.js';
 import { buildHealth } from './health.js';
 
@@ -278,9 +279,11 @@ apiRouter.post(
     const upstreamId = String(req.body?.upstream_id ?? '').trim();
     if (upstreamId) {
       const r = await syncUpstreamById(upstreamId);
+      checkAndNotifyToolsChanged();
       res.json({ [upstreamId]: r, totalSynced: r.synced });
     } else {
       const r = await syncAllUpstreams();
+      checkAndNotifyToolsChanged();
       res.json(r);
     }
   })
@@ -490,6 +493,7 @@ apiRouter.post(
     if (isSyncing()) { res.status(409).json({ error: '已有同步任务在进行中' }); return; }
     const sid = String(req.params.id);
     const r = await syncUpstreamById(sid);
+    checkAndNotifyToolsChanged();
     res.json({ upstream_id: sid, ...r });
   })
 );
@@ -500,6 +504,7 @@ apiRouter.post(
   wrap(async (_req, res) => {
     if (isSyncing()) { res.status(409).json({ error: '已有同步任务在进行中' }); return; }
     const r = await syncAllUpstreams();
+    checkAndNotifyToolsChanged();
     res.json(r);
   })
 );
@@ -607,6 +612,7 @@ apiRouter.put(
       res.status(404).json({ error: '工具不存在' });
       return;
     }
+    checkAndNotifyToolsChanged();
     res.json({ ok: true });
   })
 );
@@ -655,6 +661,7 @@ apiRouter.post(
       },
       enabled
     );
+    checkAndNotifyToolsChanged();
     res.json({ ok: true, changed });
   })
 );
