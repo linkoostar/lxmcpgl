@@ -782,7 +782,18 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
     // 西柚 / ABA / NocoDB（flat-mcp）是公共数据源 → 跳过所有店铺校验
     const isShopScoped = isShopScopedUpstream(tool.upstream ?? '');
 
-    if (identity.kind === 'user' && !identity.all_shops && isShopScoped) {
+    // 白名单：查询店铺/账号自身属性的工具 → 跳过店铺校验
+    // 这类工具返回的是"我有哪些店铺"，请求里不可能先带店铺参数（鸡生蛋问题）
+    // 包括：get_my_sids（领星/西柚）、list_stores、account_info 等
+    const SHOP_SCOPE_BYPASS_TOOLS = new Set<string>([
+      'get_my_sids',       // 领星：查询我的店铺列表
+      'list_my_sids',      // 西柚 SIF：查询我的店铺列表
+      'shop_list',         // 通用：店铺列表
+      'ad_auth_shops',     // 领星：查询广告授权店铺（同样不需要先传店铺）
+    ]);
+    const bypassShopCheck = SHOP_SCOPE_BYPASS_TOOLS.has(tool.tool_id) || SHOP_SCOPE_BYPASS_TOOLS.has(name);
+
+    if (identity.kind === 'user' && !identity.all_shops && isShopScoped && !bypassShopCheck) {
       // 领星强制 shop_scoped：运营必须传店铺参数 + 店铺在白名单里
       // 不需要 shop_scope 字段审核机制（领星全是店铺维度）
       if (shopRefs.length === 0) {
