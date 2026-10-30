@@ -921,7 +921,7 @@ function buildServer(identity: McpIdentity): Server {
       const gwUpstreams = upstreams.map((u) => ({ id: u.id, name: u.name, adapter: u.adapter, tools: toolCounts[u.id] ?? 0 }));
       const upstreamTotal = gwUpstreams.reduce((s, u) => s + u.tools, 0);
       const builtinTotal = 2;
-      const result = { gateway: '方中 MCP 网关', version: config.version, identity: identity.kind === 'admin' ? 'admin' : `user:${identity.username}`, upstreams: gwUpstreams, builtin_tools: builtinTotal, total_tools: upstreamTotal + builtinTotal };
+      const result = { gateway: '方中 MCP 网关', version: config.version, identity: identity.kind === 'admin' ? 'admin' : `user:${identity.username}`, upstreams: gwUpstreams, builtin_tools: builtinTotal, total_tools: upstreamTotal + builtinTotal, tools_hash: toolsHashOf(upstreams) };
       insertCallLog({ caller: logCtx.caller, user_id: logCtx.userId, tool_name: name, tool_id: name, tool_type: 'gateway', upstream: '', shop_refs: null, success: true, is_error: false, duration_ms: Date.now() - logCtx.started, error: null, cost_credits: null, effective_rows: null, is_admin: identity.kind === 'admin', is_empty_shell: true, gateway_points: 0 });
       return { content: [{ type: 'text' as const, text: JSON.stringify(result) }] };
     }
