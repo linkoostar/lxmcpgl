@@ -102,7 +102,10 @@ function safeParseSchema(s: string | null): Record<string, unknown> {
 }
 
 /**
- * 工具定义版本哈希：只依赖 active upstream 的 (upstream, tool_id, updated_at, schema)。
+ * 工具定义版本哈希：只覆盖「客户端可见」字段（清单身份 + description +
+ * tool_type(annotations 来源) + input_schema）。
+ * 不含 updated_at —— sync 每次 touch 它都会翻 hash，造成「内容没变 hash 变了」的假阳性；
+ * 必须含 description/tool_type —— 否则「内容变了 hash 没变」的假阴性更危险。
  * 客户端缓存 tools/list 后，可通过该 hash 判断定义是否变化。
  */
 export function toolsHashOf(activeUpstreams: Array<{ id: string }>): string {
@@ -111,12 +114,12 @@ export function toolsHashOf(activeUpstreams: Array<{ id: string }>): string {
   const ph = ids.map(() => '?').join(',');
   const rows = db
     .prepare(
-      `SELECT upstream, tool_id, updated_at, input_schema FROM tools
+      `SELECT upstream, tool_id, description, tool_type, input_schema FROM tools
        WHERE enabled = 1 AND upstream IN (${ph}) ORDER BY upstream, tool_id`
     )
-    .all(...ids) as Array<{ upstream: string; tool_id: string; updated_at: string | null; input_schema: string | null }>;
+    .all(...ids) as Array<{ upstream: string; tool_id: string; description: string | null; tool_type: string | null; input_schema: string | null }>;
   return createHash('sha256')
-    .update(rows.map((r) => `${r.upstream}\u0000${r.tool_id}\u0000${r.updated_at ?? ''}\u0000${r.input_schema ?? ''}`).join('\u0001'))
+    .update(rows.map((r) => `${r.upstream}\u0000${r.tool_id}\u0000${r.description ?? ''}\u0000${r.tool_type ?? ''}\u0000${r.input_schema ?? ''}`).join('\u0001'))
     .digest('hex')
     .slice(0, 16);
 }
@@ -745,7 +748,8 @@ function buildServer(identity: McpIdentity): Server {
         : `${u.name}（${toolCounts[u.id] ?? 0} 工具）`;
     })
     .join('；');
-  const totalTools = upstreams.reduce((sum, u) => sum + (toolCounts[u.id] ?? 0), 0);
+  // 含 2 个内置工具（_tool_search/_gateway_info），与 tools/list 实际暴露数一致
+  const totalTools = upstreams.reduce((sum, u) => sum + (toolCounts[u.id] ?? 0), 0) + 2;
   const serverDesc = `方中 MCP 网关，聚合 ${upstreams.length} 个上游 · ${totalTools} 工具：${upstreamDesc}`;
 
   const server = new Server(
