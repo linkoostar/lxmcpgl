@@ -2,7 +2,7 @@
 
 多上游 MCP 聚合中转网关：领星 ERP（元工具模式 `help → search → action`，289+ 业务工具）、西柚（广告/ABA 分析）、SIF（市场/流量）、NocoDB（数据层）等统一接入，对外以标准 MCP streamable HTTP 暴露。
 
-**v1.4.0** — 店铺可见性隔离 + 网关元工具（`_tool_search` / `_gateway_info`）+ 上游错误准确透传（`upstream_code` / `trace_id` 挖取 + code=102 缺参补注）。
+**v1.6.1** — MCP 标准能力落地：session 模式 + `notifications/tools/list_changed` 主动推送 + `notifications/cancelled` 取消透传；tools_hash 变更感知契约（三处一致、纯暴露内容口径）；同步业务错误显式透出（不再静默显示 0/0）；工具列表启用状态筛选；NocoDB `callTool`/`exportCsv` annotations 语义修正。
 
 ## 设计原则（重要）
 
@@ -35,6 +35,7 @@
 | **店铺隔离（仅领星）** | `adapter=lingxing-meta` 强制 shop_scoped — 递归提取所有层级/数组内的店铺字段（`sid / sids / store_id / profile_id / seller_id` 等），四种 ID 映射到 sid 后 every 校验，fail-closed 拒绝非白名单店铺调用 + 响应裁剪 |
 | **Token 优化** | schema 最小化（丢 description/title/pattern/additionalProperties/$defs，保留 type/enum/required/items 递归）+ description 截断 300 chars → tools/list 从 ~80K tokens 降到 ~69K tokens（-14%） |
 | **可观测性** | `upstream_code` 回填上游原始码、`trace_id` 贯通全链路、调用日志入库 + CSV 导出 + Credits 追溯 |
+| **MCP 标准能力** | session 模式：initialize 建立 `mcp-session-id`，GET `/mcp` 开 SSE 通知流，DELETE 关闭；工具定义变化向全部存活 session 推 `notifications/tools/list_changed`；`notifications/cancelled` 按 requestId abort 进行中的上游调用（AbortSignal 全链路透传，session/无状态双模式均可用）；`capabilities.tools.listChanged=true` 名副其实。不带 session 的请求走无状态路径，完全向后兼容 |
 | **安全** | 下游 Key 随机生成 + SHA-256 存储 + 每次请求查库；管理员 Key 设置页默认 masked 显示 + 👁 按需明文；店铺校验 fail-closed 兜底；SQLite 用预编译语句 |
 | **Web 管理后台** | 上游配置 + 连通测试 + 工具同步启停；下游 Key 管理 + 店铺同步；工具列表筛选 + 批量启停 + 批量 write 分配；调用日志浏览 + CSV 导出 |
 | **定期同步** | `PERIODIC_SYNC_INTERVAL_MS` 驱动定时全量 sync + schema hash（canonicalize 后 SHA-256 前 16 位）对比；领星 code=102 自动刷新 schema 重试 |
@@ -97,6 +98,20 @@ mkdir -p data && docker compose up -d
 - **全选搜索结果**：按当前搜索词跨页选中全部匹配工具（如搜 `ad` 选中所有广告类）
 - **批量启用 / 批量停用**：对选中集合一键生效；也可配合搜索词按条件整体启停
 - 点击行复选框可自由增减选中集合，批量栏实时显示已选数量
+- 筛选支持：上游 / 类型 / 审核状态 / **启用状态**（「全选搜索结果」与批量启停均遵循全部筛选条件，不会误伤筛选外的工具）
+
+## 变更感知（tools_hash 契约）
+
+网关在 `initialize._meta`、`tools/list._meta`、`_gateway_info` 三处输出**同一个** `tools_hash`（SHA-256 前 16 位）。计算口径**只覆盖客户端可见字段**：`(upstream, tool_id, description, tool_type, input_schema)` + enabled 过滤——不含 `updated_at`（sync 反复 touch 它不会翻 hash）。因此 **hash 变 = 客户端可见定义确实变了**，应重拉 `tools/list`；hash 不变则缓存可继续用。
+
+两条变更感知路径：
+
+| 路径 | 前提 | 机制 |
+|------|------|------|
+| **推送** | 客户端 initialize 建立 session 并开着 GET SSE 流 | 定期同步 / 手动同步 / 启停导致 hash 变化时，网关向全部存活 session 推 `notifications/tools/list_changed`（通知不带数据，客户端收到后重拉自己的 tools/list） |
+| **轮询** | 无（无 session 也能用） | 定期调 `_gateway_info`（轻量）比对 `tools_hash`，变了再拉全量 `tools/list` |
+
+> 注意：上游工具变化要等一次 sync 才进入 hash（`PERIODIC_SYNC_INTERVAL_MS`，生产建议设 `600000`）。推送只达有 session 的客户端；不支持 session 的客户端退回轮询 hash，成本极低。
 
 ## 运营接入（Trae / 其他 MCP 客户端）
 
@@ -171,5 +186,6 @@ npm start
 - [x] **阶段 4（v1.2.0）**：透传原则收尾（删掉响应数据语义标记、删掉本地 enum 校验、删掉 _upstream* 冗余字段）、schema 最小化 + description 截断 token 优化、block_write 默认禁 + 手动例外、管理员 Key masked、URL query 认证自动识别
 - [x] **阶段 5（v1.3.0）**：网关自建消耗分 + 调用统计图表（双分展示 + 趋势 + Top 对比）
 - [x] **阶段 6（v1.4.0）**：店铺可见性隔离（bypass 工具返回体也按 user_shops 裁剪，0 行回退 + warn）、网关注入式元工具 `_tool_search` / `_gateway_info`、`extractEmbeddedJson` 从纯文本错误挖出 `upstream_code/trace_id` 准确透传、code=102 自动刷新重试 + 缺 required 参数补注（只报 100% 可信的缺参，类型错不报防误导）、stripMarkdownFence 过滤、descPrefix 极简、版本号单一来源（package.json）
-- [ ] **阶段 7**：write 操作审批、用量看板、告警、调用记录审计日志
+- [x] **阶段 7（v1.5.0–v1.6.1）**：MCP 标准能力——session 模式（混合路由，无 session 向后兼容）+ `list_changed` SSE 推送 + `cancelled` 取消透传（in-flight 注册表 + AbortSignal 透传上游 fetch）；tools_hash 契约（三处一致 + 纯暴露内容口径）；同步业务错误显式透出（领星 help 返回 code≠1 不再静默成 0/0）；工具列表启用状态筛选 + 批量操作筛选防护；annotations 语义修正（NocoDB callTool/exportCsv → `readOnlyHint:false + destructiveHint:true`）
+- [ ] **阶段 8**：write 操作审批、用量看板、告警、调用记录审计日志
 - ~~响应数据语义标记~~（is_placeholder_row / _formulas / 本地 enum 校验等）— **已关闭**，不符合网关设计原则
