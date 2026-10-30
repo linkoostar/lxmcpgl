@@ -643,7 +643,7 @@ apiRouter.post(
   '/tools/batch-enabled',
   requireAuth,
   wrap(async (req, res) => {
-    const { items, tool_ids, all, q, upstream } = req.body ?? {};
+    const { items, tool_ids, all, q, upstream, filter_enabled } = req.body ?? {};
     const enabled = !!req.body?.enabled;
     if (!Array.isArray(items) && !Array.isArray(tool_ids) && all !== true) {
       res.status(400).json({ error: '请提供 items / tool_ids 或 all=true' });
@@ -658,6 +658,7 @@ apiRouter.post(
         all: all === true,
         q: String(q ?? ''),
         upstream: String(upstream ?? '').trim() || undefined,
+        filter_enabled: filter_enabled === 0 || filter_enabled === 1 || filter_enabled === '0' || filter_enabled === '1' ? filter_enabled : undefined,
       },
       enabled
     );

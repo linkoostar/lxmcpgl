@@ -86,7 +86,7 @@ document.querySelectorAll('.nav-btn').forEach((b) => b.addEventListener('click',
 
 /* ---------- 工具列表（含批量选择） ---------- */
 
-const toolState = { q: '', page: 1, pageSize: 50, toolType: '', upstream: '', shopScope: '', total: 0, selected: new Set(), selectFiltered: false };
+const toolState = { q: '', page: 1, pageSize: 50, toolType: '', upstream: '', shopScope: '', enabled: '', total: 0, selected: new Set(), selectFiltered: false };
 
 /** 工具列表页切到时，把后端 upstream 列表灌进筛选 select（带工具数） */
 async function populateUpstreamFilter() {
@@ -121,6 +121,7 @@ async function loadTools() {
   if (toolState.toolType) params.set('tool_type', toolState.toolType);
   if (toolState.upstream) params.set('upstream', toolState.upstream);
   if (toolState.shopScope) params.set('shop_scope', toolState.shopScope);
+  if (toolState.enabled !== '') params.set('enabled', toolState.enabled);
   const data = await api('/tools?' + params);
   toolState.total = data.total;
   $('#page-info').textContent = `共 ${data.total} 个工具 · 第 ${toolState.page} / ${Math.max(1, Math.ceil(data.total / toolState.pageSize))} 页`;
@@ -259,6 +260,7 @@ $('#btn-search').addEventListener('click', () => {
   toolState.toolType = $('#tool-type-filter').value;
   toolState.upstream = $('#tool-upstream-filter').value;
   toolState.shopScope = $('#tool-shop-scope-filter').value;
+  toolState.enabled = $('#tool-enabled-filter').value;
   toolState.page = 1;
   toolState.selected.clear(); toolState.selectFiltered = false; updateBatchBar();
   loadTools().catch((e) => toast(e.message));
@@ -267,6 +269,7 @@ $('#tool-search').addEventListener('keydown', (e) => { if (e.key === 'Enter') $(
 $('#tool-type-filter').addEventListener('change', () => $('#btn-search').click());
 $('#tool-upstream-filter').addEventListener('change', () => $('#btn-search').click());
 $('#tool-shop-scope-filter').addEventListener('change', () => $('#btn-search').click());
+$('#tool-enabled-filter').addEventListener('change', () => $('#btn-search').click());
 $('#btn-prev').addEventListener('click', () => {
   if (toolState.page > 1) { toolState.page--; loadTools().catch((e) => toast(e.message)); }
 });
@@ -292,6 +295,8 @@ $('#btn-select-filtered').addEventListener('click', async () => {
     const params = new URLSearchParams({ q: toolState.q, page, page_size: 50 });
     if (toolState.toolType) params.set('tool_type', toolState.toolType);
     if (toolState.upstream) params.set('upstream', toolState.upstream);
+    if (toolState.shopScope) params.set('shop_scope', toolState.shopScope);
+    if (toolState.enabled !== '') params.set('enabled', toolState.enabled);
     const d = await api('/tools?' + params);
     for (const it of d.items) toolState.selected.add(toolKey(it.upstream, it.tool_id));
     if (page * 50 >= d.total) break;
@@ -313,7 +318,7 @@ $('#btn-clear-select').addEventListener('click', () => {
 async function batchApply(enabled) {
   try {
     const body = toolState.selectFiltered
-      ? { all: true, q: toolState.q, upstream: toolState.upstream, enabled }
+      ? { all: true, q: toolState.q, upstream: toolState.upstream, filter_enabled: toolState.enabled, enabled }
       : {
           items: [...toolState.selected].map((k) => {
             const i = k.indexOf('::');

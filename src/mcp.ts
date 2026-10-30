@@ -846,8 +846,13 @@ function buildServer(identity: McpIdentity): Server {
           description: truncated,
           inputSchema: minimizeSchema(safeParseSchema(r.input_schema)),
           // MCP 标准 annotations：直接暴露网关已有的 tool_type 判定（sync 时定，block_write 拦截同源），
-          // 客户端可自动识别只读边界，不依赖自定义黑名单。只报 readOnlyHint——destructive 需要业务推断，不做。
-          annotations: { readOnlyHint: (r.tool_type ?? '').toLowerCase() !== 'write' },
+          // 客户端可自动识别只读边界，不依赖自定义黑名单。
+          // 例外（网关自造标注网关负责准确）：NocoDB callTool 是任意工具透传入口（可派发写操作）、
+          // exportCsv 会往存储写文件——tool_type 判 read 但并非只读，显式标 destructiveHint。
+          annotations:
+            r.upstream === 'nocodb' && (r.tool_id === 'callTool' || r.tool_id === 'exportCsv')
+              ? { readOnlyHint: false, destructiveHint: true }
+              : { readOnlyHint: (r.tool_type ?? '').toLowerCase() !== 'write' },
         };
       }), ...builtinTools],
       _meta: {

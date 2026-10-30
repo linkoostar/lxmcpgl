@@ -385,6 +385,8 @@ export function batchSetEnabled(
     all?: boolean;
     q?: string;
     upstream?: string;
+    /** 批量模式下按当前启用状态过滤（'' / undefined = 不过滤），防止「选中全部搜索结果」误伤筛选外的工具 */
+    filter_enabled?: string | number;
   },
   enabled: boolean
 ): number {
@@ -417,6 +419,10 @@ export function batchSetEnabled(
       params.push(`%${q}%`, `%${q}%`, `%${q}%`);
     }
     if (opts.upstream) { conds.push('upstream = ?'); params.push(opts.upstream); }
+    if (opts.filter_enabled === 0 || opts.filter_enabled === 1 || opts.filter_enabled === '0' || opts.filter_enabled === '1') {
+      conds.push('enabled = ?');
+      params.push(Number(opts.filter_enabled));
+    }
     const where = conds.length > 0 ? `WHERE ${conds.join(' AND ')}` : '';
     return db.prepare(`UPDATE tools SET enabled = ? ${where}`).run(...params).changes;
   }
