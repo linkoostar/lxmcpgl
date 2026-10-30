@@ -378,7 +378,9 @@ $('#btn-sync').addEventListener('click', async () => {
   try {
     const r = await api('/tools/sync', { method: 'POST' });
     $('#sync-status').textContent = `上次同步：${new Date().toLocaleString()}`;
-    toast(`同步完成：清单 ${r.total_listed}，入库 ${r.synced}，缺 Schema ${r.schema_missing}，失败 ${r.failed}（${(r.duration_ms / 1000).toFixed(1)}s）`);
+    const errUps = r.results ? Object.entries(r.results).filter(([, v]) => v.errors && v.errors.length) : [];
+    const errText = errUps.length ? ` ⚠️ ${errUps.map(([k, v]) => `${k}: ${String(v.errors[0]).slice(0, 60)}`).join('；')}` : '';
+    toast(`同步完成：清单 ${r.total_listed}，入库 ${r.synced}，缺 Schema ${r.schema_missing}，失败 ${r.failed}（${(r.duration_ms / 1000).toFixed(1)}s）${errText}`);
     loadTools().catch(() => {});
   } catch (e) {
     $('#sync-status').textContent = '';
@@ -947,8 +949,9 @@ $('#btn-sync-all-up').addEventListener('click', async () => {
   el.textContent = '同步中…';
   try {
     const r = await api('/upstreams/sync-all', { method: 'POST' });
-    const parts = Object.entries(r.results).map(([k, v]) => `${k}: ${v.synced}/${v.total_listed}`);
-    el.textContent = `✅ 共 ${r.synced} 工具（${parts.join(' · ')}）`;
+    const parts = Object.entries(r.results).map(([k, v]) => `${k}: ${v.synced}/${v.total_listed}` + (v.errors && v.errors.length ? `（❌ ${String(v.errors[0]).slice(0, 80)}）` : ''));
+    const anyErr = Object.values(r.results).some((v) => v.errors && v.errors.length);
+    el.textContent = `${anyErr ? '⚠️' : '✅'} 共 ${r.synced} 工具（${parts.join(' · ')}）`;
     loadSettings().catch(() => {});
   } catch (e) { el.textContent = '❌ ' + e.message; }
 });

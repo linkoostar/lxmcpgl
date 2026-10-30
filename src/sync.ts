@@ -245,6 +245,11 @@ async function fetchAllListedTools(client: UpstreamClient): Promise<{ tools: Map
     if (resp?.error) throw new Error(`help 调用失败: ${JSON.stringify(resp.error).slice(0, 300)}`);
     const payload = unwrapCallResult(resp);
     const { items, total: t } = extractToolPage(payload);
+    // 上游业务错误藏在 content text 里（HTTP 200 + JSON-RPC 正常，如 {"code":503,"msg":"服务繁忙[503]"}）。
+    // 不能静默当成「0 个工具」——否则前端只显示 0/0，看不出同步其实失败了。
+    if (items.length === 0 && payload && typeof payload === 'object' && typeof (payload as any).code === 'number' && (payload as any).code !== 1) {
+      throw new Error(`help 业务错误 code=${(payload as any).code}: ${String((payload as any).msg ?? (payload as any).data?.msg ?? '').slice(0, 120)}`);
+    }
     if (t !== undefined) total = t;
     if (items.length === 0) break;
     let fresh = 0;
