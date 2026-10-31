@@ -34,6 +34,14 @@ import {
   getUpstreamToolCounts,
   maskUpstreamKey,
   setToolShopScope,
+  getBillingRates,
+  setBillingRates,
+  getMonthlyBillingReport,
+  isValidYearMonth,
+  currentYearMonthCn,
+  DEFAULT_BILLING_RATES,
+  type BillingRatesConfig,
+  type BillingRate,
 } from './db.js';
 import { config, META_TOOLS } from './config.js';
 import { getUpstreamClient, resetUpstreamClient, UpstreamError } from './upstream.js';
@@ -1103,7 +1111,127 @@ apiRouter.delete(
   wrap(async (req, res) => {
     const days = Math.max(1, parseInt(String(req.query.days ?? '30'), 10) || 30);
     const deleted = cleanupCallLogs(days);
-    res.json({ ok: true, deleted, before_days: days });
+    // 费用分摊报表以 call_logs 为数据源：提示管理员先导出财务月份再清理
+    const cutoffCn = new Date(Date.now() - days * 24 * 3600 * 1000 + 8 * 3600_000).toISOString().slice(0, 10);
+    res.json({
+      ok: true,
+      deleted,
+      before_days: days,
+      billing_warning: `已删除 ${cutoffCn}（含）之前的调用日志，更早月份的费用分摊报表将不再完整，请先导出需要保留的财务月份`,
+    });
+  })
+);
+
+// ---------- 费用分摊（月度对账） ----------
+
+const BILLING_RATE_KEYS = ['credit_price', 'call_price', 'point_price'] as const;
+
+/** 校验并规范化单价配置；非法输入返回错误文案，合法返回消毒后的完整配置 */
+function sanitizeBillingRates(body: unknown): { ok: true; cfg: BillingRatesConfig } | { ok: false; error: string } {
+  if (!body || typeof body !== 'object') return { ok: false, error: '请求体必须是 JSON 对象' };
+  const b = body as Record<string, unknown>;
+  const out: BillingRatesConfig = { rates: {}, default_point_price: 0 };
+  const dpp = b.default_point_price;
+  if (typeof dpp !== 'number' || !Number.isFinite(dpp) || dpp < 0 || dpp > 1e6) {
+    return { ok: false, error: 'default_point_price 必须是 0 ~ 1000000 之间的数字' };
+  }
+  out.default_point_price = Math.round(dpp * 1e6) / 1e6;
+  const rawRates = b.rates;
+  if (rawRates !== undefined && (rawRates === null || typeof rawRates !== 'object' || Array.isArray(rawRates))) {
+    return { ok: false, error: 'rates 必须是 { upstream: { 单价 } } 形式的对象' };
+  }
+  for (const [upstream, r] of Object.entries((rawRates ?? {}) as Record<string, unknown>)) {
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(upstream)) {
+      return { ok: false, error: `非法的上游标识: ${upstream.slice(0, 32)}` };
+    }
+    if (r === undefined) continue;
+    if (r === null || typeof r !== 'object' || Array.isArray(r)) {
+      return { ok: false, error: `上游 ${upstream} 的单价必须是对象` };
+    }
+    const item: BillingRate = {};
+    for (const key of BILLING_RATE_KEYS) {
+      const v = (r as Record<string, unknown>)[key];
+      if (v === undefined) continue;
+      if (typeof v !== 'number' || !Number.isFinite(v) || v < 0 || v > 1e6) {
+        return { ok: false, error: `上游 ${upstream} 的 ${key} 必须是 0 ~ 1000000 之间的数字` };
+      }
+      (item as Record<string, number | undefined>)[key] = Math.round(v * 1e6) / 1e6;
+    }
+    if (Object.keys(item).length > 0) out.rates[upstream] = item;
+  }
+  return { ok: true, cfg: out };
+}
+
+apiRouter.get(
+  '/billing/rates',
+  requireAuth,
+  wrap(async (_req, res) => {
+    res.json({ rates: getBillingRates(), defaults: DEFAULT_BILLING_RATES, upstreams: listUpstreams().map((u) => u.id) });
+  })
+);
+
+apiRouter.put(
+  '/billing/rates',
+  requireAuth,
+  wrap(async (req, res) => {
+    const r = sanitizeBillingRates(req.body);
+    if (!r.ok) {
+      res.status(400).json({ error: r.error });
+      return;
+    }
+    setBillingRates(r.cfg);
+    res.json({ ok: true, rates: getBillingRates() });
+  })
+);
+
+function parseBillingMonth(req: Request): { ok: true; month: string } | { ok: false; error: string } {
+  const month = String(req.query.month ?? '').trim() || currentYearMonthCn();
+  if (!isValidYearMonth(month)) return { ok: false, error: 'month 参数必须是 YYYY-MM 形式（如 2026-05）' };
+  return { ok: true, month };
+}
+
+apiRouter.get(
+  '/billing/report',
+  requireAuth,
+  wrap(async (req, res) => {
+    const m = parseBillingMonth(req);
+    if (!m.ok) {
+      res.status(400).json({ error: m.error });
+      return;
+    }
+    res.json(getMonthlyBillingReport(m.month));
+  })
+);
+
+apiRouter.get(
+  '/billing/export.csv',
+  requireAuth,
+  wrap(async (req, res) => {
+    const m = parseBillingMonth(req);
+    if (!m.ok) {
+      res.status(400).json({ error: m.error });
+      return;
+    }
+    const report = getMonthlyBillingReport(m.month);
+    const headers = ['月份', '运营账号', '上游平台', '总调用数', '成功调用', '失败调用', '空壳调用', '消耗Credits', '自建分', '分摊金额(元)'];
+    const esc = (v: unknown) => {
+      const s = v == null ? '' : String(v);
+      if (/[",\r\n]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
+      return s;
+    };
+    const rows = report.items.map((it) => [
+      report.year_month, it.caller, it.upstream, it.total_calls,
+      it.success_calls, it.failed_calls, it.empty_shell_calls,
+      it.total_credits, it.total_points, it.cost_cny.toFixed(2),
+    ].map(esc).join(','));
+    const totalRow = [
+      '总计', '', '', report.summary.total_calls, report.summary.success_calls,
+      '', '', report.summary.total_credits, report.summary.total_points, report.summary.total_cny.toFixed(2),
+    ].map(esc).join(',');
+    const csv = '\uFEFF' + [headers.join(','), ...rows, totalRow].join('\r\n'); // BOM + CRLF，Excel 中文环境直接打开
+    res.setHeader('Content-Disposition', `attachment; filename=billing_${report.year_month}.csv`);
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.send(csv);
   })
 );
 
