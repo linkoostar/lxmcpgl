@@ -2,7 +2,12 @@
 
 多上游 MCP 聚合中转网关：领星 ERP（元工具模式 `help → search → action`，289+ 业务工具）、西柚（广告/ABA 分析）、SIF（市场/流量）、NocoDB（数据层）等统一接入，对外以标准 MCP streamable HTTP 暴露。
 
-**v1.6.1** — MCP 标准能力落地：session 模式 + `notifications/tools/list_changed` 主动推送 + `notifications/cancelled` 取消透传；tools_hash 变更感知契约（三处一致、纯暴露内容口径）；同步业务错误显式透出（不再静默显示 0/0）；工具列表启用状态筛选；NocoDB `callTool`/`exportCsv` annotations 语义修正。
+**v1.7.0** — 店铺权限模型重做：调用校验改为「工具 schema 声明 + 请求携带」（防给全局工具塞 sid 绕过）、缺店铺参数返回真错误、session 身份每请求刷新 + 数量上限、`all_tools` 不再绕过 block_write、同步改先拉取后单事务写入、新增内置工具 `_tool_schema`、Chart.js 本地化、管理员 Key 恒定时间比较、Cookie Secure 条件化（`TRUST_PROXY`）。
+
+> **升级到 v1.7.0 注意**：店铺校验改为按工具自身 schema 判定 ——
+> ① 升级后执行一次 `UPDATE tools SET shop_scope='unreviewed' WHERE shop_scope='global_safe';` 重置历史例外值，之后只由管理员手工添加例外；
+> ② 检查各运营的工具白名单，移出无店铺参数的工具，不要开 all_tools；
+> ③ 全部旧 session 失效，客户端重新 initialize 即可（预期行为）。
 
 ## 设计原则（重要）
 
@@ -32,13 +37,13 @@
 | **协议转换** | 领星元工具模式嵌套 `{toolId, params}` 自动处理；flat-mcp（西柚/SIF/NocoDB）直接透传；URL query 认证（如 SIF `?secret-key=`）、API Key header、自定义 headers 三种认证方式自动识别 |
 | **错误通道归一** | 领星双层响应（外层 `success:true code:1` 掩盖内层 `success:false code:0`）→ 挖到 MCP `isError:true`；西柚等 HTTP 风格 `status≥400 + error:true` → 同样归一，带 `upstream_code` / `trace_id` |
 | **只读裁剪** | write 工具对运营默认拦截（block_write=1），需管理员手动例外才能放行 |
-| **店铺隔离（仅领星）** | `adapter=lingxing-meta` 强制 shop_scoped — 递归提取所有层级/数组内的店铺字段（`sid / sids / store_id / profile_id / seller_id` 等），四种 ID 映射到 sid 后 every 校验，fail-closed 拒绝非白名单店铺调用 + 响应裁剪 |
-| **Token 优化** | schema 最小化（丢 description/title/pattern/additionalProperties/$defs，保留 type/enum/required/items 递归）+ description 截断 300 chars → tools/list 从 ~80K tokens 降到 ~69K tokens（-14%） |
+| **店铺隔离（仅领星）** | 由工具自身 schema 声明判定：递归扫描 input_schema（含嵌套/数组/联合类型）得出声明的店铺字段，请求必须在这些字段上携带店铺值，四种 ID（`sid / sids / store_id / profile_id / seller_id` 等）映射到 sid 后 every 校验，fail-closed 拒绝非白名单店铺调用 + 响应裁剪；无店铺参数的全局工具对受限运营默认拒绝，管理员可加例外清单（`shop_scope=global_safe`）；单店运营调 read 工具未传店铺时自动注入 schema 声明的字段 |
+| **Token 优化** | schema 最小化（丢 description/title/pattern/additionalProperties/$defs，保留 type/enum/required/items 递归）+ description 截断 300 chars → tools/list 从 ~80K tokens 降到 ~69K tokens（-14%）；完整 schema 经内置工具 `_tool_schema` 按需获取（参数报错时自查，不占 tools/list 预算） |
 | **可观测性** | `upstream_code` 回填上游原始码、`trace_id` 贯通全链路、调用日志入库 + CSV 导出 + Credits 追溯 |
-| **MCP 标准能力** | session 模式：initialize 建立 `mcp-session-id`，GET `/mcp` 开 SSE 通知流，DELETE 关闭；工具定义变化向全部存活 session 推 `notifications/tools/list_changed`；`notifications/cancelled` 按 requestId abort 进行中的上游调用（AbortSignal 全链路透传，session/无状态双模式均可用）；`capabilities.tools.listChanged=true` 名副其实。不带 session 的请求走无状态路径，完全向后兼容 |
-| **安全** | 下游 Key 随机生成 + SHA-256 存储 + 每次请求查库；管理员 Key 设置页默认 masked 显示 + 👁 按需明文；店铺校验 fail-closed 兜底；SQLite 用预编译语句 |
+| **MCP 标准能力** | session 模式：initialize 建立 `mcp-session-id`，GET `/mcp` 开 SSE 通知流，DELETE 关闭；工具定义变化向全部存活 session 推 `notifications/tools/list_changed`；`notifications/cancelled` 按 requestId abort 进行中的上游调用（AbortSignal 全链路透传，session/无状态双模式均可用）；session 身份每请求从 DB 刷新（后台改权限即时生效）+ 数量上限（全局 200 / 单身份 10，空闲 4h 清理，超限淘汰需重新 initialize）；`capabilities.tools.listChanged=true` 名副其实。不带 session 的请求走无状态路径，完全向后兼容 |
+| **安全** | 下游 Key 随机生成 + SHA-256 存储 + 每次请求查库；管理员通用 Key 恒定时间比较（sha256 + timingSafeEqual）；管理员 Key 设置页默认 masked 显示 + 👁 按需明文；管理后台 Cookie HTTPS 下自动带 Secure（`TRUST_PROXY`）；店铺校验 fail-closed 兜底；SQLite 用预编译语句 |
 | **Web 管理后台** | 上游配置 + 连通测试 + 工具同步启停；下游 Key 管理 + 店铺同步；工具列表筛选 + 批量启停 + 批量 write 分配；调用日志浏览 + CSV 导出 |
-| **定期同步** | `PERIODIC_SYNC_INTERVAL_MS` 驱动定时全量 sync + schema hash（canonicalize 后 SHA-256 前 16 位）对比；领星 code=102 自动刷新 schema 重试 |
+| **定期同步** | `PERIODIC_SYNC_INTERVAL_MS` 驱动定时全量 sync + schema hash（canonicalize 后 SHA-256 前 16 位）对比；拉取与写入分离——全部拉完在单个 SQLite 事务里批量落库（请求读不到半同步状态），单工具失败保留旧 schema，领星 code=102 自动刷新 schema 重试 |
 
 ## 多上游接入
 
@@ -84,9 +89,10 @@ mkdir -p data && docker compose up -d
 
 「运营用户」页可创建多个运营账号，每个账号独立 Bearer Key（数据库只存 SHA-256 哈希）、可单独停用 / 重置 / 删除、限速（次/分钟）。点「权限」可为每个账号配置：
 
-- **工具白名单**：全部工具（需注意：`admin123` 默认模板只填 read 类）或自定义勾选（支持搜索、全选、清空）；白名单外的工具在 `tools/list` 中不可见，调用也会被拒
-- **店铺白名单**：全部店铺 或 自定义勾选（先在「系统设置」→「同步店铺」拉取领星店铺，从 `get_my_sids` + `ad_auth_shops` 双接口补全 `sid / seller_id / store_id / profile_id` 四值域）；调用时递归提取所有层级/数组内的店铺字段，映射到 sid 后 every 校验，未授权店铺直接拒绝
-- **写操作管控**：全局默认开启（`block_write=1`），运营不能调用任何 write 类工具。需开放某一个时，在工具权限里**手动勾选**即可放行（不影响其他 write 工具）。write 类型来自上游标记，缺失时按工具名动词归类，可在工具列表查看每行的类型标签
+- **工具白名单**：全部工具（需注意：`admin123` 默认模板只填 read 类）或自定义勾选（支持搜索、全选、清空）；白名单外的工具在 `tools/list` 中不可见，调用也会被拒；白名单 id 口径统一为上游 `tool_id`
+- **店铺白名单**：全部店铺 或 自定义勾选（先在「系统设置」→「同步店铺」拉取领星店铺，从 `get_my_sids` + `ad_auth_shops` 双接口补全 `sid / seller_id / store_id / profile_id` 四值域）；调用时按**工具 schema 自己声明的店铺字段**校验——请求必须在这些字段上携带店铺值且全部落在白名单内（未授权店铺直接拒绝），工具没声明的店铺参数（如手塞 `sid`）不作为放行依据；单店运营调 read 工具未传店铺时自动注入 schema 声明的字段
+- **全局工具例外清单**：没有店铺参数的全局工具（供应商、采购价、汇率等）对受限运营默认**拒绝**；确需开放的由管理员在工具列表将该工具的店铺范围设为 `global_safe`
+- **写操作管控**：全局默认开启（`block_write=1`），运营不能调用任何 write 类工具。需开放某一个时，在工具权限里**手动勾选**即可放行（不影响其他 write 工具）；`all_tools=1` 只放宽读工具可见范围，**写操作必须显式勾选**。write 类型来自上游标记，缺失时按工具名动词归类（含驼峰切分），可在工具列表查看每行的类型标签
 
 管理员通用 Key（系统设置页）拥有全部工具与店铺权限，不受白名单和写管控限制。**设置页默认 masked 显示，点击 👁 才显示明文**。
 
@@ -140,9 +146,10 @@ mkdir -p data && docker compose up -d
 | `LINGXING_MCP_URL` | 领星官方地址 | 上游地址（仅首次生效） |
 | `LINGXING_MCP_KEY` | 空 | 领星 X-Mcp-Key（仅首次生效） |
 | `LX_COOKIE_SUFFIX` | 端口号 | 管理后台 session cookie 后缀，同域名多实例**必须设不同值**（如 `prod1` / `gray`），否则互相踢下线 |
+| `TRUST_PROXY` | 空 | 反代 TLS 终止场景设 `1`（或代理 IP/子网逗号分隔列表）启用 trust proxy，HTTPS 请求下管理后台 Cookie 自动带 Secure；默认关闭，局域网 HTTP 直连部署不受影响 |
 | `PERIODIC_SYNC_INTERVAL_MS` | `0`（关闭） | 定期全量同步上游工具定义 + hash 对比；设为 `600000` 即每 10 分钟同步一次 |
 
-> 以上环境变量中，`LX_COOKIE_SUFFIX` / `PERIODIC_SYNC_INTERVAL_MS` 每次启动时读取（运行时可改）；其余几个仅首次启动写入数据库，之后以 Web 后台配置为准。
+> 以上环境变量中，`LX_COOKIE_SUFFIX` / `PERIODIC_SYNC_INTERVAL_MS` / `TRUST_PROXY` 每次启动时读取（运行时可改）；其余几个仅首次启动写入数据库，之后以 Web 后台配置为准。
 
 ## 从源码构建
 
@@ -169,7 +176,7 @@ npm start
 | # | 项 | 严重度 | 说明 |
 |---|------|--------|------|
 | 1 | 改 admin 密码 | 🔴 必改 | docker-compose 默认 `admin123` |
-| 2 | HTTPS 反代 | 🔴 必加 | Cookie 无 Secure，Bearer key 明文传输 |
+| 2 | HTTPS 反代 | 🔴 必加 | Bearer key 明文传输；反代终止 TLS 时设 `TRUST_PROXY=1`，管理后台 Cookie 才会带 Secure |
 | 3 | 数据目录权限 | 🔴 必锁 | `chmod 600 ./data/*.db`；明文 SQLite 含所有上游 Key + 下游 Key 哈希 |
 | 4 | ghcr.io 换本地 build | 🟡 建议 | 别用 `pull_policy: always` + `:latest`，改成本地 `docker build` 固定 tag |
 | 5 | LX_COOKIE_SUFFIX | 🟡 多实例必须 | 同域名多实例**必须设不同值**，否则 session 互相踢下线 |
@@ -187,5 +194,6 @@ npm start
 - [x] **阶段 5（v1.3.0）**：网关自建消耗分 + 调用统计图表（双分展示 + 趋势 + Top 对比）
 - [x] **阶段 6（v1.4.0）**：店铺可见性隔离（bypass 工具返回体也按 user_shops 裁剪，0 行回退 + warn）、网关注入式元工具 `_tool_search` / `_gateway_info`、`extractEmbeddedJson` 从纯文本错误挖出 `upstream_code/trace_id` 准确透传、code=102 自动刷新重试 + 缺 required 参数补注（只报 100% 可信的缺参，类型错不报防误导）、stripMarkdownFence 过滤、descPrefix 极简、版本号单一来源（package.json）
 - [x] **阶段 7（v1.5.0–v1.6.1）**：MCP 标准能力——session 模式（混合路由，无 session 向后兼容）+ `list_changed` SSE 推送 + `cancelled` 取消透传（in-flight 注册表 + AbortSignal 透传上游 fetch）；tools_hash 契约（三处一致 + 纯暴露内容口径）；同步业务错误显式透出（领星 help 返回 code≠1 不再静默成 0/0）；工具列表启用状态筛选 + 批量操作筛选防护；annotations 语义修正（NocoDB callTool/exportCsv → `readOnlyHint:false + destructiveHint:true`）
+- [x] **阶段 7.5（v1.7.0）**：店铺权限模型重做——调用校验改为「工具 schema 声明 + 请求携带」（递归扫描 input_schema 判定声明字段，防给全局工具塞 sid 绕过）、无店铺参数的全局工具对受限运营默认拒绝（例外清单 `global_safe`）、缺店铺参数返回真错误（`isError:true`，日志记拒绝）、session 身份每请求从 DB 刷新 + 数量上限（全局 200 / 单身份 10，空闲 4h）、`all_tools` 不再绕过 block_write + 白名单 id 口径统一（上游 tool_id）、同步改先拉取后单事务写入（请求读不到半同步状态）、内置工具 `_tool_schema`（agent 报参数错时自查完整入参说明）、Chart.js 本地化 + SRI、管理员 Key 恒定时间比较、Cookie Secure 条件化（`TRUST_PROXY`）、写动词表合并 + 驼峰漏判修复、stripMarkdownFence 不再重序列化（大整数精度）、嵌入式 JSON 提取仅限错误场景、店铺目录工具不再回退展示全部店铺
 - [ ] **阶段 8**：write 操作审批、用量看板、告警、调用记录审计日志
 - ~~响应数据语义标记~~（is_placeholder_row / _formulas / 本地 enum 校验等）— **已关闭**，不符合网关设计原则
