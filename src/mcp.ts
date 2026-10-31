@@ -18,9 +18,9 @@ import {
   insertCallLog,
   listUpstreams,
   parseUpstreamHeaders,
-  SHOP_PARAM_KEYS,
   declaredShopFieldsOf,
   collectShopFieldsPresent,
+  collectShopRefs,
   type UserRow,
 } from './db.js';
 import { getUpstreamClient } from './upstream.js';
@@ -445,46 +445,7 @@ function checkRateLimit(userId: number, limitPerMin: number): boolean {
 }
 
 // ---------- 店铺参数校验 ----------
-// 统一用 db.SHOP_PARAM_KEYS（全项目共用一份，避免口径漂移）
-
-/**
- * 递归提取请求参数里的所有店铺引用。
- *
- * 审计复现：旧版 collectShopRefs 只扫顶层 + 一层嵌套对象，不扫数组内对象
- * → {items:[{sid:"9999"}]}、{a:{b:{sid:"9999"}}} 全部漏掉 → shopRefs=0 →
- * shopRequired 判断错误 → 校验被绕过。
- *
- * 新版：深度 6，遍历所有层级所有数组元素。
- */
-function collectShopRefs(args: Record<string, unknown>): string[] {
-  const out: string[] = [];
-  const visit = (node: unknown, depth = 0) => {
-    if (depth > 6 || node === null || node === undefined) return;
-    if (Array.isArray(node)) {
-      for (const item of node) visit(item, depth + 1);
-      return;
-    }
-    if (typeof node === 'object') {
-      for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
-        const key = k.toLowerCase();
-        if (SHOP_PARAM_KEYS.has(key)) {
-          // 店铺字段 → 提取值
-          if (typeof v === 'string') {
-            v.split(',').map((s) => s.trim()).filter(Boolean).forEach((s) => out.push(s));
-          } else if (Array.isArray(v)) {
-            v.map((x) => String(x)).filter(Boolean).forEach((x) => out.push(x));
-          } else if (typeof v === 'number' || typeof v === 'bigint') {
-            out.push(String(v));
-          }
-        }
-        // 无论是不是店铺字段，都递归子节点
-        if (v && typeof v === 'object') visit(v, depth + 1);
-      }
-    }
-  };
-  visit(args);
-  return [...new Set(out)];
-}
+// 统一用 db.SHOP_PARAM_KEYS / db.collectShopRefs（全项目共用一份，避免口径漂移）
 
 // ---------- 上游调用（code-102 自动刷新 Schema 重试） ----------
 

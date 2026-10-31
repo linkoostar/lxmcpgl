@@ -9,7 +9,6 @@
 
 import type { UpstreamClient } from './upstream.js';
 import { withExternalSignal } from './upstream.js';
-import { SHOP_PARAM_KEYS } from './db.js';
 
 /** upstream 配置行（从 upstreams 表读） */
 export interface UpstreamConfig {
@@ -80,12 +79,6 @@ export interface UpstreamAdapter {
     args: Record<string, unknown>,
     opts?: { signal?: AbortSignal }
   ): Promise<McpCallResult>;
-
-  /**
-   * 从参数里提取店铺引用（sid / profile_id / seller_id / store_id…）
-   * 用于网关店铺白名单校验 + call_logs
-   */
-  extractShopRefs(args: Record<string, unknown>): string[];
 
   /**
    * 从 call 返回里挖上游的 cost_credits / ￥ / token 消耗
@@ -403,39 +396,6 @@ class LingxingMetaAdapter implements UpstreamAdapter {
       return false;
     }
   }
-  extractShopRefs(args: Record<string, unknown>): string[] {
-    const out: string[] = [];
-    // 递归遍历，解决审计发现的四种漏掉场景：
-    // - 数组内对象（items:[{sid:"9999"}]）
-    // - 嵌套两层（{a:{b:{sid:"9999"}}}）
-    // - 非字符串值（数字 sid 等）
-    const visit = (node: unknown, depth = 0) => {
-      if (depth > 5 || node === null || node === undefined) return;
-      if (Array.isArray(node)) {
-        node.forEach((item) => visit(item, depth + 1));
-        return;
-      }
-      if (typeof node === 'object') {
-        const obj = node as Record<string, unknown>;
-        for (const [k, v] of Object.entries(obj)) {
-          if (SHOP_PARAM_KEYS.has(k)) {
-            if (typeof v === 'string') {
-              v.split(',').map((s) => s.trim()).filter(Boolean).forEach((s) => out.push(s));
-            } else if (Array.isArray(v)) {
-              v.map((x) => String(x)).filter(Boolean).forEach((x) => out.push(x));
-            } else if (typeof v === 'number' || typeof v === 'bigint') {
-              out.push(String(v));
-            }
-          }
-          // 递归子节点
-          if (v && typeof v === 'object') visit(v, depth + 1);
-        }
-      }
-    };
-    visit(args);
-    return [...new Set(out)];
-  }
-
   extractCost(_contentText: string | null | undefined): number | null {
     // 领星免费版不返回 cost
     return null;
@@ -570,35 +530,6 @@ class FlatMcpAdapter implements UpstreamAdapter {
     } catch {
       return false;
     }
-  }
-
-  extractShopRefs(args: Record<string, unknown>): string[] {
-    // 扁平 MCP 也用 db.SHOP_PARAM_KEYS + 递归逻辑，统一口径
-    const out: string[] = [];
-    const visit = (node: unknown, depth = 0) => {
-      if (depth > 5 || node === null || node === undefined) return;
-      if (Array.isArray(node)) {
-        node.forEach((item) => visit(item, depth + 1));
-        return;
-      }
-      if (typeof node === 'object') {
-        const obj = node as Record<string, unknown>;
-        for (const [k, v] of Object.entries(obj)) {
-          if (SHOP_PARAM_KEYS.has(k)) {
-            if (typeof v === 'string') {
-              v.split(',').map((s) => s.trim()).filter(Boolean).forEach((s) => out.push(s));
-            } else if (Array.isArray(v)) {
-              v.map((x) => String(x)).filter(Boolean).forEach((x) => out.push(x));
-            } else if (typeof v === 'number' || typeof v === 'bigint') {
-              out.push(String(v));
-            }
-          }
-          if (v && typeof v === 'object') visit(v, depth + 1);
-        }
-      }
-    };
-    visit(args);
-    return [...new Set(out)];
   }
 
   extractCost(contentText: string | null | undefined): number | null {
