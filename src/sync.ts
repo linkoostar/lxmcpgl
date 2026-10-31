@@ -220,6 +220,48 @@ async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T, index: nu
   return results;
 }
 
+// ---------- 写库阶段 ----------
+
+/** 待写入的工具定义（拉取阶段收集，写库阶段批量提交） */
+type ToolUpsert = {
+  tool_id: string;
+  exposed_name: string;
+  name: string;
+  description: string;
+  input_schema: string | null;
+  raw?: string | null;
+  tool_type: string;
+  upstream?: string;
+};
+
+/**
+ * 写库阶段：一次同步事务批量 upsert。
+ * 拉取阶段（含 await）只把结果收集到内存，全部完成后在这里一次性提交 ——
+ * 请求线程不会读到「一半新一半旧」的工具定义。
+ * extra 在同一事务内执行（例如 shop_scope 建议值回填）。
+ */
+function writeTools(items: ToolUpsert[], extra?: () => void): void {
+  if (items.length === 0 && !extra) return;
+  const tx = db.transaction(() => {
+    for (const t of items) upsertTool(t);
+    if (extra) extra();
+  });
+  tx();
+}
+
+/**
+ * 事务提交后通知客户端工具定义变化（list_changed）。
+ * 动态 import 避开 sync.ts ↔ mcp.ts 的静态循环依赖（mcp.ts 静态 import sync.ts）。
+ */
+async function notifyToolsChanged(): Promise<void> {
+  try {
+    const { checkAndNotifyToolsChanged } = await import('./mcp.js');
+    checkAndNotifyToolsChanged();
+  } catch (e: any) {
+    console.warn(`[sync] 工具变化通知失败: ${String(e?.message || e).slice(0, 120)}`);
+  }
+}
+
 // ---------- 主流程 ----------
 
 async function fetchAllListedTools(client: UpstreamClient): Promise<{ tools: Map<string, { tool_id: string; name: string; description: string; tool_type: string; raw: string }>; listed: number }> {
@@ -269,6 +311,8 @@ export async function syncTools(): Promise<SyncResult> {
 
     let schemaMissing = 0;
     let failed = 0;
+    // 拉取阶段：结果只收集在内存里，不写库
+    const upserts: ToolUpsert[] = [];
 
     const entries = [...tools.values()];
     await mapLimit(entries, 6, async (t) => {
@@ -282,7 +326,7 @@ export async function syncTools(): Promise<SyncResult> {
         const schema = extractSchema(unwrapCallResult(resp));
         const usableSchema = schema && schemaHasFields(schema) ? schema : null;
         if (!usableSchema) schemaMissing++;
-        upsertTool({
+        upserts.push({
           tool_id: t.tool_id,
           exposed_name: sanitizeToolName(t.tool_id),
           name: t.name,
@@ -297,6 +341,9 @@ export async function syncTools(): Promise<SyncResult> {
       }
     });
 
+    // 写库阶段：一次事务批量写入（shop_scope 建议回填同一事务内完成）
+    writeTools(upserts, () => backfillShopScopes());
+
     const result: SyncResult = {
       total_listed: listed,
       synced: tools.size - failed,
@@ -306,8 +353,8 @@ export async function syncTools(): Promise<SyncResult> {
       duration_ms: Date.now() - started,
     };
     setSetting('last_sync_at', new Date().toISOString());
-    // 同步完后自动标记 shop_scope（只覆盖 unreviewed 的，已标记的不碰）
-    backfillShopScopes();
+    // 工具定义可能变了 → 通知客户端（list_changed）
+    await notifyToolsChanged();
 
     // 自动初始化默认权限模板：如果管理员还没配过（default_tools_all=0 且 default_tools 空），
     // 把当前所有 read 类工具 id 填进去，让新建运营自动继承只读模板。
@@ -495,6 +542,8 @@ export async function syncAllUpstreams(): Promise<any> {
   const allMissing = Object.values(results).reduce((s, r) => s + r.schema_missing, 0);
   const allFailed = Object.values(results).reduce((s, r) => s + r.failed, 0);
   const allDuration = Object.values(results).reduce((s, r) => s + r.duration_ms, 0);
+  // 全部 upstream 写库完成后统一通知一次（list_changed）
+  await notifyToolsChanged();
   return {
     results,
     upstream_count: Object.keys(results).length,
@@ -566,6 +615,8 @@ async function syncLingxingMeta(up: { id: string; name: string; url: string; api
   let schemaMissing = 0;
   let failed = 0;
   const errors: string[] = [];
+  // 拉取阶段：结果只收集在内存里，不写库
+  const upserts: ToolUpsert[] = [];
 
   const entries = [...tools.values()];
   await mapLimit(entries, 6, async (t) => {
@@ -579,7 +630,7 @@ async function syncLingxingMeta(up: { id: string; name: string; url: string; api
       const schema = extractSchema(unwrapCallResult(resp));
       const usableSchema = schema && schemaHasFields(schema) ? schema : null;
       if (!usableSchema) schemaMissing++;
-      upsertTool({
+      upserts.push({
         tool_id: t.tool_id,
         exposed_name: sanitizeToolName(t.tool_id),
         name: t.name,
@@ -593,6 +644,9 @@ async function syncLingxingMeta(up: { id: string; name: string; url: string; api
       failed++;
     }
   });
+
+  // 写库阶段：一次事务批量写入（单个工具拉取失败的不入列，保留旧 schema 与旧 hash）
+  writeTools(upserts);
 
   return {
     total_listed: listed,
@@ -609,5 +663,8 @@ export async function syncUpstreamById(id: string): Promise<SyncResult> {
   const up = getUpstream(id);
   if (!up) throw new Error(`upstream ${id} 不存在`);
   if (!up.active) throw new Error(`upstream ${id} 已停用`);
-  return syncOneUpstream(up);
+  const r = await syncOneUpstream(up);
+  // 事务提交后通知一次（list_changed）
+  await notifyToolsChanged();
+  return r;
 }

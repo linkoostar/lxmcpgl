@@ -3,7 +3,7 @@ import path from 'node:path';
 import { config } from './config.js';
 import { initDb, getSetting, sha256, getUserByKeyHash, listUpstreams, type UserRow } from './db.js';
 import { apiRouter, apiErrorHandler } from './web.js';
-import { handleMcpRequest, identityFromUser, type McpIdentity, toolsHashOf, checkAndNotifyToolsChanged } from './mcp.js';
+import { handleMcpRequest, identityFromUser, type McpIdentity, toolsHashOf } from './mcp.js';
 import { syncAllUpstreams } from './sync.js';
 import { buildHealth } from './health.js';
 import type { Request, Response, NextFunction } from 'express';
@@ -141,8 +141,7 @@ async function main(): Promise<void> {
         } else {
           console.log(`[gw] 定期同步完成：${r.synced}/${r.total_listed} 工具，hash 无变化（${Date.now() - started}ms）`);
         }
-        // MCP 标准：工具定义变化（含管理后台启停工具）→ 向 session 客户端推送 list_changed
-        checkAndNotifyToolsChanged();
+        // 工具定义变化的 list_changed 推送由 sync 内部在事务提交后统一发出
       } catch (e: any) {
         console.warn(`[gw] 定期同步异常: ${String(e?.message ?? e).slice(0, 200)}`);
       }
