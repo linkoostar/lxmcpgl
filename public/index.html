@@ -44,6 +44,9 @@
         <button class="nav-btn" data-page="logs" title="调用统计">
           <span class="nav-icon">📊</span><span>调用统计</span>
         </button>
+        <button class="nav-btn" data-page="billing" title="费用分摊">
+          <span class="nav-icon">💰</span><span>费用分摊</span>
+        </button>
       </nav>
       <div class="sidebar-footer">
         <span id="me-name" class="sidebar-user"></span>
@@ -326,6 +329,44 @@
         </div>
       </div>
     </main>
+
+    <main id="page-billing" class="page hidden">
+      <div class="log-stats" id="billing-summary"></div>
+
+      <div class="card">
+        <h2>运营费用分摊对账单</h2>
+        <div class="muted" style="margin:-4px 0 12px 0;font-size:12px">
+          账期按北京时间自然月；金额按当前单价对全历史重估（修改单价会同步影响已往月份，非账单固化）。
+          失败调用与空壳调用不产生分摊费用。
+        </div>
+        <div class="toolbar">
+          <input type="month" id="billing-month" style="width:150px;padding:7px 8px;border-radius:8px;border:1px solid var(--border)" />
+          <button id="btn-billing-query" class="btn">查询</button>
+          <div class="spacer"></div>
+          <button id="btn-billing-rates" class="btn small">⚙️ 设置单价</button>
+          <button id="btn-billing-export" class="btn small">📊 导出财务 CSV</button>
+        </div>
+        <div id="billing-chart-wrap" style="position:relative;height:260px"><canvas id="chart-billing"></canvas></div>
+        <div class="table-wrap" style="margin-top:14px">
+          <table>
+            <thead>
+              <tr>
+                <th style="width:130px">运营账号</th>
+                <th style="width:110px">上游平台</th>
+                <th style="width:80px">总调用</th>
+                <th style="width:80px">成功</th>
+                <th style="width:80px">失败</th>
+                <th style="width:80px">空壳</th>
+                <th style="width:100px">Credits</th>
+                <th style="width:90px">自建分</th>
+                <th style="width:130px">应分摊金额(元)</th>
+              </tr>
+            </thead>
+            <tbody id="billing-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </main>
     </div><!-- /content -->
   </div><!-- /view-app -->
   <div id="user-mask" class="modal-mask hidden">
@@ -387,6 +428,32 @@
         <button id="modal-close" class="btn ghost small">关闭</button>
       </div>
       <pre id="modal-body" class="code scroll"></pre>
+    </div>
+  </div>
+
+  <!-- 费用分摊单价设置弹窗 -->
+  <div id="billing-mask" class="modal-mask hidden">
+    <div class="modal">
+      <div class="modal-head">
+        <span id="billing-modal-title">计费单价设置</span>
+        <button id="billing-modal-close" class="btn ghost small">关闭</button>
+      </div>
+      <div class="scroll" style="padding:4px 2px">
+        <div class="muted" style="font-size:12px;margin-bottom:10px">
+          金额 = 成功Credits × Credits单价 + 有效调用 × 按次单价 + 自建分 × 分单价。
+          上游配置了任一非零单价后默认不再叠加自建分（防双重计费）；如确需叠加，可为该上游单独填「分单价」。
+        </div>
+        <div id="billing-rates-list"></div>
+        <div class="row" style="margin-top:12px">
+          <b>默认分单价（元/分）：</b>
+          <input id="billing-dpp" type="number" min="0" step="0.0001" style="width:120px" />
+          <span class="muted" style="font-size:12px">未配置任何单价的上游按此价计自建分</span>
+        </div>
+        <div class="row" style="margin-top:14px;justify-content:flex-end">
+          <button id="billing-rates-save" class="btn primary">保存单价</button>
+          <span id="billing-rates-tip" class="muted"></span>
+        </div>
+      </div>
     </div>
   </div>
 

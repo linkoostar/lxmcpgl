@@ -245,3 +245,8 @@ td .desc { color: var(--muted); font-size: 12px; display: block;
 .log-stats-detail .chip b { font-weight: 600; color: var(--primary); margin-left: 4px; }
 .log-stats-detail .chip.caller { background: #eff6ff; color: #1e40af; border-color: #bfdbfe; }
 .log-stats-detail .chip.caller b { color: #1e40af; }
+
+/* ---------- 费用分摊（月度对账） ---------- */
+.billing-total-row { font-weight: 700; background: #f8fafc; }
+.billing-total-row td { border-top: 2px solid var(--border); }
+.cny-val { color: #d97706; font-weight: 600; }

@@ -52,14 +52,16 @@ function switchPage(name) {
   $('#page-users').classList.toggle('hidden', name !== 'users');
   $('#page-settings').classList.toggle('hidden', name !== 'settings');
   $('#page-logs').classList.toggle('hidden', name !== 'logs');
+  $('#page-billing').classList.toggle('hidden', name !== 'billing');
   // 顶部标题跟随
-  const titleMap = { tools: '工具列表', users: '运营用户', settings: '系统设置', logs: '调用统计' };
+  const titleMap = { tools: '工具列表', users: '运营用户', settings: '系统设置', logs: '调用统计', billing: '费用分摊' };
   const titleEl = $('#content-title');
   if (titleEl) titleEl.textContent = titleMap[name] ?? '';
   if (name === 'tools') { populateUpstreamFilter().then(() => loadTools()); }
   if (name === 'users') loadUsers();
   if (name === 'settings') loadSettings();
   if (name === 'logs') loadLogs();
+  if (name === 'billing') loadBilling();
 }
 
 /* ---------- 登录 ---------- */
@@ -1457,6 +1459,188 @@ $('#btn-log-export').addEventListener('click', () => {
       URL.revokeObjectURL(a.href);
     })
     .catch((e) => toast(e.message));
+});
+
+/* ---------- 费用分摊（月度对账） ---------- */
+
+const billingState = {
+  month: new Date(Date.now() + 8 * 3600_000).toISOString().slice(0, 7), // 上海时间当前月
+  report: null,
+  chart: null,
+};
+
+async function loadBilling() {
+  $('#billing-month').value = billingState.month;
+  try {
+    const report = await api('/billing/report?month=' + encodeURIComponent(billingState.month));
+    billingState.report = report;
+    renderBillingSummary(report);
+    renderBillingTable(report);
+    renderBillingChart(report);
+  } catch (e) {
+    toast(e.message);
+  }
+}
+
+function renderBillingSummary(report) {
+  const s = report.summary;
+  $('#billing-summary').innerHTML = `
+    <div class="log-stat-card credits"><div class="label">本月总分摊费用</div><div class="value cny-val">¥ ${s.total_cny.toFixed(2)}</div></div>
+    <div class="log-stat-card success"><div class="label">有效调用次数</div><div class="value">${s.success_calls}</div><div class="muted" style="font-size:12px;margin-top:4px">总调用 ${s.total_calls}（含失败/空壳，不计费）</div></div>
+    <div class="log-stat-card credits"><div class="label">上游 Credits 消耗</div><div class="value" style="color:#d97706">${Number(s.total_credits).toLocaleString()}</div></div>
+    <div class="log-stat-card credits"><div class="label">网关自建分</div><div class="value" style="color:#16a34a">${Number(s.total_points).toLocaleString()}</div></div>
+  `;
+}
+
+function renderBillingTable(report) {
+  const tbody = $('#billing-tbody');
+  if (!report.items.length) {
+    tbody.innerHTML = `<tr><td colspan="9" class="muted" style="text-align:center;padding:24px 0">该月份暂无调用数据</td></tr>`;
+    return;
+  }
+  // 按账号视觉聚合：同一账号只在首行显示名称
+  const rows = report.by_caller.map((g) =>
+    g.items.map((it, i) => {
+      const callerCell = i === 0 ? `<b>${escapeHtml(g.caller)}</b>` : '';
+      return `<tr>
+        <td>${callerCell}</td>
+        <td>${escapeHtml(it.upstream)}</td>
+        <td>${it.total_calls}</td>
+        <td>${it.success_calls}</td>
+        <td>${it.failed_calls > 0 ? `<span style="color:#dc2626">${it.failed_calls}</span>` : '0'}</td>
+        <td>${it.empty_shell_calls > 0 ? `<span class="muted">${it.empty_shell_calls}</span>` : '0'}</td>
+        <td>${it.total_credits ? Number(it.total_credits).toLocaleString() : '0'}</td>
+        <td>${it.total_points ? Number(it.total_points).toLocaleString() : '0'}</td>
+        <td class="cny-val">¥ ${it.cost_cny.toFixed(2)}</td>
+      </tr>`;
+    }).join('')
+  ).join('');
+  const s = report.summary;
+  rows += `<tr class="billing-total-row">
+    <td>总计</td><td>—</td><td>${s.total_calls}</td><td>${s.success_calls}</td><td>—</td><td>—</td>
+    <td>${Number(s.total_credits).toLocaleString()}</td><td>${Number(s.total_points).toLocaleString()}</td>
+    <td class="cny-val">¥ ${s.total_cny.toFixed(2)}</td>
+  </tr>`;
+  tbody.innerHTML = rows;
+}
+
+function renderBillingChart(report) {
+  if (typeof Chart === 'undefined') return;
+  const canvas = $('#chart-billing');
+  if (billingState.chart) { billingState.chart.destroy(); billingState.chart = null; }
+  const callers = report.by_caller;
+  if (!callers.length) {
+    $('#billing-chart-wrap').style.display = 'none';
+    return;
+  }
+  $('#billing-chart-wrap').style.display = '';
+  billingState.chart = new Chart(canvas, {
+    type: 'bar',
+    data: {
+      labels: callers.map((g) => g.caller),
+      datasets: [{
+        label: '应分摊金额(元)',
+        data: callers.map((g) => g.total_cny),
+        backgroundColor: 'rgba(217,119,6,0.75)',
+        borderRadius: 6,
+      }],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: { y: { beginAtZero: true, ticks: { callback: (v) => '¥' + v } } },
+    },
+  });
+}
+
+$('#billing-month').addEventListener('change', () => {
+  billingState.month = $('#billing-month').value || billingState.month;
+  loadBilling();
+});
+$('#btn-billing-query').addEventListener('click', () => {
+  billingState.month = $('#billing-month').value || billingState.month;
+  loadBilling();
+});
+$('#btn-billing-export').addEventListener('click', () => {
+  const url = '/api/billing/export.csv?month=' + encodeURIComponent(billingState.month);
+  fetch(url)
+    .then((r) => {
+      if (!r.ok) throw new Error('导出失败: HTTP ' + r.status);
+      return r.blob();
+    })
+    .then((blob) => {
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob); a.download = `billing_${billingState.month}.csv`; a.click();
+      URL.revokeObjectURL(a.href);
+    })
+    .catch((e) => toast(e.message));
+});
+
+// ---------- 单价设置弹窗 ----------
+
+const BILLING_RATE_LABELS = [
+  ['credit_price', 'Credits 单价（元/点）'],
+  ['call_price', '按次单价（元/次）'],
+  ['point_price', '分单价（元/分，留空按默认规则）'],
+];
+
+async function openBillingRates() {
+  let data;
+  try {
+    data = await api('/billing/rates');
+  } catch (e) {
+    toast(e.message);
+    return;
+  }
+  const list = $('#billing-rates-list');
+  const upstreamIds = [...new Set([...(data.upstreams || []), ...Object.keys(data.rates.rates || {})])];
+  list.innerHTML = upstreamIds.map((id) => {
+    const r = (data.rates.rates || {})[id] || {};
+    return `<div class="row" style="margin-bottom:8px">
+      <code style="width:110px">${escapeHtml(id)}</code>
+      ${BILLING_RATE_LABELS.map(([k, label]) => {
+        const v = r[k];
+        return `<input type="number" min="0" step="0.0001" data-upstream="${escapeHtml(id)}" data-rate="${k}"
+          placeholder="${label}" value="${v !== undefined ? v : ''}" style="width:130px" title="${label}" />`;
+      }).join('')}
+    </div>`;
+  }).join('') || '<div class="muted">暂无上游，先在「系统设置」添加并启用上游</div>';
+  $('#billing-dpp').value = data.rates.default_point_price ?? '';
+  $('#billing-rates-tip').textContent = '';
+  $('#billing-mask').classList.remove('hidden');
+}
+
+$('#btn-billing-rates').addEventListener('click', openBillingRates);
+$('#billing-modal-close').addEventListener('click', () => $('#billing-mask').classList.add('hidden'));
+$('#billing-mask').addEventListener('click', (e) => { if (e.target === $('#billing-mask')) $('#billing-mask').classList.add('hidden'); });
+
+$('#billing-rates-save').addEventListener('click', async () => {
+  const rates = {};
+  for (const inp of document.querySelectorAll('#billing-rates-list input[data-upstream]')) {
+    const id = inp.dataset.upstream, k = inp.dataset.rate;
+    if (inp.value === '') continue;
+    const v = Number(inp.value);
+    if (!Number.isFinite(v) || v < 0) {
+      $('#billing-rates-tip').textContent = `${id} 的单价必须是非负数字`;
+      return;
+    }
+    (rates[id] ??= {})[k] = v;
+  }
+  const dppRaw = $('#billing-dpp').value;
+  const dpp = dppRaw === '' ? NaN : Number(dppRaw);
+  if (!Number.isFinite(dpp) || dpp < 0) {
+    $('#billing-rates-tip').textContent = '默认分单价必须是非负数字';
+    return;
+  }
+  try {
+    await api('/billing/rates', { method: 'PUT', body: { rates, default_point_price: dpp } });
+    $('#billing-mask').classList.add('hidden');
+    toast('单价已保存，报表已按新单价重估');
+    loadBilling();
+  } catch (e) {
+    toast(e.message);
+  }
 });
 
 /* ---------- 初始化 ---------- */
