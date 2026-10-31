@@ -1332,3 +1332,219 @@ export function maskUpstreamKey(key: string): string {
   if (key.length <= 8) return '****';
   return `${key.slice(0, 4)}****${key.slice(-4)}`;
 }
+
+// ---------- 费用分摊（月度对账） ----------
+// 纯聚合层：只在 call_logs 上做月度 GROUP BY，不改表结构、不写新表。
+// 计费口径（三处一致：报表 / CSV / 前端展示都由这里算出）：
+//   金额 = 成功Credits × credit_price + 有效调用 × call_price + 自建分 × point_price
+//   - Credits 只计成功调用（上游失败是否扣费无法透传得知，默认拒绝计费）
+//   - 有效调用 = success=1 且非空壳（空壳行没有真实数据产出，不收按次费）
+//   - point_price：上游显式配置了 point_price 用之；否则只要该上游配置了
+//     任一非零 credit_price / call_price 就不再叠加分价（防双重计费）；
+//     都没配置才用 default_point_price（领星免费自建 → 只算自建分的口径）。
+// 账期口径：Asia/Shanghai 自然月（财务），换算成 UTC 区间后与 ts（UTC ISO）比较。
+
+export interface BillingRate {
+  credit_price?: number; // 元 / 上游 Credit
+  call_price?: number; // 元 / 次有效调用
+  point_price?: number; // 元 / 网关自建分（缺省时按回退规则取值）
+}
+
+export interface BillingRatesConfig {
+  rates: Record<string, BillingRate>; // key = upstream id
+  default_point_price: number; // 未配置单价的上游按此价计自建分
+}
+
+export const DEFAULT_BILLING_RATES: BillingRatesConfig = {
+  rates: {},
+  default_point_price: 0.01,
+};
+
+/** 单行分摊明细（caller × upstream） */
+export interface BillingReportItem {
+  caller: string;
+  user_id: number | null;
+  upstream: string;
+  total_calls: number;
+  success_calls: number; // success=1 且非空壳（计 call_price 的口径）
+  failed_calls: number; // success=0
+  empty_shell_calls: number; // success=1 但空壳（不收按次费）
+  total_credits: number; // 仅成功调用
+  total_points: number;
+  cost_cny: number; // 保留 2 位
+  rate_usage: { credit_price: number; call_price: number; point_price: number };
+}
+
+export interface MonthlyBillingPayload {
+  year_month: string;
+  since: string; // UTC ISO，上海自然月起点
+  until: string;
+  rates: BillingRatesConfig;
+  summary: {
+    total_calls: number;
+    success_calls: number;
+    total_credits: number;
+    total_points: number;
+    total_cny: number;
+  };
+  by_caller: Array<{
+    caller: string;
+    total_calls: number;
+    total_credits: number;
+    total_points: number;
+    total_cny: number;
+    items: BillingReportItem[];
+  }>;
+  items: BillingReportItem[];
+}
+
+export function isValidYearMonth(s: string): boolean {
+  const m = /^(\d{4})-(\d{2})$/.exec(s);
+  if (!m) return false;
+  const mo = Number(m[2]);
+  return mo >= 1 && mo <= 12;
+}
+
+/** 上海时间自然月 → UTC 区间 [since, until)，与 ts（UTC ISO）做字符串比较 */
+function monthRangeCn(yearMonth: string): { since: string; until: string } {
+  const y = Number(yearMonth.slice(0, 4));
+  const mo = Number(yearMonth.slice(5, 7));
+  const nextY = mo === 12 ? y + 1 : y;
+  const nextM = mo === 12 ? 1 : mo + 1;
+  return {
+    since: new Date(`${yearMonth}-01T00:00:00+08:00`).toISOString(),
+    until: new Date(`${nextY}-${String(nextM).padStart(2, '0')}-01T00:00:00+08:00`).toISOString(),
+  };
+}
+
+/** 当前月份（上海时间），报表默认值 */
+export function currentYearMonthCn(): string {
+  return new Date(Date.now() + 8 * 3600_000).toISOString().slice(0, 7);
+}
+
+function clampRate(v: unknown): number | undefined {
+  if (v === undefined || v === null || v === '') return undefined;
+  const n = Number(v);
+  if (!Number.isFinite(n) || n < 0) return undefined;
+  return Math.round(n * 1e6) / 1e6;
+}
+
+/** 读取并消毒单价配置（历史脏数据不影响报表，非法字段按未配置处理） */
+export function getBillingRates(): BillingRatesConfig {
+  const raw = getSettingJSON<Partial<BillingRatesConfig> | null>('billing_rates', null);
+  const rates: Record<string, BillingRate> = {};
+  if (raw && typeof raw === 'object' && raw.rates && typeof raw.rates === 'object') {
+    for (const [k, r] of Object.entries(raw.rates)) {
+      if (!r || typeof r !== 'object') continue;
+      const item: BillingRate = {};
+      const cp = clampRate((r as BillingRate).credit_price);
+      const kp = clampRate((r as BillingRate).call_price);
+      const pp = clampRate((r as BillingRate).point_price);
+      if (cp !== undefined) item.credit_price = cp;
+      if (kp !== undefined) item.call_price = kp;
+      if (pp !== undefined) item.point_price = pp;
+      if (Object.keys(item).length > 0) rates[String(k).trim().slice(0, 64)] = item;
+    }
+  }
+  const dpp = clampRate(raw?.default_point_price);
+  return { rates, default_point_price: dpp ?? DEFAULT_BILLING_RATES.default_point_price };
+}
+
+/** 写入单价配置（校验在 web 层做，这里只负责落库） */
+export function setBillingRates(cfg: BillingRatesConfig): void {
+  setSettingJSON('billing_rates', cfg);
+}
+
+/** 该上游生效的自建分单价（防双重计费回退规则，见区块头注释） */
+function pointPriceOf(rate: BillingRate | undefined, defaultPointPrice: number): number {
+  if (rate?.point_price !== undefined) return rate.point_price;
+  if (rate && ((rate.credit_price ?? 0) > 0 || (rate.call_price ?? 0) > 0)) return 0;
+  return defaultPointPrice;
+}
+
+function round2(n: number): number {
+  return Math.round(n * 100) / 100;
+}
+
+/** 月度费用分摊报表（fail-soft：无数据月份返回全 0，不报错） */
+export function getMonthlyBillingReport(yearMonth: string): MonthlyBillingPayload {
+  if (!isValidYearMonth(yearMonth)) throw new Error(`非法月份参数: ${yearMonth}`);
+  const rates = getBillingRates();
+  const { since, until } = monthRangeCn(yearMonth);
+
+  const rows = db
+    .prepare(
+      `SELECT l.caller,
+              u.id AS user_id,
+              COALESCE(NULLIF(l.upstream, ''), 'unknown') AS upstream,
+              COUNT(*) AS total_calls,
+              SUM(CASE WHEN l.success = 1 AND COALESCE(l.is_empty_shell, 0) = 0 THEN 1 ELSE 0 END) AS success_calls,
+              SUM(CASE WHEN l.success = 0 THEN 1 ELSE 0 END) AS failed_calls,
+              SUM(CASE WHEN l.success = 1 AND COALESCE(l.is_empty_shell, 0) = 1 THEN 1 ELSE 0 END) AS empty_shell_calls,
+              COALESCE(SUM(CASE WHEN l.success = 1 THEN l.cost_credits ELSE 0 END), 0) AS total_credits,
+              COALESCE(SUM(COALESCE(l.gateway_points, 0)), 0) AS total_points
+       FROM call_logs l
+       LEFT JOIN users u ON u.username = l.caller
+       WHERE l.ts >= ? AND l.ts < ?
+       GROUP BY l.caller, upstream
+       ORDER BY l.caller ASC, total_calls DESC, upstream ASC`
+    )
+    .all(since, until) as Array<{
+    caller: string;
+    user_id: number | null;
+    upstream: string;
+    total_calls: number;
+    success_calls: number;
+    failed_calls: number;
+    empty_shell_calls: number;
+    total_credits: number;
+    total_points: number;
+  }>;
+
+  const items: BillingReportItem[] = rows.map((r) => {
+    const rate = rates.rates[r.upstream];
+    const creditPrice = rate?.credit_price ?? 0;
+    const callPrice = rate?.call_price ?? 0;
+    const pointPrice = pointPriceOf(rate, rates.default_point_price);
+    const cost =
+      (r.total_credits ?? 0) * creditPrice + (r.success_calls ?? 0) * callPrice + (r.total_points ?? 0) * pointPrice;
+    return {
+      caller: r.caller,
+      user_id: r.user_id ?? null,
+      upstream: r.upstream,
+      total_calls: r.total_calls ?? 0,
+      success_calls: r.success_calls ?? 0,
+      failed_calls: r.failed_calls ?? 0,
+      empty_shell_calls: r.empty_shell_calls ?? 0,
+      total_credits: Math.round((r.total_credits ?? 0) * 1e4) / 1e4,
+      total_points: Math.round((r.total_points ?? 0) * 1e4) / 1e4,
+      cost_cny: round2(cost),
+      rate_usage: { credit_price: creditPrice, call_price: callPrice, point_price: pointPrice },
+    };
+  });
+
+  const byCaller = new Map<string, MonthlyBillingPayload['by_caller'][number]>();
+  for (const it of items) {
+    let g = byCaller.get(it.caller);
+    if (!g) {
+      g = { caller: it.caller, total_calls: 0, total_credits: 0, total_points: 0, total_cny: 0, items: [] };
+      byCaller.set(it.caller, g);
+    }
+    g.total_calls += it.total_calls;
+    g.total_credits += it.total_credits;
+    g.total_points += it.total_points;
+    g.total_cny += it.cost_cny;
+    g.items.push(it);
+  }
+  const by_caller = [...byCaller.values()].map((g) => ({ ...g, total_cny: round2(g.total_cny) }));
+
+  const summary = {
+    total_calls: items.reduce((a, b) => a + b.total_calls, 0),
+    success_calls: items.reduce((a, b) => a + b.success_calls, 0),
+    total_credits: Math.round(items.reduce((a, b) => a + b.total_credits, 0) * 1e4) / 1e4,
+    total_points: Math.round(items.reduce((a, b) => a + b.total_points, 0) * 1e4) / 1e4,
+    total_cny: round2(items.reduce((a, b) => a + b.cost_cny, 0)),
+  };
+
+  return { year_month: yearMonth, since, until, rates, summary, by_caller, items };
+}
