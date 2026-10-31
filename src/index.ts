@@ -1,5 +1,6 @@
 import express from 'express';
 import path from 'node:path';
+import { timingSafeEqual } from 'node:crypto';
 import { config } from './config.js';
 import { initDb, getSetting, sha256, getUserByKeyHash, listUpstreams, type UserRow } from './db.js';
 import { apiRouter, apiErrorHandler } from './web.js';
@@ -19,6 +20,15 @@ async function setupProxy(): Promise<void> {
   } catch (e) {
     console.warn('[proxy] 代理初始化失败，直连模式:', e instanceof Error ? e.message : e);
   }
+}
+
+/**
+ * 管理员通用 Key 比较：两边先各做一次 sha256，再用 timingSafeEqual 比较两个定长摘要。
+ * 原始 Key 长度可能不同，timingSafeEqual 要求等长 Buffer（长度不等会抛异常）；
+ * 摘要恒为 64 字符 hex，且哈希不泄露原文长度，比较耗时与内容无关。
+ */
+function adminKeyMatches(provided: string): boolean {
+  return timingSafeEqual(Buffer.from(sha256(provided)), Buffer.from(sha256(getSetting('downstream_key') ?? '')));
 }
 
 function mcpAuth(req: Request, res: Response, next: NextFunction): void {
@@ -41,7 +51,7 @@ function mcpAuth(req: Request, res: Response, next: NextFunction): void {
       return;
     }
     identity = identityFromUser(user as UserRow);
-  } else if (provided === getSetting('downstream_key')) {
+  } else if (adminKeyMatches(provided)) {
     identity = { kind: 'admin', upstream: 'lingxing' }; // 管理员通用 Key：全部权限
   } else {
     res.status(401).json({
