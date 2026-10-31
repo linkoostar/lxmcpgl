@@ -703,21 +703,19 @@ function stripInternalUrlsInContent(content: unknown, stat: { removed: number })
   });
 }
 
-/** 去掉上游返回里包裹的 markdown 代码围栏（如 ```json {...} ```） */
+/**
+ * 去掉上游返回里包裹的 markdown 代码围栏（如 ```json {...} ```）。
+ *
+ * 只去围栏，其余文本原样返回 —— 不做 JSON.parse → JSON.stringify：
+ * 重新序列化会丢大整数精度（> 2^53 的 ID 会被改写），也改变了上游原文。
+ */
 function stripMarkdownFenceInContent(content: unknown): unknown {
   if (!Array.isArray(content)) return content;
   return content.map((part: any) => {
     if (!part || typeof part !== 'object' || typeof part.text !== 'string') return part;
-    const t = part.text.trim();
-    const m = t.match(/^```(?:json|JSON|JavaScript|js)?\s*\n([\s\S]*?)\n?```\s*$/);
+    const m = part.text.match(/^\s*```[ \t]*(?:json|javascript|js)?[ \t]*\r?\n([\s\S]*?)\r?\n?```\s*$/i);
     if (!m) return part;
-    try {
-      return { ...part, text: JSON.stringify(JSON.parse(m[1].trim())) };
-    } catch {
-      const stripped = t.replace(/^```(?:json|JSON|JavaScript|js)?\s*\n/, '').replace(/\n?```\s*$/, '');
-      if (stripped !== t) return { ...part, text: stripped };
-      return part;
-    }
+    return { ...part, text: m[1] };
   });
 }
 
