@@ -537,6 +537,8 @@ function buildShopIdMapping(): Map<string, Set<string>> {
 
 interface ShopFilterStat {
   removed: number;
+  /** 保留下来的、明确命中白名单店铺标识的行数 */
+  kept: number;
 }
 
 /**
@@ -574,10 +576,14 @@ function filterShopListInNode(
           }
           // 都不是 → 忽略（可能是 profile_id 这种其他平台 id，不做猜测）
         }
-        if (ids.length > 0 && resolvedIds.length === 0) {
-          // 抽到了店铺标识，但映射后一个都不在白名单 → 明确未授权 → 剔除
-          stat.removed += 1;
-          continue;
+        if (ids.length > 0) {
+          if (resolvedIds.length === 0) {
+            // 抽到了店铺标识，但映射后一个都不在白名单 → 明确未授权 → 剔除
+            stat.removed += 1;
+            continue;
+          }
+          // 命中白名单的行（保留并计数，用于判断裁剪后是否还剩授权店铺的行）
+          stat.kept += 1;
         }
       }
       out.push(filterShopListInNode(item, allowedShops, stat, idMap));
@@ -1050,7 +1056,8 @@ function buildServer(fallbackIdentity: McpIdentity): Server {
     const isShopScoped = isShopScopedUpstream(tool.upstream ?? '');
 
     // 白名单 bypass：查询店铺/账号自身属性的工具 → 跳过店铺参数校验 + 结果裁剪
-    const bypassShopCheck = SHOP_SCOPE_BYPASS_TOOLS.has(tool.tool_id) || SHOP_SCOPE_BYPASS_TOOLS.has(name);
+    // 只按上游 tool_id 匹配，不用客户端传入的暴露名（暴露名可被上游/管理员改写，不能当权限依据）
+    const bypassShopCheck = SHOP_SCOPE_BYPASS_TOOLS.has(tool.tool_id);
 
     if (identity.kind === 'user' && !identity.all_shops && isShopScoped && !bypassShopCheck) {
       // 工具自己声明的店铺字段（递归扫 schema，结果按 schema 内容缓存）
@@ -1377,33 +1384,45 @@ function buildServer(fallbackIdentity: McpIdentity): Server {
 
       // 店铺结果裁剪
       // 只对「店铺维度上游」生效：西柚/NocoDB 等上游没有店铺维度，结果必须原样返回
-      // bypass 工具（get_my_sids/ad_auth_shops 等店铺目录类）也按 user_shops 白名单裁剪，
-      // 但裁剪后 0 行时保留全部 + warning（运营能看到领星绑定了哪些店，方便申请权限）
+      // bypass 工具（get_my_sids/ad_auth_shops 等店铺目录类）也按 user_shops 白名单裁剪；
+      // 但绝不回退成「展示全部店铺」——白名单为空或裁剪后一行都不剩时只返回空结果 + 提示。
       if (Array.isArray(content)) {
         let filteredContent = content as any[];
-        const isBypassTool = SHOP_SCOPE_BYPASS_TOOLS.has(tool?.tool_id ?? '') || SHOP_SCOPE_BYPASS_TOOLS.has(name);
+        const isBypassTool = SHOP_SCOPE_BYPASS_TOOLS.has(tool?.tool_id ?? '');
         if (identity.kind === 'user' && !identity.all_shops && isShopScopedUpstream(upId)) {
           const allowedShops = new Set(getUserShopIds(identity.id));
           if (allowedShops.size === 0) {
-            // user_shops 未配置 → 防御性兜底：原样返回 + warning
             if (isBypassTool) {
+              // 店铺目录工具：白名单为空 → 不返回领星的全量店铺目录（默认拒绝）
+              console.warn(`[mcp] ${caller} ${name} 店铺白名单为空，bypass 工具返回空结果`);
               filteredContent = [
-                { type: 'text' as const, text: JSON.stringify({ __gateway_warn: '未配置店铺白名单，当前展示领星账号绑定的全部店铺（仅可见目录，不能调用 shop_scoped 工具）' }) },
-                ...filteredContent,
+                {
+                  type: 'text' as const,
+                  text: JSON.stringify({
+                    __gateway_warn:
+                      '未配置店铺白名单，已隐藏店铺目录明细。请在管理后台「运营用户 → 店铺权限」配置店铺，或由管理员改为「全部店铺」。',
+                  }),
+                },
               ];
+            } else {
+              // 非 bypass 工具：防御性兜底：原样返回 + warning
+              console.warn(`[mcp] ${caller} ${name} 店铺裁剪跳过：user_shops 为空`);
             }
-            console.warn(`[mcp] ${caller} ${name} 店铺裁剪跳过：user_shops 为空`);
           } else {
-            const stat: ShopFilterStat = { removed: 0 };
+            const stat: ShopFilterStat = { removed: 0, kept: 0 };
             const idMap = buildShopIdMapping();
             filteredContent = filterContentByShops(content, allowedShops, stat, idMap) as any[];
-            if (isBypassTool && filteredContent.length === 0 && stat.removed > 0) {
-              // bypass 工具裁剪后 0 行（运营白名单与领星返回无交集）→ 保留全部 + warning
-              console.warn(`[mcp] ${caller} ${name} bypass 工具裁剪后 0 行（allowed=${allowedShops.size}），保留全部`);
-              filteredContent = content as any[];
+            if (isBypassTool && stat.removed > 0 && stat.kept === 0) {
+              // bypass 工具裁剪后一行都不剩（运营白名单与领星返回无交集）
+              // → 返回空结果 + 提示，绝不保留全部店铺明细
+              console.warn(`[mcp] ${caller} ${name} bypass 工具裁剪后 0 行（allowed=${allowedShops.size}），返回空结果`);
               filteredContent = [
-                { type: 'text' as const, text: JSON.stringify({ __gateway_warn: `你当前可用店铺 ${allowedShops.size} 家，领星返回的 ${stat.removed + 1} 家中无匹配。当前展示全部仅供参考。` }) },
-                ...filteredContent,
+                {
+                  type: 'text' as const,
+                  text: JSON.stringify({
+                    __gateway_warn: `上游返回的 ${stat.removed} 行店铺明细均不在你的授权范围内，已全部隐藏。你的可用店铺 sid: ${[...allowedShops].join(', ')}。`,
+                  }),
+                },
               ];
             } else if (stat.removed > 0) {
               console.log(`[mcp] ${caller} ${name} 店铺裁剪 ${stat.removed} 行（allowed=${allowedShops.size}${isBypassTool ? '，bypass工具' : ''}）`);
@@ -1428,7 +1447,7 @@ function buildServer(fallbackIdentity: McpIdentity): Server {
         filteredContent = stripMarkdownFenceInContent(filteredContent) as any[];
         // bypass 工具（店铺目录类）→ 在返回里注入显式店铺提示，不让 agent 从大 JSON 里自己抽
         // 即使后面的数据很长，agent 第一眼也能看到可用 sid 列表 + 使用示例
-        const isBypassToolForHint = SHOP_SCOPE_BYPASS_TOOLS.has(tool?.tool_id ?? '') || SHOP_SCOPE_BYPASS_TOOLS.has(name);
+        const isBypassToolForHint = SHOP_SCOPE_BYPASS_TOOLS.has(tool?.tool_id ?? '');
         if (isBypassToolForHint && filteredContent.length > 0) {
           const shopHints: Array<{ sid: string; name?: string; country?: string }> = [];
           for (const block of filteredContent) {
@@ -1462,15 +1481,15 @@ function buildServer(fallbackIdentity: McpIdentity): Server {
 
             // 如果 user_shops 已配置（非空）→ hint 只列白名单店铺
             // 避免 agent 拿到不属于自己的 sid 去调 shop_scoped 又被拒
-            // 如果 user_shops 未配置（空）→ 原样返回领星全部（让运营看到可用店铺）
+            // 白名单为空时 hint 里没有任何可用 sid（内容本身也已在裁剪阶段被拦掉）
             if (identity.kind === 'user' && !identity.all_shops) {
               const whitelist = new Set(getUserShopIds(identity.id));
               if (whitelist.size > 0) {
                 const before = uniq.length;
                 uniq = uniq.filter((h) => whitelist.has(h.sid));
                 if (uniq.length === 0) {
-                  // 白名单过滤后一个都没剩 → 保留领星全部，但加个提醒
-                  console.warn(`[mcp] ${caller} ${name} bypass hint: user_shops 白名单 (${whitelist.size}) 与领星返回的店铺 (${before}) 无交集，返回全部`);
+                  // 白名单过滤后一个都没剩 → 不退回展示全部，hint 置空
+                  console.warn(`[mcp] ${caller} ${name} bypass hint: user_shops 白名单 (${whitelist.size}) 与领星返回的店铺 (${before}) 无交集，可用 sid 置空`);
                 } else {
                   console.log(`[mcp] ${caller} ${name} bypass hint: user_shops 白名单过滤 ${before} → ${uniq.length} 家`);
                 }
