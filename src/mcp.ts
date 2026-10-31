@@ -1084,33 +1084,18 @@ function buildServer(identity: McpIdentity): Server {
           } else {
             hint = '未配置店铺白名单 → 请先在运营用户管理里配置店铺权限';
           }
-          // write 工具仍然硬拒绝（安全底线：改价发货不能自动猜店铺）
+          // write 工具额外说明「禁止自动注入」（安全底线：改价发货不能自动猜店铺）
           const safeToolType = (tool.tool_type ?? '').toLowerCase();
-          if (safeToolType === 'write') {
-            logOutcome(false, true, `write 工具未提供店铺参数（禁止自动注入）`);
-            return errorResult(
-              `写操作工具「${name}」禁止自动注入店铺。${hint}`,
-              { type: 'invalid_params', upstream: tool.upstream, tool: name, reason: 'missing_shop_param', hint }
-            );
-          }
-          // read 工具 → 返回带 hint 的空壳响应（gateway_points=0，不计分）
-          logOutcome(true, false, undefined, null, { isEmptyShell: true });
-          return {
-            content: [
-              {
-                type: 'text',
-                text: JSON.stringify({
-                  code: 0,
-                  data: null,
-                  msg: `缺少店铺参数。${hint}`,
-                  _auto_inject_disabled: true,
-                }),
-              },
-            ],
-            isError: false,
-            // structuredContent 故意不带（不传=undefined），
-            // MCP 协议要求 structuredContent 若出现必须是 object（不能 null），否则 zod 校验报 -32602
-          };
+          const isWrite = safeToolType === 'write';
+          const prefix = isWrite ? `写操作工具「${name}」禁止自动注入店铺。` : '';
+          logOutcome(false, true, isWrite ? 'write 工具未提供店铺参数（禁止自动注入）' : '缺少店铺参数');
+          return errorResult(`${prefix}缺少店铺参数。${hint}`, {
+            type: 'invalid_params',
+            upstream: tool.upstream,
+            tool: name,
+            reason: 'missing_shop_param',
+            hint,
+          });
         }
       }
 
