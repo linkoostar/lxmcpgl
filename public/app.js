@@ -1499,7 +1499,7 @@ function renderBillingTable(report) {
     return;
   }
   // 按账号视觉聚合：同一账号只在首行显示名称
-  const rows = report.by_caller.map((g) =>
+  let rows = report.by_caller.map((g) =>
     g.items.map((it, i) => {
       const callerCell = i === 0 ? `<b>${escapeHtml(g.caller)}</b>` : '';
       return `<tr>
