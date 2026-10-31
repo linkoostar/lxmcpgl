@@ -43,6 +43,7 @@
 | **MCP 标准能力** | session 模式：initialize 建立 `mcp-session-id`，GET `/mcp` 开 SSE 通知流，DELETE 关闭；工具定义变化向全部存活 session 推 `notifications/tools/list_changed`；`notifications/cancelled` 按 requestId abort 进行中的上游调用（AbortSignal 全链路透传，session/无状态双模式均可用）；session 身份每请求从 DB 刷新（后台改权限即时生效）+ 数量上限（全局 200 / 单身份 10，空闲 4h 清理，超限淘汰需重新 initialize）；`capabilities.tools.listChanged=true` 名副其实。不带 session 的请求走无状态路径，完全向后兼容 |
 | **安全** | 下游 Key 随机生成 + SHA-256 存储 + 每次请求查库；管理员通用 Key 恒定时间比较（sha256 + timingSafeEqual）；管理员 Key 设置页默认 masked 显示 + 👁 按需明文；管理后台 Cookie HTTPS 下自动带 Secure（`TRUST_PROXY`）；店铺校验 fail-closed 兜底；SQLite 用预编译语句 |
 | **Web 管理后台** | 上游配置 + 连通测试 + 工具同步启停；下游 Key 管理 + 店铺同步；工具列表筛选 + 批量启停 + 批量 write 分配；调用日志浏览 + CSV 导出 |
+| **费用分摊** | 月度对账看板：上游单价配置（Credits/按次/自建分三计费方式，防双重计费回退）、按北京时间自然月聚合的运营 × 上游对账表、金额柱图、一键导出财务 CSV（UTF-8 BOM + CRLF）；纯聚合查询，不动 MCP 链路 |
 | **定期同步** | `PERIODIC_SYNC_INTERVAL_MS` 驱动定时全量 sync + schema hash（canonicalize 后 SHA-256 前 16 位）对比；拉取与写入分离——全部拉完在单个 SQLite 事务里批量落库（请求读不到半同步状态），单工具失败保留旧 schema，领星 code=102 自动刷新 schema 重试 |
 
 ## 多上游接入
@@ -105,6 +106,25 @@ mkdir -p data && docker compose up -d
 - **批量启用 / 批量停用**：对选中集合一键生效；也可配合搜索词按条件整体启停
 - 点击行复选框可自由增减选中集合，批量栏实时显示已选数量
 - 筛选支持：上游 / 类型 / 审核状态 / **启用状态**（「全选搜索结果」与批量启停均遵循全部筛选条件，不会误伤筛选外的工具）
+
+## 费用分摊（月度对账）
+
+「费用分摊」页提供财务维度的月度对账：按运营账号 × 上游聚合当月调用量与费用，支持一键导出财务 CSV。
+
+**计费口径**（报表 / 前端 / CSV 三处一致，金额按查询时点单价对全历史重估——改单价会同步影响已往月份，非账单固化）：
+
+```
+金额 = 成功Credits × credit_price + 有效调用 × call_price + 自建分 × point_price
+```
+
+- **Credits 只计成功调用**——上游失败时是否扣费无法透传得知，默认不计费（fail-closed）
+- **有效调用 = 成功且非空壳**——空壳行没有真实数据产出，不收按次费（自建分照计）
+- **账期按北京时间自然月**切分（内部换算成 UTC 区间与日志时间比较），不是 UTC 月
+- **防双重计费**：上游配置了任一非零单价后默认不再叠加自建分；确需叠加可为该上游单独填「分单价」
+
+单价在页内「设置单价」弹窗配置（存 `settings.billing_rates`），按上游动态生成输入项；`default_point_price` 是未配置任何单价的上游的自建分单价（领星免费自建 → 只算自建分的口径）。
+
+**日志保留注意**：报表数据源就是 call_logs，「清理日志」会永久影响未导出月份的对账完整性（清理接口响应带 `billing_warning` 提示）。做财务分摊的部署建议日志保留 ≥ 13 个月，或每月导出 CSV 存档。
 
 ## 变更感知（tools_hash 契约）
 
@@ -195,5 +215,6 @@ npm start
 - [x] **阶段 6（v1.4.0）**：店铺可见性隔离（bypass 工具返回体也按 user_shops 裁剪，0 行回退 + warn）、网关注入式元工具 `_tool_search` / `_gateway_info`、`extractEmbeddedJson` 从纯文本错误挖出 `upstream_code/trace_id` 准确透传、code=102 自动刷新重试 + 缺 required 参数补注（只报 100% 可信的缺参，类型错不报防误导）、stripMarkdownFence 过滤、descPrefix 极简、版本号单一来源（package.json）
 - [x] **阶段 7（v1.5.0–v1.6.1）**：MCP 标准能力——session 模式（混合路由，无 session 向后兼容）+ `list_changed` SSE 推送 + `cancelled` 取消透传（in-flight 注册表 + AbortSignal 透传上游 fetch）；tools_hash 契约（三处一致 + 纯暴露内容口径）；同步业务错误显式透出（领星 help 返回 code≠1 不再静默成 0/0）；工具列表启用状态筛选 + 批量操作筛选防护；annotations 语义修正（NocoDB callTool/exportCsv → `readOnlyHint:false + destructiveHint:true`）
 - [x] **阶段 7.5（v1.7.0）**：店铺权限模型重做——调用校验改为「工具 schema 声明 + 请求携带」（递归扫描 input_schema 判定声明字段，防给全局工具塞 sid 绕过）、无店铺参数的全局工具对受限运营默认拒绝（例外清单 `global_safe`）、缺店铺参数返回真错误（`isError:true`，日志记拒绝）、session 身份每请求从 DB 刷新 + 数量上限（全局 200 / 单身份 10，空闲 4h）、`all_tools` 不再绕过 block_write + 白名单 id 口径统一（上游 tool_id）、同步改先拉取后单事务写入（请求读不到半同步状态）、内置工具 `_tool_schema`（agent 报参数错时自查完整入参说明）、Chart.js 本地化 + SRI、管理员 Key 恒定时间比较、Cookie Secure 条件化（`TRUST_PROXY`）、写动词表合并 + 驼峰漏判修复、stripMarkdownFence 不再重序列化（大整数精度）、嵌入式 JSON 提取仅限错误场景、店铺目录工具不再回退展示全部店铺
-- [ ] **阶段 8**：write 操作审批、用量看板、告警、调用记录审计日志
+- [ ] **阶段 8**：write 操作审批（评估后不做）、告警（轻量 Webhook，待做）
+- [x] **阶段 8.5（v1.8.0）**：运营费用分摊与月度对账看板——上游单价配置（防双重计费回退规则）、北京时间自然月聚合（运营 × 上游对账表 + 金额柱图）、财务 CSV 导出（UTF-8 BOM + CRLF + 总计行）、日志清理入口分摊影响提示；纯聚合层，不动 MCP 核心链路与表结构
 - ~~响应数据语义标记~~（is_placeholder_row / _formulas / 本地 enum 校验等）— **已关闭**，不符合网关设计原则
