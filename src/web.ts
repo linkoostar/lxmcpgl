@@ -96,6 +96,16 @@ function wrap(fn: (req: Request, res: Response, next: NextFunction) => Promise<u
   };
 }
 
+/**
+ * Cookie 的 Secure 标记：仅在请求本身是 HTTPS 时添加。
+ * req.secure 依据 req.protocol === 'https'；反代（TLS 在 Nginx/Caddy 终止）场景
+ * 需要设置 app.set('trust proxy', ...) 才能从 X-Forwarded-Proto 还原出 https。
+ * 不得无条件添加 —— 局域网 HTTP 部署下带 Secure 的 cookie 会被浏览器丢弃，登录直接失效。
+ */
+function cookieSecurityAttr(req: Request): string {
+  return req.secure ? '; Secure' : '';
+}
+
 // ---------- 登录限速 ----------
 
 const loginAttempts = new Map<string, { count: number; resetAt: number }>();
@@ -145,14 +155,14 @@ apiRouter.post(
     }
     res.setHeader(
       'Set-Cookie',
-      `${COOKIE_NAME}=${encodeURIComponent(signSession(String(username)))}; HttpOnly; Path=/; SameSite=Lax; Max-Age=${SESSION_TTL_MS / 1000}`
+      `${COOKIE_NAME}=${encodeURIComponent(signSession(String(username)))}; HttpOnly; Path=/; SameSite=Lax; Max-Age=${SESSION_TTL_MS / 1000}${cookieSecurityAttr(req)}`
     );
     res.json({ ok: true });
   })
 );
 
-apiRouter.post('/logout', (_req, res) => {
-  res.setHeader('Set-Cookie', `${COOKIE_NAME}=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0`);
+apiRouter.post('/logout', (req, res) => {
+  res.setHeader('Set-Cookie', `${COOKIE_NAME}=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0${cookieSecurityAttr(req)}`);
   res.json({ ok: true });
 });
 

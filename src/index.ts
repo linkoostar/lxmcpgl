@@ -74,6 +74,19 @@ async function main(): Promise<void> {
   app.disable('x-powered-by');
   app.use(express.json({ limit: '20mb' }));
 
+  // 反代 TLS 终止场景：配 TRUST_PROXY 后 req.secure 才能从 X-Forwarded-Proto 还原出 https，
+  // Cookie 的 Secure 标记（P2-14）才会在 HTTPS 下生效。默认不启用 —— 直连部署不受影响，
+  // 也不给伪造 X-Forwarded-Proto 留口子。取值：1/true = 信任所有代理；否则为 IP/子网逗号分隔列表。
+  const trustProxy = (process.env.TRUST_PROXY ?? '').trim();
+  if (trustProxy === '1' || trustProxy === 'true') {
+    app.set('trust proxy', true);
+    console.log('[lxmcpgl] trust proxy = true（TRUST_PROXY，反代 TLS 场景）');
+  } else if (trustProxy) {
+    const proxies = trustProxy.split(',').map((s) => s.trim()).filter(Boolean);
+    app.set('trust proxy', proxies);
+    console.log(`[lxmcpgl] trust proxy = [${proxies.join(', ')}]（TRUST_PROXY，反代 TLS 场景）`);
+  }
+
   app.use('/api', apiRouter);
   app.use('/api', apiErrorHandler);
 
