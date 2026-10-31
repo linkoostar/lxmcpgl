@@ -782,9 +782,12 @@ function buildServer(fallbackIdentity: McpIdentity): Server {
         : `${u.name}（${toolCounts[u.id] ?? 0} 工具）`;
     })
     .join('；');
-  // 含 2 个内置工具（_tool_search/_gateway_info），与 tools/list 实际暴露数一致
-  const totalTools = upstreams.reduce((sum, u) => sum + (toolCounts[u.id] ?? 0), 0) + 2;
+  // 含 3 个内置工具（_tool_search/_tool_schema/_gateway_info），与 tools/list 实际暴露数一致
+  const totalTools = upstreams.reduce((sum, u) => sum + (toolCounts[u.id] ?? 0), 0) + 3;
   const serverDesc = `方中 MCP 网关，聚合 ${upstreams.length} 个上游 · ${totalTools} 工具：${upstreamDesc}`;
+  // 固定提示：只在这里写一次，不根据错误内容动态生成
+  const schemaHint = '调用报参数或格式错误时，用 _tool_schema 查看完整参数说明。';
+  const instructions = `${serverDesc}。${schemaHint}`;
 
   const server = new Server(
     { name: 'fangzhong-mcp-gateway', version: config.version, description: serverDesc },
@@ -809,7 +812,7 @@ function buildServer(fallbackIdentity: McpIdentity): Server {
     capabilities: { tools: { listChanged: true } },
     serverInfo: { name: '方中 MCP 网关', version: config.version },
     // MCP 标准字段：客户端会把这段说明带给模型，用于判断该网关能提供哪些数据域
-    instructions: serverDesc,
+    instructions,
     _meta: { tools_hash: toolsHashOf(activeUpstreams()) },
   }));
 
@@ -864,6 +867,12 @@ function buildServer(fallbackIdentity: McpIdentity): Server {
         name: '_tool_search',
         description: '[网关] 按关键词检索可用工具。输入关键词（如 "广告"、"ASIN"、"listing"），返回匹配的工具列表（含上游、用途简述）。工具数撑爆上下文时先用这个缩小范围。',
         inputSchema: { type: 'object', properties: { keyword: { type: 'string', description: '搜索关键词（匹配工具名和描述）' }, upstream: { type: 'string', description: '可选：限定上游' }, limit: { type: 'integer', description: '返回上限，默认10，最大30' } }, required: ['keyword'] },
+        annotations: { readOnlyHint: true },
+      },
+      {
+        name: '_tool_schema',
+        description: '[网关] 查看指定工具的完整入参 JSON Schema（含参数级 description/pattern 等说明，tools/list 里的是精简版）。' + schemaHint,
+        inputSchema: { type: 'object', properties: { tool_name: { type: 'string', description: '工具名（tools/list 里暴露的名称）' } }, required: ['tool_name'] },
         annotations: { readOnlyHint: true },
       },
       {
@@ -963,7 +972,7 @@ function buildServer(fallbackIdentity: McpIdentity): Server {
       const toolCounts = computeToolCounts(upstreams);
       const gwUpstreams = upstreams.map((u) => ({ id: u.id, name: u.name, adapter: u.adapter, tools: toolCounts[u.id] ?? 0 }));
       const upstreamTotal = gwUpstreams.reduce((s, u) => s + u.tools, 0);
-      const builtinTotal = 2;
+      const builtinTotal = 3;
       const result = { gateway: '方中 MCP 网关', version: config.version, identity: identity.kind === 'admin' ? 'admin' : `user:${identity.username}`, upstreams: gwUpstreams, builtin_tools: builtinTotal, total_tools: upstreamTotal + builtinTotal, tools_hash: toolsHashOf(upstreams) };
       insertCallLog({ caller: logCtx.caller, user_id: logCtx.userId, tool_name: name, tool_id: name, tool_type: 'gateway', upstream: '', shop_refs: null, success: true, is_error: false, duration_ms: Date.now() - logCtx.started, error: null, cost_credits: null, effective_rows: null, is_admin: identity.kind === 'admin', is_empty_shell: true, gateway_points: 0 });
       return { content: [{ type: 'text' as const, text: JSON.stringify(result) }] };
@@ -989,6 +998,55 @@ function buildServer(fallbackIdentity: McpIdentity): Server {
       const result = { keyword: kw, total: matched.length, results: matched.map((r) => ({ name: r.exposed_name, upstream: upNames.get(r.upstream) ?? r.upstream, desc: (r.description ?? '').slice(0, 100) })) };
       insertCallLog({ caller: logCtx.caller, user_id: logCtx.userId, tool_name: name, tool_id: name, tool_type: 'gateway', upstream: '', shop_refs: null, success: true, is_error: false, duration_ms: Date.now() - logCtx.started, error: null, cost_credits: null, effective_rows: matched.length, is_admin: identity.kind === 'admin', is_empty_shell: true, gateway_points: 0 });
       return { content: [{ type: 'text' as const, text: JSON.stringify(result) }] };
+    }
+    if (name === '_tool_schema') {
+      const toolName = String(args.tool_name ?? '').trim();
+      const logSchema = (success: boolean, error: string | null): void =>
+        insertCallLog({
+          caller: logCtx.caller,
+          user_id: logCtx.userId,
+          tool_name: name,
+          tool_id: name,
+          tool_type: 'gateway',
+          upstream: '',
+          shop_refs: null,
+          success,
+          is_error: !success,
+          duration_ms: Date.now() - logCtx.started,
+          error,
+          cost_credits: null,
+          effective_rows: null,
+          is_admin: identity.kind === 'admin',
+          is_empty_shell: true,
+          gateway_points: 0,
+        });
+      if (!toolName) {
+        logSchema(false, '缺少 tool_name 参数');
+        return errorResult('请提供 tool_name 参数', { type: 'invalid_params' });
+      }
+      // 可见性规则与 tools/list 一致：上游范围 + 工具白名单（白名单口径 = tool_id）
+      const activeUpIds2 = upstreams.map((u) => u.id);
+      const scope2 =
+        identity.kind === 'admin'
+          ? { all: true, ids: [...activeUpIds2] }
+          : resolveUserUpstreams(identity.upstream, activeUpIds2);
+      const row = scope2.ids.length > 0 ? getToolByExposedName(toolName, scope2.ids) : undefined;
+      const allowed =
+        identity.kind === 'user' && !identity.all_tools ? new Set(getUserToolIds(identity.id)) : null;
+      const visible = !!row && (!allowed || allowed.has(row.tool_id));
+      if (!visible) {
+        // 「不存在」与「无权限」返回完全一致的响应，不泄露工具是否存在
+        logSchema(false, '工具不存在');
+        return errorResult('工具不存在', { type: 'tool_not_found' });
+      }
+      const raw = row!.input_schema ?? '';
+      if (!raw) {
+        logSchema(false, '该工具暂无参数说明');
+        return errorResult('该工具暂无参数说明（上游尚未同步 schema）');
+      }
+      logSchema(true, null);
+      // 原样返回数据库里存的 input_schema：不做 minimizeSchema，也不截断 description
+      return { content: [{ type: 'text' as const, text: raw }] };
     }
 
     // 调用者可见的 upstream 范围（admin = 全部 active；用户 = users.upstream，fail-closed）
