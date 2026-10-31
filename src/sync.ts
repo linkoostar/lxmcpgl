@@ -1,5 +1,5 @@
 import { db, getSetting, setSetting, setSettingJSON, getReadToolIds, upsertTool, getUpstream, SHOP_PARAM_KEYS, type ToolRow } from './db.js';
-import { META_TOOLS } from './config.js';
+import { META_TOOLS, classifyByName } from './config.js';
 import { getUpstreamClient, type UpstreamClient } from './upstream.js';
 
 /**
@@ -138,18 +138,7 @@ function findNumber(obj: any, keys: string[], depth = 0): number | undefined {
   return undefined;
 }
 
-// 上游 help 不提供 toolType 时，按工具名中的动词分词兜底判断读写类型
-const WRITE_TOKENS = new Set([
-  'put', 'add', 'create', 'update', 'delete', 'del', 'set', 'modify', 'cancel',
-  'edit', 'remove', 'save', 'import', 'send', 'archive', 'push', 'upload',
-  'pause', 'enable', 'disable', 'adjust', 'audit', 'approve', 'reject',
-  'mark', 'reset', 'bind', 'unbind', 'apply',
-]);
-
-function classifyByName(name: string): string {
-  const tokens = name.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
-  return tokens.some((t) => WRITE_TOKENS.has(t)) ? 'write' : 'read';
-}
+// 上游 help 不提供 toolType 时，按工具名中的动词分词兜底判断读写类型（分类实现见 config.ts）
 
 function normalizeTool(raw: any): { tool_id: string; name: string; description: string; tool_type: string; raw: string } | null {
   if (!raw || typeof raw !== 'object') return null;

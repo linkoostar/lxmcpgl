@@ -9,6 +9,7 @@
 
 import type { UpstreamClient } from './upstream.js';
 import { withExternalSignal } from './upstream.js';
+import { classifyByName } from './config.js';
 
 /** upstream 配置行（从 upstreams 表读） */
 export interface UpstreamConfig {
@@ -629,18 +630,6 @@ class FlatMcpClient {
     // 不在这里抛错：把 JSON-RPC error 原样返回，交给 adapter 归一化（保留 code/traceId）
     return this.rpc('tools/call', { name, arguments: args }, 30000, signal);
   }
-}
-
-/** 工具读写分类（兜底） */
-const WRITE_TOKENS = new Set([
-  'put', 'add', 'create', 'update', 'delete', 'del', 'set', 'modify', 'cancel',
-  'edit', 'remove', 'save', 'import', 'send', 'archive', 'push', 'upload',
-  'pause', 'enable', 'disable', 'adjust', 'audit', 'approve', 'reject',
-  'mark', 'reset', 'bind', 'unbind', 'apply',
-]);
-function classifyByName(name: string): 'read' | 'write' {
-  const tokens = String(name || '').toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
-  return tokens.some((t) => WRITE_TOKENS.has(t)) ? 'write' : 'read';
 }
 
 // 注册

@@ -2,7 +2,7 @@ import Database from 'better-sqlite3';
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomBytes, scryptSync, timingSafeEqual, createHash } from 'node:crypto';
-import { config, DEFAULT_UPSTREAM_URL } from './config.js';
+import { config, DEFAULT_UPSTREAM_URL, classifyByName } from './config.js';
 
 /**
  * 店铺 ID 字段名常量 —— 全项目共用一份，避免口径漂移。
@@ -492,17 +492,7 @@ function migrateToolsCompositePk(): void {
   tx();
 }
 
-/** 老数据兜底：按工具名中的动词分词判断读写类型 */
-const WRITE_TOKENS = new Set([
-  'put', 'add', 'create', 'update', 'delete', 'del', 'set', 'modify', 'cancel',
-  'edit', 'remove', 'save', 'import', 'send', 'archive', 'push', 'upload',
-  'pause', 'enable', 'disable', 'adjust', 'audit', 'approve', 'reject',
-  'mark', 'reset', 'bind', 'unbind', 'apply',
-]);
-function classifyByName(name: string): string {
-  const tokens = String(name || '').toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
-  return tokens.some((t) => WRITE_TOKENS.has(t)) ? 'write' : 'read';
-}
+/** 老数据兜底：按工具名中的动词分词判断读写类型（分类实现见 config.ts） */
 function backfillToolTypes(): void {
   const rows = (db.prepare("SELECT upstream, tool_id FROM tools WHERE tool_type IS NULL OR tool_type = ''").all() as Array<{ upstream: string; tool_id: string }>);
   if (rows.length === 0) return;
