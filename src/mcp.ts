@@ -940,10 +940,11 @@ function buildServer(identity: McpIdentity): Server {
       const scope2 = identity.kind === 'admin' ? { all: true, ids: [...activeUpIds2] } : resolveUserUpstreams(identity.upstream, activeUpIds2);
       const toolUpstream = scope2.ids.length > 0 ? scope2.ids : activeUpIds2;
       const ph = toolUpstream.map(() => '?').join(',');
-      let allTools = db.prepare(`SELECT upstream, exposed_name, description FROM tools WHERE enabled = 1 AND upstream IN (${ph})`).all(...toolUpstream) as any[];
+      let allTools = db.prepare(`SELECT upstream, tool_id, exposed_name, description FROM tools WHERE enabled = 1 AND upstream IN (${ph})`).all(...toolUpstream) as any[];
       if (identity.kind === 'user' && !identity.all_tools) {
         const allowed = new Set(getUserToolIds(identity.id));
-        allTools = allTools.filter((r) => allowed.has(r.exposed_name));
+        // 白名单口径 = tool_id（与 tools/list、调用校验、block_write 例外一致）
+        allTools = allTools.filter((r) => allowed.has(r.tool_id));
       }
       const hay = (r: any) => `${r.exposed_name} ${r.description ?? ''}`.toLowerCase();
       const matched = allTools.filter((r) => hay(r).includes(kw.toLowerCase()) && (!upstreamFilter || r.upstream === upstreamFilter)).slice(0, limit);
@@ -988,10 +989,10 @@ function buildServer(identity: McpIdentity): Server {
     }
 
     // write 工具管控
-    // block_write=1 时默认禁止所有 write 工具，但管理员可手动在运营用户的 tool_ids 里
-    // 分配特定 write 工具作为例外（比如只开放"确认发货"不给"改价"）。
-    // all_tools=1 的运营用户视为完全信任，不受 block_write 限制。
-    if (identity.kind === 'user' && tool.tool_type === 'write' && getSetting('block_write') === '1' && !identity.all_tools) {
+    // block_write=1 时禁止所有 write 工具，除非管理员在运营用户的 tool_ids 里显式勾选
+    // （白名单口径 = tool_id，与 tools/list、_tool_search、调用校验一致）。
+    // all_tools=1 只是「不限制读工具可见范围」，不代表可以写：写操作必须显式勾选。
+    if (identity.kind === 'user' && tool.tool_type === 'write' && getSetting('block_write') === '1') {
       const allowedTools = getUserToolIds(identity.id);
       if (!allowedTools.includes(tool.tool_id)) {
         logOutcome(false, true, 'block_write 禁止写操作');
