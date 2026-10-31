@@ -119,12 +119,39 @@ function pickTraceId(obj: any): string | undefined {
  * Agent 拿空 data.list 继续算 → 出错误结论（成本>售价等）。
  */
 /**
+ * 上游错误纯文本的前缀特征。
+ *
+ * 只有以这些前缀开头的纯文本才可能是「上游错误」——错误场景才去挖嵌入式 JSON，
+ * 避免成功响应里出现的普通 {...} 片段被当成错误体（误判为业务失败）。
+ */
+const UPSTREAM_ERROR_TEXT_RE = /^\s*(?:call failed|upstream error|internal error|request failed|failed)\b/i;
+
+/**
+ * 解析纯 JSON 文本；markdown 代码围栏包裹的 JSON 也算（剥围栏后再解析）。
+ * 解析失败返回 null（不抛错）。
+ */
+function parseJsonBody(text: string): any | null {
+  try { return JSON.parse(text); } catch { /* 不是纯 JSON */ }
+  const m = text.match(/^\s*```[ \t]*(?:json|javascript|js)?[ \t]*\r?\n([\s\S]*?)\r?\n?```\s*$/i);
+  if (!m) return null;
+  try { return JSON.parse(m[1]); } catch { /* 围栏里也不是 JSON */ }
+  return null;
+}
+
+/**
  * 从上游错误纯文本里挖嵌入式 JSON。
  * 领星 HTTP 422 错误格式: "call failed, status: 422, response: {\"code\":102,...}"
  * 这种纯文本 JSON.parse 会失败，但里面的 response: {...} 子串是有效 JSON。
+ *
+ * 适用范围：仅错误场景（文本本身是纯 JSON，或以 call failed 一类上游错误前缀开头）。
+ * 成功响应里的普通文本不参与提取 —— 否则文本中任意 {...} 片段都可能被误判成业务错误。
  */
 function extractEmbeddedJson(text: string): any | null {
-  try { return JSON.parse(text); } catch { /* 不是纯 JSON，继续 */ }
+  // ① 文本本身是纯 JSON（成功/失败响应的正常形态）
+  const direct = parseJsonBody(text);
+  if (direct !== null) return direct;
+  // ② 不是纯 JSON：只有像上游错误前缀的文本才继续尝试提取
+  if (!UPSTREAM_ERROR_TEXT_RE.test(text)) return null;
   // 模式 1: "response: {...}" 或 "response: \"{...}\""
   const respM = text.match(/response:\s*"((?:[^"\\]|\\.)*)"/);
   if (respM) {
