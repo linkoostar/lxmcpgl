@@ -26,6 +26,7 @@ import {
 import { getUpstreamClient } from './upstream.js';
 import { refreshToolSchema } from './sync.js';
 import { createHash, randomUUID } from 'node:crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { config } from './config.js';
 
 /**
@@ -142,6 +143,30 @@ interface SessionEntry {
 
 const sessions = new Map<string, SessionEntry>();
 
+/**
+ * 本次请求生效的身份（mcpAuth 每请求从 DB 重读）。
+ * session 模式下 Server 长期存活，若 handler 闭包住 initialize 时的身份，
+ * 后台改 all_shops / all_tools / 限速 / upstream 范围对已有 session 不生效。
+ * 因此把当前请求的身份放进 AsyncLocalStorage，handler 每次从里面取最新值。
+ */
+const requestIdentityStorage = new AsyncLocalStorage<McpIdentity>();
+
+/** session 数量上限：全局 200，单身份 10 */
+const MAX_SESSIONS_TOTAL = 200;
+const MAX_SESSIONS_PER_IDENTITY = 10;
+
+/** session 空闲超时：4 小时（超过即关闭，客户端下次请求收到 404，需重新 initialize） */
+const SESSION_IDLE_TIMEOUT_MS = 4 * 3600_000;
+
+/**
+ * 取本次请求生效的身份。
+ * ALS 里是 mcpAuth 刚刚从 DB 读出的最新身份（权限变更立即生效）；
+ * 没有 ALS 上下文（例如后台推送通知）时回退到构建时身份。
+ */
+function currentIdentity(fallback: McpIdentity): McpIdentity {
+  return requestIdentityStorage.getStore() ?? fallback;
+}
+
 /** in-flight 上游调用注册表：key = `${identityKey}:${client requestId}`，cancelled 通知据此 abort */
 const inflight = new Map<string, AbortController>();
 
@@ -188,14 +213,51 @@ function ensureSessionCleanup(): void {
   sessionCleanupTimer = setInterval(() => {
     const now = Date.now();
     for (const [sid, s] of sessions) {
-      if (now - s.lastSeen > 24 * 3600_000) {
-        console.log(`[mcp] session 空闲超 24h，关闭: ${sid}`);
+      if (now - s.lastSeen > SESSION_IDLE_TIMEOUT_MS) {
+        console.log(`[mcp] session 空闲超 4h，关闭: ${sid}`);
         void s.transport.close().catch(() => { /* 已关闭 */ });
         sessions.delete(sid);
       }
     }
   }, 5 * 60_000);
   sessionCleanupTimer.unref();
+}
+
+/**
+ * session 数量上限：全局 MAX_SESSIONS_TOTAL，单身份 MAX_SESSIONS_PER_IDENTITY。
+ * 超出时淘汰该身份 lastSeen 最久的一个并关闭其 transport —— 被淘汰的客户端
+ * 下次带旧 session id 会收到 404，重新 initialize 即可（预期行为）。
+ */
+function enforceSessionLimits(identityKey: string): void {
+  // 全局上限：超过则淘汰全局 lastSeen 最久的一个
+  if (sessions.size > MAX_SESSIONS_TOTAL) {
+    let oldestSid: string | null = null;
+    let oldestSeen = Number.POSITIVE_INFINITY;
+    for (const [sid, s] of sessions) {
+      if (s.lastSeen < oldestSeen) {
+        oldestSeen = s.lastSeen;
+        oldestSid = sid;
+      }
+    }
+    if (oldestSid) evictSession(oldestSid, '全局 session 数超上限');
+  }
+  // 单身份上限：超过则淘汰该身份 lastSeen 最久的一个
+  const mine = [...sessions.entries()].filter(([, s]) => s.identityKey === identityKey);
+  if (mine.length > MAX_SESSIONS_PER_IDENTITY) {
+    mine.sort((a, b) => a[1].lastSeen - b[1].lastSeen);
+    for (const [sid] of mine.slice(0, mine.length - MAX_SESSIONS_PER_IDENTITY)) {
+      evictSession(sid, `身份 ${identityKey} 的 session 数超上限`);
+    }
+  }
+}
+
+/** 关闭并移除一个 session（客户端下次带该 id 会收到 404，需重新 initialize） */
+function evictSession(sid: string, reason: string): void {
+  const s = sessions.get(sid);
+  if (!s) return;
+  sessions.delete(sid);
+  console.log(`[mcp] session 淘汰（${reason}）: ${sid.slice(0, 8)}…`);
+  void s.transport.close().catch(() => { /* 已关闭 */ });
 }
 
 /**
@@ -736,8 +798,13 @@ const CallToolRequestWithIdSchema = CallToolRequestSchema.extend({
  * 构建一个挂了全部 handler 的 Server 实例。
  * session 模式下由 initialize 创建并长期存活；无状态模式下每请求新建。
  * 因此各 handler 内部必须重取 upstreams 快照，不能依赖构建时闭包。
+ *
+ * identity 不直接闭包：session 模式下 Server 活几小时，构建时的身份快照早就过期
+ * （后台改 all_shops / all_tools / 限速 / upstream 范围都要立刻生效）。
+ * 每次请求由 handleMcpRequest 把 mcpAuth 读出的最新身份放进 AsyncLocalStorage，
+ * handler 用 currentIdentity() 取；构建时身份只作为兜底（无状态路径同样会写 ALS）。
  */
-function buildServer(identity: McpIdentity): Server {
+function buildServer(fallbackIdentity: McpIdentity): Server {
   // 构建动态 serverInfo — 让 Agent 启动时一眼知道网关聚合了哪些上游
   const upstreams = activeUpstreams();
   const toolCounts = computeToolCounts(upstreams);
@@ -761,6 +828,7 @@ function buildServer(identity: McpIdentity): Server {
 
   // MCP 标准 cancelled 通知：按 requestId 找到 in-flight 上游调用并 abort（signal 透传到上游 fetch）
   server.setNotificationHandler(CancelledNotificationSchema, async (notification) => {
+    const identity = currentIdentity(fallbackIdentity);
     const rid = (notification.params as any)?.requestId;
     const key = `${identityKeyOf(identity)}:${String(rid)}`;
     const ctrl = inflight.get(key);
@@ -781,6 +849,8 @@ function buildServer(identity: McpIdentity): Server {
   }));
 
   server.setRequestHandler(ListToolsRequestSchema, async () => {
+    // 本次请求生效的身份（session 模式下每请求从 ALS 取最新，权限变更立即生效）
+    const identity = currentIdentity(fallbackIdentity);
     // 先查 active upstream 列表，用于给每个工具打 tag + 解析用户 upstream 范围
     // session 模式下 server 长期存活，必须每次重取（不能依赖构建时闭包）
     const upstreams = activeUpstreams();
@@ -871,6 +941,8 @@ function buildServer(identity: McpIdentity): Server {
   });
 
   server.setRequestHandler(CallToolRequestWithIdSchema, async (request) => {
+    // 本次请求生效的身份（session 模式下每请求从 ALS 取最新，权限变更立即生效）
+    const identity = currentIdentity(fallbackIdentity);
     // session 模式下 server 长期存活：upstreams 快照必须在每次调用时重取
     const upstreams = activeUpstreams();
     const name = String(request.params.name ?? '');
@@ -1517,6 +1589,9 @@ function buildServer(identity: McpIdentity): Server {
  *  1. 带 mcp-session-id 且命中 → 路由到该 session 的 transport（GET 即 SSE 通知流）
  *  2. 不带 session 的 initialize → 建立 session（transport 生成 mcp-session-id，server 常驻）
  *  3. 不带 session 的其余 POST → 无状态路径（向后兼容 curl/脚本/旧客户端）
+ *
+ * identity 每次请求都由 mcpAuth 从 DB 重读，这里把它放进 AsyncLocalStorage，
+ * 让常驻的 Server handler 拿到最新权限（后台改权限立即生效，不用重新 initialize）。
  */
 export async function handleMcpRequest(req: Request, res: Response, identity: McpIdentity): Promise<void> {
   const sidHeader = String(req.headers['mcp-session-id'] ?? '').trim();
@@ -1532,7 +1607,7 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
       return;
     }
     entry.lastSeen = Date.now();
-    await entry.transport.handleRequest(req, res, req.body);
+    await requestIdentityStorage.run(identity, () => entry.transport.handleRequest(req, res, req.body));
     return;
   }
 
@@ -1545,7 +1620,9 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: () => randomUUID(),
       onsessioninitialized: (newSid) => {
-        sessions.set(newSid, { server, transport, identityKey: identityKeyOf(identity), lastSeen: Date.now() });
+        const idKey = identityKeyOf(identity);
+        sessions.set(newSid, { server, transport, identityKey: idKey, lastSeen: Date.now() });
+        enforceSessionLimits(idKey);
         ensureSessionCleanup();
         console.log(`[mcp] session 建立: ${newSid.slice(0, 8)}… (${identity.kind === 'admin' ? 'admin' : identity.username})`);
       },
@@ -1555,7 +1632,7 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
       if (transport.sessionId) sessions.delete(transport.sessionId);
     };
     await server.connect(transport);
-    await transport.handleRequest(req, res, req.body);
+    await requestIdentityStorage.run(identity, () => transport.handleRequest(req, res, req.body));
     return;
   }
 
@@ -1579,5 +1656,5 @@ export async function handleMcpRequest(req: Request, res: Response, identity: Mc
     void server.close();
   });
   await server.connect(transport);
-  await transport.handleRequest(req, res, req.body);
+  await requestIdentityStorage.run(identity, () => transport.handleRequest(req, res, req.body));
 }
