@@ -1486,7 +1486,7 @@ export function getMonthlyBillingReport(yearMonth: string): MonthlyBillingPayloa
        FROM call_logs l
        LEFT JOIN users u ON u.username = l.caller
        WHERE l.ts >= ? AND l.ts < ?
-       GROUP BY l.caller, upstream
+       GROUP BY l.caller, COALESCE(NULLIF(l.upstream, ''), 'unknown')
        ORDER BY l.caller ASC, total_calls DESC, upstream ASC`
     )
     .all(since, until) as Array<{
