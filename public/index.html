@@ -391,7 +391,9 @@
   </div>
 
   <div id="toast" class="toast hidden"></div>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+  <!-- Chart.js 4.4.4 本地化：管理页能显示管理员通用 Key，外部脚本被污染就能读到；
+       局域网无外网时图表也加载不出来。文件来自 npm 官方包 chart.js@4.4.4（dist/chart.umd.js）。 -->
+  <script src="/vendor/chart.umd.min.js" integrity="sha384-hAJ45fzetBP2IfCoEczAXX5gx1FPmhv9CEq9poVR+t+M0RAZKkxTfZ7M/2Cj9dHP" crossorigin="anonymous"></script>
   <script src="/app.js"></script>
 </body>
 </html>
