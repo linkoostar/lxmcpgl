@@ -19,6 +19,8 @@ import {
   listUpstreams,
   parseUpstreamHeaders,
   SHOP_PARAM_KEYS,
+  declaredShopFieldsOf,
+  collectShopFieldsPresent,
   type UserRow,
 } from './db.js';
 import { getUpstreamClient } from './upstream.js';
@@ -1011,116 +1013,148 @@ function buildServer(identity: McpIdentity): Server {
     }
 
     // 店铺级校验（仅对运营用户 + 店铺维度上游生效）
-    // 领星（lingxing-meta）所有工具都是店铺维度 → 强制 shop_scoped，不需要审核
-    // 西柚 / ABA / NocoDB（flat-mcp）是公共数据源 → 跳过所有店铺校验
+    // 判定依据：工具自己的 input_schema 声明了哪些店铺字段（网关实时读 schema 判断），
+    // 不再依赖人工审核状态，也不再靠「请求里出现任意店铺字段名就放行」。
     const isShopScoped = isShopScopedUpstream(tool.upstream ?? '');
 
     // 白名单 bypass：查询店铺/账号自身属性的工具 → 跳过店铺参数校验 + 结果裁剪
     const bypassShopCheck = SHOP_SCOPE_BYPASS_TOOLS.has(tool.tool_id) || SHOP_SCOPE_BYPASS_TOOLS.has(name);
 
     if (identity.kind === 'user' && !identity.all_shops && isShopScoped && !bypassShopCheck) {
-      // 领星强制 shop_scoped：运营必须传店铺参数 + 店铺在白名单里
-      // 不需要 shop_scope 字段审核机制（领星全是店铺维度）
-      if (shopRefs.length === 0) {
-        // === A. 自动注入：read 工具 + 店铺白名单只有 1 家 → 自动加 sid ===
-        const allowedShopIds = getUserShopIds(identity.id);
-        const safeToolType = (tool.tool_type ?? '').toLowerCase(); // read = 安全，write = 危险
-        if (allowedShopIds.length === 1 && safeToolType !== 'write') {
-          const autoSid = allowedShopIds[0];
-          // 注入到 args.sid（领星最通用的字段名）
-          args.sid = autoSid;
-          // 刷新 shopRefs，让后续校验链路统一
-          shopRefs.push(autoSid);
-          console.log(
-            `[mcp] ${identity.username} ${name} 未传店铺 → 自动注入唯一店铺 sid=${autoSid}（read 工具 + 单店运营）`
-          );
-        }
-      }
+      // 工具自己声明的店铺字段（递归扫 schema，结果按 schema 内容缓存）
+      const declaredFields = declaredShopFieldsOf(tool.input_schema);
 
-      // 注入后 shopRefs 仍然为空 → 走 B（友好 hint）或硬拒绝
-      if (shopRefs.length === 0) {
-        // 收集可用店铺，拼成 hint
-        const allowedShopIds = getUserShopIds(identity.id);
-        let hint = '';
-        if (allowedShopIds.length > 0) {
-          const shopList = allowedShopIds.map((sid) => {
-            const row = db
-              .prepare('SELECT name, country, profile_id FROM shops WHERE sid = ?')
-              .get(sid) as { name: string; country: string; profile_id: string } | undefined;
-            const label = row?.name ? `${sid}(${row.name})` : sid;
-            return label;
+      if (declaredFields.length === 0) {
+        // 工具没有店铺参数 → 返回的是全局数据（供应商/采购价/成本/汇率…）
+        // 受限运营不可调用；只有管理员放进例外清单（shop_scope='global_safe'）才放行
+        if ((tool.shop_scope ?? '') !== 'global_safe') {
+          logOutcome(false, true, '工具无店铺参数且未加入例外清单');
+          return errorResult('该工具没有店铺参数，受限运营不可调用，如需开放请加入例外清单', {
+            type: 'shop_unreviewed',
+            upstream: tool.upstream,
+            tool: name,
+            reason: 'shop_unreviewed',
           });
-          hint = `可用店铺: ${shopList.join(', ')}。请在参数里加 sid: "${allowedShopIds[0]}" 或 sids: ${JSON.stringify(allowedShopIds)}`;
-        } else {
-          hint = '未配置店铺白名单 → 请先在运营用户管理里配置店铺权限';
         }
-        // write 工具仍然硬拒绝（安全底线：改价发货不能自动猜店铺）
-        const safeToolType = (tool.tool_type ?? '').toLowerCase();
-        if (safeToolType === 'write') {
-          logOutcome(false, true, `write 工具未提供店铺参数（禁止自动注入）`);
+        // 例外清单放行 → 不做店铺参数校验（但请求里带的店铺值仍要过白名单，见下）
+      } else {
+        // 工具声明了店铺字段 → 请求必须在「声明过的字段」上带至少一个店铺值
+        const declaredNames = new Set(declaredFields.map((d) => d.name));
+        const presentFields = collectShopFieldsPresent(args);
+        const carriesDeclared = [...presentFields].some((f) => declaredNames.has(f));
+
+        if (!carriesDeclared) {
+          // === A. 自动注入：单店运营 + read 工具 + schema 顶层声明了可判类型的店铺字段 ===
+          const allowedShopIds = getUserShopIds(identity.id);
+          const safeToolType = (tool.tool_type ?? '').toLowerCase(); // read = 安全，write = 危险
+          // 请求里带了「工具没声明」的店铺字段 → 不自动注入（上游不认识这个字段，注入也没意义）
+          const requestHasShopValue = presentFields.size > 0;
+          if (!requestHasShopValue && allowedShopIds.length === 1 && safeToolType !== 'write') {
+            // 只往 schema 顶层声明的字段注入；字段是数组 → 注入数组，字符串 → 注入字符串
+            const target = declaredFields.find((d) => d.topLevel && (d.type === 'string' || d.type === 'array'));
+            if (target) {
+              const autoSid = allowedShopIds[0];
+              if (target.type === 'array') args[target.key] = [autoSid];
+              else args[target.key] = autoSid;
+              // 刷新 shopRefs，让后续校验链路统一
+              shopRefs.push(autoSid);
+              console.log(
+                `[mcp] ${identity.username} ${name} 未传店铺 → 自动注入唯一店铺 ${target.key}=${autoSid}（read 工具 + 单店运营，字段取自工具 schema）`
+              );
+            }
+          }
+        }
+
+        // 请求仍未在声明过的字段上带店铺值 → 拒绝（P0-2 统一错误信封）
+        const stillMissing = ![...collectShopFieldsPresent(args)].some((f) => declaredNames.has(f));
+        if (stillMissing) {
+          // 收集可用店铺，拼成 hint
+          const allowedShopIds = getUserShopIds(identity.id);
+          let hint = '';
+          if (allowedShopIds.length > 0) {
+            const shopList = allowedShopIds.map((sid) => {
+              const row = db
+                .prepare('SELECT name, country, profile_id FROM shops WHERE sid = ?')
+                .get(sid) as { name: string; country: string; profile_id: string } | undefined;
+              const label = row?.name ? `${sid}(${row.name})` : sid;
+              return label;
+            });
+            const fieldNames = declaredFields.map((d) => d.key).join(' / ');
+            hint = `可用店铺: ${shopList.join(', ')}。请在参数里带上 ${fieldNames}，例如 ${declaredFields[0].key}: "${allowedShopIds[0]}"`;
+          } else {
+            hint = '未配置店铺白名单 → 请先在运营用户管理里配置店铺权限';
+          }
+          // write 工具仍然硬拒绝（安全底线：改价发货不能自动猜店铺）
+          const safeToolType = (tool.tool_type ?? '').toLowerCase();
+          if (safeToolType === 'write') {
+            logOutcome(false, true, `write 工具未提供店铺参数（禁止自动注入）`);
+            return errorResult(
+              `写操作工具「${name}」禁止自动注入店铺。${hint}`,
+              { type: 'invalid_params', upstream: tool.upstream, tool: name, reason: 'missing_shop_param', hint }
+            );
+          }
+          // read 工具 → 返回带 hint 的空壳响应（gateway_points=0，不计分）
+          logOutcome(true, false, undefined, null, { isEmptyShell: true });
+          return {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify({
+                  code: 0,
+                  data: null,
+                  msg: `缺少店铺参数。${hint}`,
+                  _auto_inject_disabled: true,
+                }),
+              },
+            ],
+            isError: false,
+            // structuredContent 故意不带（不传=undefined），
+            // MCP 协议要求 structuredContent 若出现必须是 object（不能 null），否则 zod 校验报 -32602
+          };
+        }
+      }
+
+      // === 参数级店铺校验：请求里出现的所有已识别店铺值都必须落在白名单内 ===
+      if (shopRefs.length > 0) {
+        const allowedShopIds = new Set(getUserShopIds(identity.id));
+        // fail-closed：user_shops 为空 → 配置缺失，明确拒绝调用
+        if (allowedShopIds.size === 0) {
+          logOutcome(false, true, '未配置店铺白名单');
           return errorResult(
-            `写操作工具「${name}」禁止自动注入店铺。${hint}`,
-            { type: 'invalid_params', upstream: tool.upstream, tool: name, reason: 'missing_shop_param', hint }
+            `密钥未配置店铺白名单，无法调用店铺维度工具。请在管理后台 "运营用户 → 店铺权限" 补配，或设为全部店铺。`,
+            { type: 'permission_denied', upstream: tool.upstream, tool: name, reason: 'no_shop_whitelist' }
           );
         }
-        // read 工具 → 返回带 hint 的空壳响应（gateway_points=0，不计分）
-        logOutcome(true, false, undefined, null, { isEmptyShell: true });
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify({
-                code: 0,
-                data: null,
-                msg: `缺少店铺参数。${hint}`,
-                _auto_inject_disabled: true,
-              }),
-            },
-          ],
-          isError: false,
-          // structuredContent 故意不带（不传=undefined），
-          // MCP 协议要求 structuredContent 若出现必须是 object（不能 null），否则 zod 校验报 -32602
-        };
-      }
-      // === shop_scoped + shopRefs 非空：参数级店铺校验 ===
-      const allowedShopIds = new Set(getUserShopIds(identity.id));
-      // fail-closed：user_shops 为空 → 配置缺失，明确拒绝调用
-      if (allowedShopIds.size === 0) {
-        logOutcome(false, true, '未配置店铺白名单');
-        return errorResult(
-          `密钥未配置店铺白名单，无法调用店铺维度工具。请在管理后台 "运营用户 → 店铺权限" 补配，或设为全部店铺。`,
-          { type: 'permission_denied', upstream: tool.upstream, tool: name, reason: 'no_shop_whitelist' }
-        );
-      }
-      const idMap = buildShopIdMapping();
+        const idMap = buildShopIdMapping();
 
-      const denied: string[] = [];
-      for (const ref of shopRefs) {
-        const mapped = idMap.get(ref);
-        if (mapped) {
-          // ref 是映射里的某个 ID（store_id / seller_id / profile_id / sid 本身）
-          // 评审意见改用 every 不用 some：同一个 seller_id 可能跨多个站点，
-          // 只授权 US 的用户传这个 seller_id → some 会让它通过但返回所有站点数据
-          if (![...mapped].every((s) => allowedShopIds.has(s))) {
-            denied.push(ref + '→' + [...mapped].join(','));
+        const denied: string[] = [];
+        for (const ref of shopRefs) {
+          const mapped = idMap.get(ref);
+          if (mapped) {
+            // ref 是映射里的某个 ID（store_id / seller_id / profile_id / sid 本身）
+            // 评审意见改用 every 不用 some：同一个 seller_id 可能跨多个站点，
+            // 只授权 US 的用户传这个 seller_id → some 会让它通过但返回所有站点数据
+            if (![...mapped].every((s) => allowedShopIds.has(s))) {
+              denied.push(ref + '→' + [...mapped].join(','));
+            }
+          } else {
+            // 未映射 → fail-closed 拒绝
+            denied.push(ref + '(未映射)');
           }
-        } else {
-          // 未映射 → fail-closed 拒绝
-          denied.push(ref + '(未映射)');
         }
-      }
-      if (denied.length > 0) {
-        logOutcome(false, true, `无权访问店铺: ${denied.join(',')}`);
-        const allowedList = [...allowedShopIds];
-        return errorResult(`无权访问以下店铺: ${denied.join(', ')}。当前可用店铺 sid: ${allowedList.join(', ')}`, {
-          type: 'permission_denied',
-          upstream: tool.upstream,
-          tool: name,
-          field: 'shop',
-          denied,
-          available_sids: allowedList,
-          tip: `可用店铺 sid 清单: ${allowedList.join(', ')}。在参数中使用 sid / sids / store_id / profile_ids 等字段。`,
-        });
+        if (denied.length > 0) {
+          logOutcome(false, true, `无权访问店铺: ${denied.join(',')}`);
+          const allowedList = [...allowedShopIds];
+          return errorResult(`无权访问以下店铺: ${denied.join(', ')}。当前可用店铺 sid: ${allowedList.join(', ')}`, {
+            type: 'permission_denied',
+            upstream: tool.upstream,
+            tool: name,
+            field: 'shop',
+            denied,
+            available_sids: allowedList,
+            tip: `可用店铺 sid 清单: ${allowedList.join(', ')}。在参数中使用 sid / sids / store_id / profile_ids 等字段。`,
+          });
+        }
       }
     }
 

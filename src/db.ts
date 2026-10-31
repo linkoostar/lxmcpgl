@@ -6,7 +6,7 @@ import { config, DEFAULT_UPSTREAM_URL } from './config.js';
 
 /**
  * 店铺 ID 字段名常量 —— 全项目共用一份，避免口径漂移。
- * mcp.ts 的 collectShopRefs、sync.ts 的 schemaHasShopField、adapter.ts 的 extractShopRefs 都用这份。
+ * db.ts 的 collectShopRefs / declaredShopFieldsOf、sync.ts 的 schemaHasShopField 都用这份。
  */
 export const SHOP_PARAM_KEYS = new Set<string>([
   // sid 本身及其复数
@@ -24,6 +24,133 @@ export const SHOP_PARAM_KEYS = new Set<string>([
   // Amazon PVI ID（广告类工具的另一种 ID 形式）
   'pvi_ids',
 ]);
+
+/**
+ * 工具 schema 里声明的店铺字段（P0-1）
+ *
+ * 工具「是否需要店铺参数」由网关实时读工具自己的 input_schema 判断，
+ * 不再靠人工审核的 shop_scope，也不再靠「请求里出现了某个店铺字段名」来猜。
+ */
+export interface DeclaredShopField {
+  /** 字段名（小写，与 SHOP_PARAM_KEYS 同口径） */
+  name: string;
+  /** schema 里的原始字段名（注入参数时用它，避免大小写漂移） */
+  key: string;
+  /** 是否直接声明在 schema 顶层 properties（自动注入只认顶层） */
+  topLevel: boolean;
+  /** 顶层字段类型：string / array / unknown（嵌套字段无类型概念） */
+  type: 'string' | 'array' | 'unknown';
+}
+
+/** 判断 schema 里某个属性节点的类型（够用即可：注入只关心 string / array） */
+function shopFieldType(node: any): 'string' | 'array' | 'unknown' {
+  if (!node || typeof node !== 'object') return 'unknown';
+  const t = node.type;
+  if (t === 'string') return 'string';
+  if (t === 'array') return 'array';
+  if (Array.isArray(t)) return 'unknown'; // 联合类型无法确定
+  if (node.items) return 'array'; // 没写 type 但有 items → 数组
+  return 'unknown';
+}
+
+/** 递归找出 schema 嵌套结构（properties / items / anyOf / oneOf / allOf）里的店铺字段 */
+function collectNestedShopFields(schema: any, depth: number, map: Map<string, DeclaredShopField>): void {
+  if (depth > 8 || !schema || typeof schema !== 'object') return;
+  if (schema.properties && typeof schema.properties === 'object' && !Array.isArray(schema.properties)) {
+    for (const [k, v] of Object.entries(schema.properties as Record<string, any>)) {
+      const key = k.toLowerCase();
+      if (SHOP_PARAM_KEYS.has(key) && !map.has(key)) {
+        map.set(key, { name: key, key: k, topLevel: false, type: 'unknown' });
+      }
+      collectNestedShopFields(v, depth + 1, map);
+    }
+  }
+  if (schema.items) collectNestedShopFields(schema.items, depth + 1, map);
+  for (const arr of [schema.anyOf, schema.oneOf, schema.allOf]) {
+    if (Array.isArray(arr)) {
+      for (const sub of arr) collectNestedShopFields(sub, depth + 1, map);
+    }
+  }
+}
+
+function computeDeclaredShopFields(raw: string): DeclaredShopField[] {
+  if (!raw.trim()) return [];
+  let schema: any;
+  try {
+    schema = JSON.parse(raw);
+  } catch {
+    return [];
+  }
+  if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return [];
+  const map = new Map<string, DeclaredShopField>();
+  // 顶层 properties：自动注入的候选（带上原始字段名与类型）
+  const props = schema.properties && typeof schema.properties === 'object' && !Array.isArray(schema.properties)
+    ? (schema.properties as Record<string, any>)
+    : null;
+  if (props) {
+    for (const [k, v] of Object.entries(props)) {
+      const key = k.toLowerCase();
+      if (!SHOP_PARAM_KEYS.has(key)) continue;
+      map.set(key, { name: key, key: k, topLevel: true, type: shopFieldType(v) });
+    }
+  }
+  // 嵌套结构里的店铺字段（不可注入，但请求带上时同样参与校验）
+  collectNestedShopFields(schema, 0, map);
+  return [...map.values()];
+}
+
+/** schema 扫描结果缓存（按 schema 内容缓存，内容变则自动失效） */
+const SHOP_FIELD_CACHE = new Map<string, DeclaredShopField[]>();
+const SHOP_FIELD_CACHE_LIMIT = 512;
+
+/**
+ * 取出工具 schema 里声明的店铺字段。
+ * 结果按 schema 内容缓存 —— 同一个 schema 不重复扫描，schema 一变缓存自然失效。
+ */
+export function declaredShopFieldsOf(inputSchema: string | null | undefined): DeclaredShopField[] {
+  const raw = inputSchema ?? '';
+  const hit = SHOP_FIELD_CACHE.get(raw);
+  if (hit) return hit;
+  const fields = computeDeclaredShopFields(raw);
+  if (SHOP_FIELD_CACHE.size >= SHOP_FIELD_CACHE_LIMIT) {
+    const oldest = SHOP_FIELD_CACHE.keys().next().value;
+    if (oldest !== undefined) SHOP_FIELD_CACHE.delete(oldest);
+  }
+  SHOP_FIELD_CACHE.set(raw, fields);
+  return fields;
+}
+
+/**
+ * 请求里「带了值的」店铺字段名集合（只认 SHOP_PARAM_KEYS 里的字段名）。
+ * 用于判断请求是否在指定字段上携带了店铺值。
+ */
+export function collectShopFieldsPresent(args: Record<string, unknown>): Set<string> {
+  const out = new Set<string>();
+  const visit = (node: unknown, depth = 0) => {
+    if (depth > 6 || node === null || node === undefined) return;
+    if (Array.isArray(node)) {
+      for (const item of node) visit(item, depth + 1);
+      return;
+    }
+    if (typeof node === 'object') {
+      for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
+        const key = k.toLowerCase();
+        if (SHOP_PARAM_KEYS.has(key)) {
+          if (typeof v === 'string') {
+            if (v.split(',').map((s) => s.trim()).filter(Boolean).length > 0) out.add(key);
+          } else if (Array.isArray(v)) {
+            if (v.map((x) => String(x)).filter(Boolean).length > 0) out.add(key);
+          } else if (typeof v === 'number' || typeof v === 'bigint') {
+            out.add(key);
+          }
+        }
+        if (v && typeof v === 'object') visit(v, depth + 1);
+      }
+    }
+  };
+  visit(args);
+  return out;
+}
 
 export let db: Database.Database;
 
@@ -481,6 +608,9 @@ export function upsertTool(t: {
       const oldAlgorithmHash = sha256(t.input_schema).slice(0, 16);
       if (oldAlgorithmHash === existing.schema_hash) {
         console.log(`[db] tool ${upstream}.${t.tool_id} hash 算法切换（旧原始→新规范化），shop_scope=${existing.shop_scope} 保持不变`);
+      } else if (existing.shop_scope === 'global_safe') {
+        // global_safe = 管理员确认的全局例外（例外清单）→ 不因上游 schema 变更被静默撤销
+        console.log(`[db] tool ${upstream}.${t.tool_id} schema 变更 (${existing.schema_hash.slice(0,6)}→${newHash.slice(0,6)})，shop_scope=global_safe 例外清单保持不变`);
       } else {
         console.log(`[db] tool ${upstream}.${t.tool_id} schema 变更 (${existing.schema_hash.slice(0,6)}→${newHash.slice(0,6)})，shop_scope=${existing.shop_scope} 退回 unreviewed`);
         shopScope = 'unreviewed';
