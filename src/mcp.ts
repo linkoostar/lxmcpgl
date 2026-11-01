@@ -806,7 +806,7 @@ function buildServer(fallbackIdentity: McpIdentity): Server {
   const totalTools = upstreams.reduce((sum, u) => sum + (toolCounts[u.id] ?? 0), 0) + 3;
   const serverDesc = `方中 MCP 网关，聚合 ${upstreams.length} 个上游 · ${totalTools} 工具：${upstreamDesc}`;
   // 固定提示：只在这里写一次，不根据错误内容动态生成
-  const schemaHint = '调用报参数或格式错误时，用 _tool_schema 查看完整参数说明。';
+  const schemaHint = '找不到合适的工具时，用 _tool_search 搜索；调用报参数或格式错误时，用 _tool_schema 查看完整参数说明。';
   const instructions = `${serverDesc}。${schemaHint}`;
 
   const server = new Server(
