@@ -23,7 +23,7 @@ import {
   collectShopRefs,
   type UserRow,
 } from './db.js';
-import { getUpstreamClient } from './upstream.js';
+import { getUpstreamClient, type UpstreamClient } from './upstream.js';
 import { refreshToolSchema } from './sync.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
@@ -448,6 +448,26 @@ function checkRateLimit(userId: number, limitPerMin: number): boolean {
 // 统一用 db.SHOP_PARAM_KEYS / db.collectShopRefs（全项目共用一份，避免口径漂移）
 
 // ---------- 上游调用（code-102 自动刷新 Schema 重试） ----------
+
+/**
+ * code-102 Schema 刷新 single-flight：
+ * 同一 (upstream, tool) 的并发 102 只触发一次上游刷新，其余等待共用结果。
+ * Agent 并行重试同一工具（或一轮并行调用多个工具后逐个重试）时，
+ * 避免对上游发起重复刷新请求风暴（上游限流会让刷新全部失败 → 原始 102 直接记失败）。
+ * 不同工具的刷新互相独立、各自触发（每个工具的 schema 不同，无法共用）。
+ */
+const schemaRefreshInflight = new Map<string, Promise<void>>();
+
+function refreshToolSchemaOnce(client: UpstreamClient, toolId: string, upId: string): Promise<void> {
+  const key = `${upId}\u0000${toolId}`;
+  const inflight = schemaRefreshInflight.get(key);
+  if (inflight) return inflight;
+  const p = refreshToolSchema(client, toolId, upId).finally(() => {
+    schemaRefreshInflight.delete(key);
+  });
+  schemaRefreshInflight.set(key, p);
+  return p;
+}
 
 const SCHEMA_STALE_RE = /工具参数定义已更新|"code"\s*:\s*102/;
 
@@ -1286,7 +1306,7 @@ function buildServer(fallbackIdentity: McpIdentity): Server {
       if (bizCode === 102 || SCHEMA_STALE_RE.test(bizMsg)) {
         console.log(`[mcp] ${caller} ${name} 触发 schema 刷新（code=${bizCode}）`);
         try {
-          await refreshToolSchema(getUpstreamClient(upConfig.url, upConfig.api_key ?? ''), tool.tool_id, upId);
+          await refreshToolSchemaOnce(getUpstreamClient(upConfig.url, upConfig.api_key ?? ''), tool.tool_id, upId);
           // schema 刷新可能改变 tools_hash → 按标准推送 list_changed
           checkAndNotifyToolsChanged();
           callResult = await adapter.callTool(upConfig, tool.tool_id, args, { signal: callCtrl.signal });
