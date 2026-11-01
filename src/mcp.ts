@@ -1397,7 +1397,12 @@ function buildServer(fallbackIdentity: McpIdentity): Server {
             console.log(`[mcp] ${caller} ${name} code=102 gateway_hint: ${missingFields.join(', ')}`);
           }
         }
-        return errorResult(`上游返回错误: ${msg}`, {
+        // 102 且本地校验命中「缺必填」时，把可自愈的提示放在 message 最前面；
+        // 上游原文原样保留在后半段（透传：不修改上游返回内容，只做网关侧固定模板标注）。
+        const userMsg = gatewayHint
+          ? `缺少必填参数: ${(gatewayHint.missing_required as string[]).join(', ')}（按已同步的参数定义校验，详见 gateway_hint）。上游返回错误: ${msg}`
+          : `上游返回错误: ${msg}`;
+        return errorResult(userMsg, {
           type: 'upstream_error',
           upstream: upId,
           tool: name,
