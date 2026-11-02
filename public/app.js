@@ -834,7 +834,7 @@ function upstreamCardHTML(u) {
         </label>
       </div>
       <label style="flex-direction:column;margin-top:6px">备注<input class="ed-notes" value="${escapeHTML(u.notes || '')}" /></label>
-      <label style="flex-direction:column;margin-top:6px">Headers（JSON 对象，可选 — 需要自定义鉴权头比如 NocoDB 的 x-api-key 时填）<textarea class="ed-headers" rows="2" style="font-family:monospace;font-size:12px;padding:7px 8px;border-radius:8px;border:1px solid var(--border)">${escapeHTML(u.headers || '{}')}</textarea></label>
+      <label style="flex-direction:column;margin-top:6px">Headers（JSON 对象，可选 — 自定义鉴权头如 NocoDB 的 x-api-key；值可含 {caller} 占位符，每次调用替换为调用者用户名，如 {"X-Client-Id":"{caller}"}）<textarea class="ed-headers" rows="2" style="font-family:monospace;font-size:12px;padding:7px 8px;border-radius:8px;border:1px solid var(--border)">${escapeHTML(u.headers || '{}')}</textarea></label>
       <div class="row" style="margin-top:10px">
         <button class="btn primary small" data-act="save-edit" data-id="${u.id}">保存</button>
         <button class="btn small" data-act="cancel-edit" data-id="${u.id}">取消</button>

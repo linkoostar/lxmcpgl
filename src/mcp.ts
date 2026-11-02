@@ -1295,7 +1295,7 @@ function buildServer(fallbackIdentity: McpIdentity): Server {
       // 延迟 import 避免循环依赖
       const { getAdapter } = await import('./adapter.js');
       const adapter = getAdapter(upConfig);
-      let callResult = await adapter.callTool(upConfig, tool.tool_id, args, { signal: callCtrl.signal });
+      let callResult = await adapter.callTool(upConfig, tool.tool_id, args, { signal: callCtrl.signal, callerName: caller });
 
       // ===== code=102 自动刷新 Schema + 重试一次 =====
       // 领星上游工具定义更新后旧 schema 会过期，返回 code=102（业务错误，包在 content 里）。
@@ -1309,7 +1309,7 @@ function buildServer(fallbackIdentity: McpIdentity): Server {
           await refreshToolSchemaOnce(getUpstreamClient(upConfig.url, upConfig.api_key ?? ''), tool.tool_id, upId);
           // schema 刷新可能改变 tools_hash → 按标准推送 list_changed
           checkAndNotifyToolsChanged();
-          callResult = await adapter.callTool(upConfig, tool.tool_id, args, { signal: callCtrl.signal });
+          callResult = await adapter.callTool(upConfig, tool.tool_id, args, { signal: callCtrl.signal, callerName: caller });
           console.log(`[mcp] ${caller} ${name} 刷新 schema 后重试完成`);
         } catch (refreshErr: any) {
           if (callCtrl.signal.aborted) throw refreshErr; // 取消不是刷新异常，交给外层 cancelled 分支

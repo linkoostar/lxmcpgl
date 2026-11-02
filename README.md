@@ -56,6 +56,8 @@
 | NocoDB | `flat-mcp` | 按需 | 自定义 headers | ❌ 跳过 |
 
 > flat-mcp 上游的接入：在 Web 后台「上游配置」新增，选 adapter=flat-mcp，填 URL。URL query 里有 `key/token/secret/auth/access/api_key` 等关键词时自动识别为 URL 认证（api_key 字段留空即可）。
+>
+> **{caller} 占位符**：上游 Headers 的值可写 `{"X-Client-Id": "{caller}"}`，网关每次调用时替换为当前请求鉴权出的调用者用户名（admin 请求为 `admin`，工具同步为 `gateway`）。用于上游按调用者归因（如 amzkzc 要求的 `X-Client-Id` header）。
 
 ## 快速开始（群晖等 Docker 环境）
 

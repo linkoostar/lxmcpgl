@@ -578,7 +578,8 @@ async function syncFlatMcp(up: { id: string; name: string; url: string; api_key:
   const started = Date.now();
   const { getAdapter } = await import('./adapter.js');
   const adapter = getAdapter({ ...up, shop_field: 'asin', active: 1 });
-  const tools = await adapter.listTools({ ...up, shop_field: 'asin', active: 1 });
+  // 同步是网关自身行为：{caller} 占位符固定替换为 'gateway'，上游可区分「同步」与「业务调用」
+  const tools = await adapter.listTools({ ...up, shop_field: 'asin', active: 1 }, 'gateway');
 
   const tx = db.transaction(() => {
     for (const t of tools) {

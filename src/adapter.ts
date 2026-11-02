@@ -61,24 +61,26 @@ export interface UpstreamAdapter {
 
   /**
    * 列出上游所有可用工具（用于 tools 同步）
-   * @param config  upstream 配置
+   * @param config     upstream 配置
+   * @param callerName 调用者标识（用于 Headers 里 {caller} 占位符替换；同步传 'gateway'）
    * @returns 标准化工具列表
    */
-  listTools(config: UpstreamConfig): Promise<StandardTool[]>;
+  listTools(config: UpstreamConfig, callerName?: string): Promise<StandardTool[]>;
 
   /**
    * 调上游工具（MCP tools/call 转发）
-   * @param config  upstream 配置
-   * @param toolId  上游原始 tool_id（不是 exposed_name）
-   * @param args    工具参数
-   * @param opts    可选：signal — 客户端 cancelled 通知到达时 abort 上游请求
+   * @param config     upstream 配置
+   * @param toolId     上游原始 tool_id（不是 exposed_name）
+   * @param args       工具参数
+   * @param opts       可选：signal — 客户端 cancelled 通知到达时 abort 上游请求；
+   *                   callerName — 调用者标识（Headers 里 {caller} 占位符替换，如 amzkzc 的 X-Client-Id）
    * @returns MCP content 格式
    */
   callTool(
     config: UpstreamConfig,
     toolId: string,
     args: Record<string, unknown>,
-    opts?: { signal?: AbortSignal }
+    opts?: { signal?: AbortSignal; callerName?: string }
   ): Promise<McpCallResult>;
 
   /**
@@ -494,10 +496,10 @@ class FlatMcpAdapter implements UpstreamAdapter {
 
   canHandle(c: UpstreamConfig): boolean { return c.adapter === 'flat-mcp'; }
 
-  async listTools(config: UpstreamConfig): Promise<StandardTool[]> {
+  async listTools(config: UpstreamConfig, callerName?: string): Promise<StandardTool[]> {
     const client = this.getOrCreateClient(config);
     await client.initialize();
-    const raw = await client.listTools();
+    const raw = await client.listTools(callerName);
     return raw.map((t: any) => ({
       tool_id: t.name,
       exposed_name: t.name,
@@ -512,11 +514,11 @@ class FlatMcpAdapter implements UpstreamAdapter {
     config: UpstreamConfig,
     toolId: string,
     args: Record<string, unknown>,
-    opts?: { signal?: AbortSignal }
+    opts?: { signal?: AbortSignal; callerName?: string }
   ): Promise<McpCallResult> {
     const client = this.getOrCreateClient(config);
     await client.initialize();
-    const resp = await client.callTool(toolId, args, opts?.signal);
+    const resp = await client.callTool(toolId, args, opts?.signal, opts?.callerName);
     if (resp?.error) {
       // 同样优先挖 error.data.code（部分扁平 MCP 上游也会把业务码包在 data 里）
       const errData = resp.error.data as Record<string, unknown> | undefined;
@@ -601,17 +603,9 @@ class FlatMcpClient {
     private customHeaders: Record<string, string> = {}
   ) {}
 
-  private async rpc(method: string, params: unknown, timeoutMs = 30000, externalSignal?: AbortSignal): Promise<any> {
+  private async rpc(method: string, params: unknown, timeoutMs = 30000, externalSignal?: AbortSignal, callerName?: string): Promise<any> {
     const body = JSON.stringify({ jsonrpc: '2.0', id: Date.now(), method, params });
-    // 先放自定义 headers，再用标准 headers 覆盖（Content-Type/Accept 不能被覆盖）
-    const headers: Record<string, string> = {
-      ...this.customHeaders,
-      'Content-Type': 'application/json',
-      'Accept': 'application/json, text/event-stream',
-    };
-    if (this.apiKey && !headers['Authorization'] && !headers['authorization']) {
-      headers['Authorization'] = `Bearer ${this.apiKey}`;
-    }
+    const headers = this.buildHeaders(callerName);
     const resp = await fetch(this.url, {
       method: 'POST',
       headers,
@@ -636,6 +630,34 @@ class FlatMcpClient {
     return JSON.parse(txt);
   }
 
+  /**
+   * 组装请求 headers：自定义 headers（上游配置）优先，标准 headers 覆盖 Content-Type/Accept，
+   * api_key 补 Authorization（除非自定义里已带）。最后做 {caller} 占位符替换。
+   *
+   * {caller} 占位符：自定义 header 值可写 {"X-Client-Id": "{caller}"}，
+   * 每次请求替换为实际调用者标识（mcpAuth 鉴权出的用户名 / admin / 同步时的 gateway），
+   * 用于上游按调用者归因（如 amzkzc 的 X-Client-Id）。未传 callerName 时替换为 'gateway'。
+   * 客户端缓存 key 用原始 headers 字符串，不受替换影响 —— 同一上游所有调用者共享一个连接。
+   */
+  private buildHeaders(callerName?: string): Record<string, string> {
+    const headers: Record<string, string> = {
+      ...this.customHeaders,
+      'Content-Type': 'application/json',
+      'Accept': 'application/json, text/event-stream',
+    };
+    if (this.apiKey && !headers['Authorization'] && !headers['authorization']) {
+      headers['Authorization'] = `Bearer ${this.apiKey}`;
+    }
+    if (Object.values(headers).some((v) => typeof v === 'string' && v.includes('{caller}'))) {
+      const resolved = callerName && callerName.trim() ? callerName.trim() : 'gateway';
+      for (const k of Object.keys(headers)) {
+        const v = headers[k];
+        if (typeof v === 'string' && v.includes('{caller}')) headers[k] = v.split('{caller}').join(resolved);
+      }
+    }
+    return headers;
+  }
+
   async initialize(): Promise<void> {
     if (this.initialized) return;
     const resp = await this.rpc('initialize', {
@@ -647,15 +669,15 @@ class FlatMcpClient {
     this.initialized = true;
   }
 
-  async listTools(): Promise<any[]> {
-    const resp = await this.rpc('tools/list', {});
+  async listTools(callerName?: string): Promise<any[]> {
+    const resp = await this.rpc('tools/list', {}, 30000, undefined, callerName);
     if (resp.error) throw new Error(`listTools error: ${resp.error.message}`);
     return resp.result?.tools ?? [];
   }
 
-  async callTool(name: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<any> {
+  async callTool(name: string, args: Record<string, unknown>, signal?: AbortSignal, callerName?: string): Promise<any> {
     // 不在这里抛错：把 JSON-RPC error 原样返回，交给 adapter 归一化（保留 code/traceId）
-    return this.rpc('tools/call', { name, arguments: args }, 30000, signal);
+    return this.rpc('tools/call', { name, arguments: args }, 30000, signal, callerName);
   }
 }
 
